@@ -1,0 +1,221 @@
+# otter-credential-broker: two stateless replicas, all state in PostgreSQL.
+# Apply with: kubectl apply -f deploy/k8s/broker.yaml
+# Secrets are referenced, not created here: see secret.example.yaml.
+#
+# Ports and who may reach them (enforced by the NetworkPolicy below):
+#   8080 http     LLM proxy (/llm/*) and worker endpoint (/v1/worker/*)
+#                 <- pods labelled credential-broker/client=true
+#   8081 admin    admin API (/v1/admin/*) <- pods labelled credential-broker/admin=true
+#   9090 metrics  Prometheus <- namespace "monitoring"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: credential-broker
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: credential-broker
+  namespace: credential-broker
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: credential-broker-config
+  namespace: credential-broker
+data:
+  config.toml: |
+    listen = "0.0.0.0:8080"
+    admin_listen = "0.0.0.0:8081"
+    metrics_listen = "0.0.0.0:9090"
+    admin_tokens_file = "/etc/otter-credential-broker/admin/tokens"
+    token_key_file = "/etc/otter-credential-broker/kek/token-key"
+
+    [database]
+    url_file = "/etc/otter-credential-broker/database/url"
+    max_connections = 10
+
+    [kek]
+    id = "local-1"
+    file = "/etc/otter-credential-broker/kek/current"
+
+    [llm.providers.anthropic]
+    kind = "anthropic"
+    base_url = "https://api.anthropic.com"
+
+    [llm.providers.deepseek]
+    kind = "openai"
+    base_url = "https://api.deepseek.com"
+
+    # Add [[llm.pricing]] entries (see config/example.toml).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: credential-broker
+  namespace: credential-broker
+  labels: { app.kubernetes.io/name: credential-broker }
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app.kubernetes.io/name: credential-broker }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: credential-broker }
+    spec:
+      serviceAccountName: credential-broker
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # LLM responses stream for minutes. Must exceed http.shutdown_grace_secs
+      # (default 300) plus a few seconds for the final usage writes.
+      terminationGracePeriodSeconds: 600
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: credential-broker }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: broker
+          # Pin a release tag or digest in production.
+          image: ghcr.io/iswappp/otter-credential-broker:main
+          args: ["serve", "--config", "/etc/otter-credential-broker/config/config.toml"]
+          env:
+            - { name: RUST_LOG, value: "info" }
+            # Trace export is off unless an endpoint is set (docs/OBSERVABILITY.md).
+            # - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.monitoring:4318" }
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: admin, containerPort: 8081 }
+            - { name: metrics, containerPort: 9090 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/otter-credential-broker/config, readOnly: true }
+            - { name: kek, mountPath: /etc/otter-credential-broker/kek, readOnly: true }
+            - { name: admin, mountPath: /etc/otter-credential-broker/admin, readOnly: true }
+            - { name: database, mountPath: /etc/otter-credential-broker/database, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: credential-broker-config }
+        - name: kek
+          secret: { secretName: credential-broker-kek, defaultMode: 0440 }
+        - name: admin
+          secret: { secretName: credential-broker-admin, defaultMode: 0440 }
+        - name: database
+          secret: { secretName: credential-broker-database, defaultMode: 0440 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: credential-broker
+  namespace: credential-broker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: credential-broker }
+---
+# LLM proxy and worker endpoint.
+apiVersion: v1
+kind: Service
+metadata:
+  name: credential-broker
+  namespace: credential-broker
+spec:
+  selector: { app.kubernetes.io/name: credential-broker }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: credential-broker-admin
+  namespace: credential-broker
+spec:
+  selector: { app.kubernetes.io/name: credential-broker }
+  ports:
+    - { name: admin, port: 8081, targetPort: admin }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: credential-broker-metrics
+  namespace: credential-broker
+  labels: { app.kubernetes.io/name: credential-broker }
+spec:
+  selector: { app.kubernetes.io/name: credential-broker }
+  ports:
+    - { name: metrics, port: 9090, targetPort: metrics }
+---
+# Ingress per port as described at the top. Egress: DNS, PostgreSQL, HTTPS
+# to public addresses (LLM providers). Adjust the database rule to where
+# PostgreSQL runs (here: pods labelled credential-broker/database=true).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: credential-broker
+  namespace: credential-broker
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: credential-broker }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { credential-broker/client: "true" }
+      ports:
+        - { port: 8080, protocol: TCP }
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { credential-broker/admin: "true" }
+      ports:
+        - { port: 8081, protocol: TCP }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { port: 9090, protocol: TCP }
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { credential-broker/database: "true" }
+      ports:
+        - { port: 5432, protocol: TCP }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+      ports:
+        - { port: 443, protocol: TCP }

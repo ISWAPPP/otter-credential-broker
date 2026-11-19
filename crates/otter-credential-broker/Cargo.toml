@@ -1,0 +1,29 @@
+[package]
+name = "otter-credential-broker"
+description = "Secrets manager with an LLM proxy endpoint: tenant-scoped secrets, job tokens for workers, LLM API proxy with budgets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "otter-credential-broker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+broker-core.workspace = true
+broker-server.workspace = true
+clap.workspace = true
+hex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,133 @@
+# Example production configuration. Every key can be overridden with an
+# environment variable: OCB_<SECTION>__<KEY>, e.g. OCB_LLM__MAX_DURATION_SECS=600.
+# Paths below match deploy/k8s/broker.yaml.
+
+# LLM proxy (/llm/*) and worker endpoint (/v1/worker/*): agent pods, workers.
+listen = "0.0.0.0:8080"
+# Admin API (/v1/admin/*): the platform core only.
+admin_listen = "0.0.0.0:8081"
+# Prometheus /metrics: the monitoring namespace only.
+metrics_listen = "0.0.0.0:9090"
+# `<principal> <token>` per line; the principal name is the audit actor.
+admin_tokens_file = "/etc/otter-credential-broker/admin/tokens"
+# Keys the digests of issued tokens and the MACs of token rows, so database
+# write access alone cannot mint or widen tokens. 64 hex chars (`keygen`).
+# Changing it invalidates every issued token.
+token_key_file = "/etc/otter-credential-broker/kek/token-key"
+
+[database]
+# A file with the PostgreSQL URL (it carries the password). Alternatively set
+# `url` or OCB_DATABASE__URL.
+url_file = "/etc/otter-credential-broker/database/url"
+max_connections = 10
+acquire_timeout_secs = 5
+# Set to false when migrations run separately (`otter-credential-broker migrate`)
+# with a more privileged role.
+run_migrations = true
+
+[kek]
+# The current KEK wraps every new data key. To rotate: generate a new key,
+# make it current, move the old one to [[kek.previous]], restart, call
+# POST /v1/admin/kek/rewrap until `remaining` is 0, then drop the old key.
+id = "local-1"
+file = "/etc/otter-credential-broker/kek/current"
+# [[kek.previous]]
+# id = "local-0"
+# file = "/etc/otter-credential-broker/kek/previous"
+
+[http]
+# Admin API and worker endpoint.
+request_timeout_secs = 30
+body_limit_bytes = 262144
+# All listeners: complete request headers must arrive within this time, and
+# at most this many connections are open per listener.
+header_read_timeout_secs = 10
+max_connections = 4096
+# On shutdown, in-flight requests (LLM streams included) get this long to
+# finish; what is left is cut and accounted conservatively. Keep the
+# Kubernetes terminationGracePeriodSeconds above it.
+shutdown_grace_secs = 300
+# Callers on the public listener are untrusted: their traceparent is only
+# linked, never used as parent or written to audit and usage rows. Tokens
+# carry the trusted trace context (see the admin API).
+trust_caller_trace_context = false
+# Failed token checks per client address and minute (per replica) before
+# further attempts are refused without a database lookup.
+auth_failures_per_minute = 30
+
+[keeper]
+max_secret_bytes = 65536
+max_metadata_bytes = 4096
+llm_token_default_ttl_secs = 86400
+llm_token_max_ttl_secs = 2592000
+job_token_default_ttl_secs = 300
+job_token_max_ttl_secs = 3600
+max_job_secrets = 32
+default_rate_limit_per_minute = 120
+max_rate_limit_per_minute = 100000
+
+[llm]
+max_request_bytes = 16777216
+request_read_timeout_secs = 60
+connect_timeout_secs = 10
+response_timeout_secs = 300
+idle_timeout_secs = 300
+max_duration_secs = 1800
+max_error_body_bytes = 65536
+max_buffered_response_bytes = 33554432
+# Requests in flight per LLM token and in total, per replica.
+max_concurrent_per_token = 16
+max_concurrent_total = 1024
+
+# Providers. The tenant's key for provider <id> is the secret `llm.<id>` of
+# kind `llm_api_key`. Clients use:
+#   Anthropic SDK:  base_url = http://<broker>:8080/llm/anthropic
+#   OpenAI SDK:     base_url = http://<broker>:8080/llm/openai/<id>
+[llm.providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[llm.providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[llm.providers.deepseek]
+kind = "openai"
+base_url = "https://api.deepseek.com"
+
+[llm.providers.openrouter]
+kind = "openai"
+base_url = "https://openrouter.ai/api/v1"
+
+# Prices in USD per million tokens. The entries below are placeholders:
+# replace the model ids and prices with the provider's current ones.
+# `model` is an exact id or a prefix ending in `*`.
+# Tokens with a USD budget can only use priced models. Requests are billed
+# by the model the provider reports as having answered; one without a price
+# is billed at the provider's highest configured price. input and output
+# must be above zero unless the entry sets `free = true`.
+[[llm.pricing]]
+provider = "anthropic"
+model = "model-large"
+input = 4.0
+output = 20.0
+cache_read = 0.20
+cache_write = 5.0
+cache_write_1h = 8.0
+
+[[llm.pricing]]
+provider = "anthropic"
+model = "model-small"
+input = 2.0
+output = 10.0
+cache_read = 0.10
+cache_write = 2.5
+cache_write_1h = 4.0
+
+# Template: copy, uncomment and fill in from the provider's pricing page.
+# [[llm.pricing]]
+# provider = "deepseek"
+# model = "deepseek-chat"
+# input = ...
+# output = ...
+# cache_read = ...

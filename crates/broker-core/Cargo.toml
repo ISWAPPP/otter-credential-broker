@@ -1,0 +1,38 @@
+[package]
+name = "broker-core"
+description = "Domain logic for otter-credential-broker: secret store, envelope crypto, tokens, LLM usage accounting."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+hmac.workspace = true
+metrics.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[features]
+# Test helpers (throwaway PostgreSQL databases). Never enabled in release builds.
+testing = []
+
+[dev-dependencies]
+broker-core = { path = ".", features = ["testing"] }
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,33 @@
+# Local development. `make run-dev` creates ./secrets (KEK, admin tokens) and
+# expects a PostgreSQL server; see README "Development".
+listen = "127.0.0.1:8080"
+admin_listen = "127.0.0.1:8081"
+metrics_listen = "127.0.0.1:9090"
+admin_tokens_file = "./secrets/admin-tokens"
+token_key_file = "./secrets/token-key"
+
+[database]
+url = "postgres://postgres@127.0.0.1:5432/otter_credential_broker"
+max_connections = 5
+
+[kek]
+id = "dev-1"
+file = "./secrets/kek"
+
+[llm.providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[llm.providers.deepseek]
+kind = "openai"
+base_url = "https://api.deepseek.com"
+
+# Placeholder model id and price (USD per million tokens).
+[[llm.pricing]]
+provider = "anthropic"
+model = "model-small"
+input = 2.0
+output = 10.0
+cache_read = 0.10
+cache_write = 2.5
+cache_write_1h = 4.0
