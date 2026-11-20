@@ -19,8 +19,8 @@ struct Routes {
 }
 
 /// Providers `anthropic` and `gateway` (both of the Anthropic kind; the
-/// gateway serves two endpoints, only to tokens that name it) and `openai`;
-/// tenant-a has a key for each.
+/// gateway serves two endpoints, only to tokens that name it, and is priced
+/// like `anthropic`) and `openai`; tenant-a has a key for each.
 async fn routes() -> Option<Routes> {
     let (anthropic, a) = start_upstream().await;
     let (openai, o) = start_upstream().await;
@@ -43,6 +43,7 @@ async fn routes() -> Option<Routes> {
         allow_http = true
         access = "explicit"
         endpoints = ["messages", "count_tokens"]
+        pricing_from = "anthropic"
 
         [[llm.pricing]]
         provider = "anthropic"
@@ -101,6 +102,9 @@ async fn each_route_reaches_exactly_its_provider() {
     let rows = usage(env).await;
     let by = |p: &str| rows.iter().filter(|u| u["provider"] == p).count();
     assert_eq!((by("anthropic"), by("openai"), by("gateway")), (2, 3, 2), "{rows:?}");
+    // The gateway is priced with anthropic's entries: 200 * 3.0 + 50 * 15.0.
+    let gw = rows.iter().find(|u| u["provider"] == "gateway" && u["endpoint"] == "v1/messages").unwrap();
+    assert_eq!(gw["cost_micro_usd"].as_i64(), Some(1350), "{gw}");
     r.env.cleanup().await;
 }
 
@@ -177,5 +181,22 @@ async fn an_explicit_provider_serves_only_tokens_that_name_it() {
     assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
     assert_eq!(r.gateway.last().headers.get("x-api-key").unwrap(), GATEWAY_KEY);
     assert_eq!(call(named, "/llm/p/anthropic/v1/messages").await.status, StatusCode::FORBIDDEN);
+    r.env.cleanup().await;
+}
+
+#[tokio::test]
+async fn usd_budgets_work_with_borrowed_prices() {
+    let Some(r) = routes().await else { return };
+    let env = &r.env;
+    let (token, token_id) = env.llm_token("tenant-a", json!({"providers": ["gateway"], "budget_usd": 1.0})).await;
+    let h = [("x-api-key", token.as_str())];
+    let resp = env.llm("POST", "/llm/p/gateway/v1/messages", &h, Some(anthropic_body("test-model", false))).await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
+    // A model without a price at the source is still refused for a USD budget.
+    let resp = env.llm("POST", "/llm/p/gateway/v1/messages", &h, Some(anthropic_body("unpriced", false))).await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    env.settle().await;
+    let (_, t) = env.admin_call("GET", &format!("/v1/admin/tenants/tenant-a/llm-tokens/{token_id}"), None).await;
+    assert_eq!(t["spent_micro_usd"].as_i64(), Some(1350), "{t}");
     r.env.cleanup().await;
 }

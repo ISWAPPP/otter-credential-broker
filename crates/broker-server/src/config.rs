@@ -171,6 +171,11 @@ pub struct ProviderConfig {
     /// `chat_completions`, `models` for `openai`). All of them when left out.
     #[serde(default)]
     pub endpoints: Option<Vec<String>>,
+    /// Price this provider's usage with the `[[llm.pricing]]` entries of
+    /// another provider of the same kind (e.g. a gateway in front of it).
+    /// The provider then has no entries of its own.
+    #[serde(default)]
+    pub pricing_from: Option<String>,
 }
 
 fn yes() -> bool {
@@ -188,6 +193,7 @@ impl ProviderConfig {
             require_stream_usage: true,
             access: ProviderAccess::default(),
             endpoints: None,
+            pricing_from: None,
         }
     }
 }
@@ -286,9 +292,16 @@ pub struct Provider {
     pub access: ProviderAccess,
     /// The endpoints this provider serves (a subset of its kind's).
     pub endpoints: Vec<&'static Endpoint>,
+    /// Provider whose prices apply to this one.
+    pub pricing_from: Option<String>,
 }
 
 impl Provider {
+    /// The provider whose `[[llm.pricing]]` entries price this one's usage.
+    pub fn price_source(&self) -> &str {
+        self.pricing_from.as_deref().unwrap_or(&self.id)
+    }
+
     /// The endpoint at `path` for `method`, if this provider serves it.
     pub fn endpoint(&self, method: HttpMethod, path: &str) -> Option<&'static Endpoint> {
         self.endpoints.iter().copied().find(|e| e.method == method && e.path == path)
@@ -356,12 +369,29 @@ impl LlmConfig {
                     require_stream_usage: p.require_stream_usage,
                     access: p.access,
                     endpoints: provider_endpoints(id, p)?,
+                    pricing_from: p.pricing_from.clone(),
                 },
             );
         }
         let prices = PriceTable::new(self.pricing.clone())?;
         if let Some(unknown) = prices.providers().find(|p| !out.contains_key(*p)) {
             return Err(format!("llm.pricing: unknown provider {unknown}"));
+        }
+        for (id, p) in &self.providers {
+            let Some(source) = &p.pricing_from else { continue };
+            let what = format!("llm.providers.{id}.pricing_from");
+            let Some(s) = self.providers.get(source).filter(|_| source != id) else {
+                return Err(format!("{what}: must name another configured provider"));
+            };
+            if s.kind != p.kind {
+                return Err(format!("{what}: {source} is of another kind"));
+            }
+            if s.pricing_from.is_some() {
+                return Err(format!("{what}: {source} takes its prices from elsewhere itself (no chains)"));
+            }
+            if prices.providers().any(|x| x == id) {
+                return Err(format!("llm.pricing: {id} takes its prices from {source}; remove its own entries"));
+            }
         }
         for (name, v) in [
             ("request_read_timeout_secs", self.request_read_timeout_secs),
@@ -471,6 +501,50 @@ mod tests {
             gw.endpoints = Some(bad.iter().map(|s| s.to_string()).collect());
             c.providers.insert("gateway".into(), gw);
             assert!(c.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pricing_from() {
+        let price = |provider: &str| ModelPrice {
+            provider: provider.into(),
+            model: "m".into(),
+            input: 1.0,
+            output: 2.0,
+            cache_read: None,
+            cache_write: None,
+            cache_write_1h: None,
+            free: false,
+        };
+        let config = |pricing_from: &[(&str, &str)], pricing: Vec<ModelPrice>| {
+            let mut c = LlmConfig::default();
+            for id in ["anthropic", "gateway", "gateway-2"] {
+                c.providers.insert(id.into(), provider(ProviderKind::Anthropic, "https://host.example"));
+            }
+            c.providers.insert("openai".into(), provider(ProviderKind::Openai, "https://api.openai.com/v1"));
+            for (id, from) in pricing_from {
+                c.providers.get_mut(*id).unwrap().pricing_from = Some((*from).into());
+            }
+            c.pricing = pricing;
+            c.validate()
+        };
+        let (p, prices) =
+            config(&[("gateway", "anthropic"), ("gateway-2", "anthropic")], vec![price("anthropic")]).unwrap();
+        assert_eq!(p["gateway"].price_source(), "anthropic");
+        assert_eq!(p["anthropic"].price_source(), "anthropic");
+        assert_eq!(prices.lookup(p["gateway"].price_source(), "m").unwrap().output, 2.0);
+        // Without prices of its own the source is still fine (no prices then).
+        assert!(config(&[("gateway", "anthropic")], vec![]).is_ok());
+
+        for (bad, pricing) in [
+            (vec![("gateway", "missing")], vec![]),
+            (vec![("gateway", "gateway")], vec![]),
+            (vec![("gateway", "openai")], vec![]),
+            (vec![("gateway", "anthropic"), ("anthropic", "gateway-2")], vec![]),
+            (vec![("gateway", "gateway-2"), ("gateway-2", "anthropic")], vec![]),
+            (vec![("gateway", "anthropic")], vec![price("anthropic"), price("gateway")]),
+        ] {
+            assert!(config(&bad, pricing).is_err(), "{bad:?}");
         }
     }
 

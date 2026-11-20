@@ -340,7 +340,7 @@ async fn proxy(
         Probe::default()
     };
     let streaming = probe.stream.unwrap_or(false);
-    let request_price = probe.model.as_deref().and_then(|m| px.prices.lookup(provider_id, m));
+    let request_price = probe.model.as_deref().and_then(|m| px.prices.lookup(provider.price_source(), m));
     if endpoint.billable {
         if let Err(e) = grant.check_budget(probe.model.as_deref(), request_price) {
             let what = match (&e, grant.budget_tokens) {
@@ -445,6 +445,7 @@ async fn proxy(
         span: span.clone(),
         grant,
         provider: provider_id.to_owned(),
+        price_source: provider.price_source().to_owned(),
         endpoint,
         model: probe.model.clone(),
         max_output: probe.max_output(),
@@ -756,6 +757,8 @@ struct Finisher {
     span: Span,
     grant: LlmGrant,
     provider: String,
+    /// Provider whose prices apply (`pricing_from`, or the provider itself).
+    price_source: String,
     endpoint: &'static Endpoint,
     model: Option<String>,
     max_output: Option<u64>,
@@ -802,7 +805,7 @@ impl Finisher {
         let duration = self.started.elapsed();
         let u = report.usage;
         let (price, fallback) =
-            self.prices.prices.billing_price(&self.provider, self.model.as_deref(), report.model.as_deref());
+            self.prices.prices.billing_price(&self.price_source, self.model.as_deref(), report.model.as_deref());
         if fallback {
             tracing::warn!("provider reported a model without a configured price; billed at the highest known price");
             metrics::counter!("ocb_llm_unpriced_response_model_total", "provider" => self.provider.clone())
