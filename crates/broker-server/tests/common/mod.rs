@@ -273,6 +273,53 @@ pub fn price(provider: &str, model: &str, input: f64, output: f64, cache_read: O
     }
 }
 
+/// Providers `anthropic`, `deepseek` and `openrouter`, all on one fake
+/// upstream, with test prices.
+fn default_llm(o: &EnvOptions, upstream_addr: SocketAddr) -> LlmConfig {
+    let mut providers = BTreeMap::new();
+    let mk = |kind, base_url: String| ProviderConfig {
+        kind,
+        base_url,
+        allow_http: true,
+        propagate_trace_context: true,
+        require_stream_usage: o.require_stream_usage,
+    };
+    providers.insert("anthropic".into(), mk(ProviderKind::Anthropic, format!("http://{upstream_addr}")));
+    providers.insert("deepseek".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1")));
+    providers.insert("openrouter".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1/")));
+    LlmConfig {
+        max_request_bytes: o.max_request_bytes,
+        request_read_timeout_secs: 5,
+        connect_timeout_secs: 2,
+        response_timeout_secs: o.response_timeout_secs,
+        idle_timeout_secs: o.idle_timeout_secs,
+        max_duration_secs: 30,
+        max_error_body_bytes: 4096,
+        max_buffered_response_bytes: 1 << 20,
+        max_concurrent_per_token: o.max_concurrent_per_token,
+        max_concurrent_total: 1024,
+        providers,
+        pricing: vec![
+            // USD per million tokens (test values).
+            price("anthropic", "test-model", 3.0, 15.0, Some(0.3)),
+            price("anthropic", "echo-key", 1.0, 1.0, None),
+            price("anthropic", "long-stream", 1.0, 1.0, None),
+            price("anthropic", "stall-stream", 1.0, 1.0, None),
+            price("anthropic", "slow-json", 1.0, 1.0, None),
+            price("anthropic", "huge-stream", 1.0, 1.0, None),
+            price("anthropic", "cheap-model", 0.1, 0.1, None),
+            price("anthropic", "cheap-model-2", 0.1, 0.1, None),
+            price("anthropic", "expensive-model", 50.0, 100.0, None),
+            price("deepseek", "deepseek-*", 0.5, 2.0, Some(0.1)),
+        ],
+    }
+}
+
+/// The `[llm]` section of a test's TOML configuration.
+pub fn llm_config(toml: &str) -> LlmConfig {
+    broker_server::ServerConfig::parse(toml).unwrap_or_else(|e| panic!("test config: {e}")).llm
+}
+
 pub struct Env {
     pub admin: Router,
     pub public: Router,
@@ -313,9 +360,18 @@ impl Env {
     }
 
     pub async fn with(o: EnvOptions) -> Option<Self> {
+        let (upstream, upstream_addr) = start_upstream().await;
+        let llm = default_llm(&o, upstream_addr);
+        Self::with_llm(o, llm, (upstream, upstream_addr)).await
+    }
+
+    /// An environment with the given LLM configuration (e.g. parsed from a
+    /// test's own TOML). `upstream` is the fake upstream exposed as
+    /// `env.upstream`; the configuration decides which providers use it.
+    pub async fn with_llm(o: EnvOptions, llm: LlmConfig, upstream: (Upstream, SocketAddr)) -> Option<Self> {
         telemetry();
         let db = TestDb::create().await?;
-        let (upstream, upstream_addr) = start_upstream().await;
+        let (upstream, upstream_addr) = upstream;
         let clock = Arc::new(ManualClock::new(T0));
         let kek = LocalKeyProvider::new("test-1", Secret::new(random_bytes(KEY_LEN).unwrap())).unwrap();
         let hasher = TokenHasher::new(Secret::new(random_bytes(KEY_LEN).unwrap())).unwrap();
@@ -326,43 +382,6 @@ impl Env {
             clock.clone(),
             KeeperSettings::default(),
         );
-        let mut providers = BTreeMap::new();
-        let mk = |kind, base_url: String| ProviderConfig {
-            kind,
-            base_url,
-            allow_http: true,
-            propagate_trace_context: true,
-            require_stream_usage: o.require_stream_usage,
-        };
-        providers.insert("anthropic".into(), mk(ProviderKind::Anthropic, format!("http://{upstream_addr}")));
-        providers.insert("deepseek".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1")));
-        providers.insert("openrouter".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1/")));
-        let llm = LlmConfig {
-            max_request_bytes: o.max_request_bytes,
-            request_read_timeout_secs: 5,
-            connect_timeout_secs: 2,
-            response_timeout_secs: o.response_timeout_secs,
-            idle_timeout_secs: o.idle_timeout_secs,
-            max_duration_secs: 30,
-            max_error_body_bytes: 4096,
-            max_buffered_response_bytes: 1 << 20,
-            max_concurrent_per_token: o.max_concurrent_per_token,
-            max_concurrent_total: 1024,
-            providers,
-            pricing: vec![
-                // USD per million tokens (test values).
-                price("anthropic", "test-model", 3.0, 15.0, Some(0.3)),
-                price("anthropic", "echo-key", 1.0, 1.0, None),
-                price("anthropic", "long-stream", 1.0, 1.0, None),
-                price("anthropic", "stall-stream", 1.0, 1.0, None),
-                price("anthropic", "slow-json", 1.0, 1.0, None),
-                price("anthropic", "huge-stream", 1.0, 1.0, None),
-                price("anthropic", "cheap-model", 0.1, 0.1, None),
-                price("anthropic", "cheap-model-2", 0.1, 0.1, None),
-                price("anthropic", "expensive-model", 50.0, 100.0, None),
-                price("deepseek", "deepseek-*", 0.5, 2.0, Some(0.1)),
-            ],
-        };
         let proxy = LlmProxy::new(&llm).unwrap();
         let state = AppState {
             keeper: Arc::new(keeper),
@@ -376,7 +395,7 @@ impl Env {
             PublicOptions {
                 timeout: Duration::from_secs(10),
                 body_limit: 256 * 1024,
-                llm_body_limit: o.max_request_bytes,
+                llm_body_limit: llm.max_request_bytes,
                 trust_caller_trace_context: o.trust_caller_trace_context,
             },
         );

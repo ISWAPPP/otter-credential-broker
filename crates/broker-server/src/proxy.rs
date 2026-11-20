@@ -1,4 +1,7 @@
-//! LLM proxy: `/llm/anthropic/<endpoint>` and `/llm/openai/<provider>/<endpoint>`.
+//! LLM proxy: `/llm/p/<provider>/<endpoint>` for any configured provider,
+//! plus the older `/llm/anthropic/<endpoint>` (the provider with id
+//! `anthropic`) and `/llm/openai/<provider>/<endpoint>` (OpenAI-compatible
+//! providers).
 //!
 //! A caller (an agent pod) authenticates with an internal LLM token, sent the
 //! way its SDK sends an API key (`x-api-key` or `Authorization: Bearer`). The
@@ -124,16 +127,29 @@ impl LlmProxy {
     }
 }
 
-pub async fn anthropic(State(st): State<AppState>, req: Request) -> Response {
-    let rest = req.uri().path().strip_prefix("/llm/anthropic/").unwrap_or("").to_owned();
-    proxy(st, "anthropic", ProviderKind::Anthropic, &rest, req).await
+/// `/llm/p/<provider>/<endpoint>`: any configured provider, by id.
+pub async fn by_id(State(st): State<AppState>, req: Request) -> Response {
+    let (provider, rest) = split_provider(req.uri().path(), "/llm/p/");
+    proxy(st, &provider, None, &rest, req).await
 }
 
+/// `/llm/anthropic/<endpoint>`: the provider with id `anthropic`.
+pub async fn anthropic(State(st): State<AppState>, req: Request) -> Response {
+    let rest = req.uri().path().strip_prefix("/llm/anthropic/").unwrap_or("").to_owned();
+    proxy(st, "anthropic", Some(ProviderKind::Anthropic), &rest, req).await
+}
+
+/// `/llm/openai/<provider>/<endpoint>`: OpenAI-compatible providers.
 pub async fn openai(State(st): State<AppState>, req: Request) -> Response {
-    let tail = req.uri().path().strip_prefix("/llm/openai/").unwrap_or("");
+    let (provider, rest) = split_provider(req.uri().path(), "/llm/openai/");
+    proxy(st, &provider, Some(ProviderKind::Openai), &rest, req).await
+}
+
+/// Provider id and endpoint path from the raw request path (no decoding).
+fn split_provider(path: &str, prefix: &str) -> (String, String) {
+    let tail = path.strip_prefix(prefix).unwrap_or("");
     let (provider, rest) = tail.split_once('/').unwrap_or((tail, ""));
-    let (provider, rest) = (provider.to_owned(), rest.to_owned());
-    proxy(st, &provider, ProviderKind::Openai, &rest, req).await
+    (provider.to_owned(), rest.to_owned())
 }
 
 fn reject(kind: ProviderKind, e: &BrokerError) -> Response {
@@ -240,12 +256,27 @@ fn forwarded_response_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
     out
 }
 
-async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, req: Request) -> Response {
+/// Proxies one request to `provider_id`. A route that implies a provider
+/// kind (`route_kind`) only reaches providers of that kind.
+async fn proxy(
+    st: AppState,
+    provider_id: &str,
+    route_kind: Option<ProviderKind>,
+    rest: &str,
+    req: Request,
+) -> Response {
     let started = Instant::now();
     let px = st.proxy.clone();
-    let Some(provider) = px.providers.get(provider_id).filter(|p| p.kind == kind).cloned() else {
-        return reject(kind, &BrokerError::NotFound("unknown LLM provider".into()));
+    let found = px.providers.get(provider_id).filter(|p| route_kind.is_none_or(|k| p.kind == k)).cloned();
+    let Some(provider) = found else {
+        // Without a provider there is no error shape to copy; the generic
+        // route answers in the OpenAI-compatible one.
+        return reject(
+            route_kind.unwrap_or(ProviderKind::Openai),
+            &BrokerError::NotFound("unknown LLM provider".into()),
+        );
     };
+    let kind = provider.kind;
     let method = match *req.method() {
         Method::GET => HttpMethod::Get,
         Method::POST => HttpMethod::Post,

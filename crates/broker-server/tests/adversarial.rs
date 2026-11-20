@@ -410,6 +410,14 @@ async fn only_allowlisted_endpoints_and_providers_are_reachable() {
         ("POST", "/llm/openai/deepseek/chat/completions?api-version=1".into()),
         ("POST", "/llm/deepseek/chat/completions".into()),
         ("POST", "/llm/".into()),
+        ("POST", "/llm/p/evil/v1/messages".into()),
+        ("POST", "/llm/p/anthropic/v1/files".into()),
+        ("POST", "/llm/p/anthropic/chat/completions".into()),
+        ("POST", "/llm/p/deepseek/v1/messages".into()),
+        ("POST", "/llm/p/anthropic%2Fv1/messages".into()),
+        ("POST", "/llm/p/../anthropic/v1/messages".into()),
+        ("POST", format!("/llm/p/{evil_addr}/v1/messages")),
+        ("POST", "/llm/p/http:%2F%2Fevil.example/v1/messages".into()),
     ];
     for (method, uri) in &cases {
         let r = env

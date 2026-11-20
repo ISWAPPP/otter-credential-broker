@@ -13,8 +13,12 @@ use broker_core::llm::ProviderKind;
 use broker_core::llm::pricing::{ModelPrice, PriceTable};
 use broker_core::validate;
 use figment::Figment;
-use figment::providers::{Env, Format, Serialized, Toml};
+use figment::providers::{Data, Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
+
+/// Provider ids that would collide with paths under `/llm/`: the
+/// `/llm/p/<id>/...` route and the broker's own `/llm/_/...` paths.
+pub const RESERVED_PROVIDER_IDS: &[&str] = &["p", "_", "limits"];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -132,8 +136,9 @@ pub struct LlmConfig {
     pub max_concurrent_per_token: u32,
     /// Requests in flight in total (per replica).
     pub max_concurrent_total: u32,
-    /// Upstream providers by id. `/llm/anthropic/...` uses the provider with
-    /// id `anthropic`; `/llm/openai/<id>/...` uses OpenAI-compatible ones.
+    /// Upstream providers by id. `/llm/p/<id>/...` reaches any of them;
+    /// the older routes stay: `/llm/anthropic/...` uses the provider with id
+    /// `anthropic`, `/llm/openai/<id>/...` OpenAI-compatible ones.
     pub providers: BTreeMap<String, ProviderConfig>,
     /// USD per million tokens, per provider and model.
     pub pricing: Vec<ModelPrice>,
@@ -223,9 +228,18 @@ const TOP_LEVEL_KEYS: &[&str] = &[
 
 impl ServerConfig {
     pub fn load(file: Option<&Path>) -> Result<Self, Box<figment::Error>> {
+        Self::extract(file.map(Toml::file_exact))
+    }
+
+    /// Like [`ServerConfig::load`], with the content of the file given.
+    pub fn parse(toml: &str) -> Result<Self, Box<figment::Error>> {
+        Self::extract(Some(Toml::string(toml)))
+    }
+
+    fn extract(file: Option<Data<Toml>>) -> Result<Self, Box<figment::Error>> {
         let mut fig = Figment::from(Serialized::defaults(Self::default()));
         if let Some(f) = file {
-            fig = fig.merge(Toml::file_exact(f));
+            fig = fig.merge(f);
         }
         // Only known keys: OCB_CONFIG and test variables are not config.
         let env = Env::prefixed("OCB_")
@@ -252,10 +266,10 @@ impl LlmConfig {
     pub fn validate(&self) -> Result<(BTreeMap<String, Provider>, PriceTable), String> {
         let mut out = BTreeMap::new();
         for (id, p) in &self.providers {
-            validate::provider_id(id).map_err(|e| format!("llm.providers.{id}: {e}"))?;
-            if p.kind == ProviderKind::Anthropic && id != "anthropic" {
-                return Err(format!("llm.providers.{id}: providers of kind anthropic must have the id `anthropic`"));
+            if RESERVED_PROVIDER_IDS.contains(&id.as_str()) {
+                return Err(format!("llm.providers.{id}: this id is reserved"));
             }
+            validate::provider_id(id).map_err(|e| format!("llm.providers.{id}: {e}"))?;
             let url = reqwest::Url::parse(&p.base_url).map_err(|e| format!("llm.providers.{id}.base_url: {e}"))?;
             match url.scheme() {
                 "https" => {}
@@ -333,8 +347,10 @@ mod tests {
             ("x", ProviderKind::Openai, "https://user:pw@host.example"),
             ("x", ProviderKind::Openai, "https://host.example/?a=1"),
             ("x", ProviderKind::Openai, "file:///etc/passwd"),
-            ("x", ProviderKind::Anthropic, "https://host.example"),
             ("Bad.Id", ProviderKind::Openai, "https://host.example"),
+            ("p", ProviderKind::Anthropic, "https://host.example"),
+            ("limits", ProviderKind::Openai, "https://host.example"),
+            ("_", ProviderKind::Openai, "https://host.example"),
         ] {
             let mut c = LlmConfig::default();
             c.providers.insert(id.into(), provider(kind, url));
@@ -348,9 +364,46 @@ mod tests {
     }
 
     #[test]
+    fn several_providers_of_one_kind() {
+        let mut c = LlmConfig::default();
+        c.providers.insert("anthropic".into(), provider(ProviderKind::Anthropic, "https://api.anthropic.com"));
+        c.providers.insert("gateway".into(), provider(ProviderKind::Anthropic, "https://gateway.example:8443/"));
+        let (p, _) = c.validate().unwrap();
+        assert_eq!(p["gateway"].kind, ProviderKind::Anthropic);
+        assert_eq!(p["gateway"].base_url, "https://gateway.example:8443");
+    }
+
+    #[test]
     fn defaults_load() {
         let cfg = ServerConfig::load(None).unwrap();
         assert_eq!(cfg.listen.port(), 8080);
         assert_eq!(cfg.admin_listen.port(), 8081);
+    }
+
+    /// The TOML embedded in the ConfigMap of the Kubernetes manifest.
+    fn manifest_config() -> String {
+        let yaml = include_str!("../../../deploy/k8s/broker.yaml");
+        let (_, rest) = yaml.split_once("config.toml: |\n").unwrap();
+        let lines: Vec<&str> = rest
+            .lines()
+            .take_while(|l| l.is_empty() || l.starts_with("    "))
+            .map(|l| l.strip_prefix("    ").unwrap_or(l))
+            .collect();
+        lines.join("\n")
+    }
+
+    #[test]
+    fn shipped_configs_load_as_they_are() {
+        for (name, text) in [
+            ("deploy/k8s/broker.yaml", manifest_config()),
+            ("config/example.toml", include_str!("../../../config/example.toml").to_owned()),
+            ("config/dev.toml", include_str!("../../../config/dev.toml").to_owned()),
+        ] {
+            let cfg = ServerConfig::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (providers, _) = cfg.llm.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(providers["anthropic"].kind, ProviderKind::Anthropic, "{name}");
+            assert_eq!(providers["deepseek"].kind, ProviderKind::Openai, "{name}");
+        }
+        assert_eq!(ServerConfig::parse(&manifest_config()).unwrap().database.max_connections, 10);
     }
 }

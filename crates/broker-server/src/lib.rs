@@ -140,6 +140,7 @@ pub fn public_router(state: AppState, o: PublicOptions) -> Router {
     // No global timeout here: responses stream for minutes. Upstream timeouts
     // (connect, response, idle, total) are enforced by the proxy itself.
     let llm = Router::new()
+        .route("/llm/p/{*path}", any(proxy::by_id))
         .route("/llm/anthropic/{*path}", any(proxy::anthropic))
         .route("/llm/openai/{*path}", any(proxy::openai))
         .layer(DefaultBodyLimit::max(o.llm_body_limit));
