@@ -110,12 +110,14 @@
   firm bound). A budget in USD is exceeded likewise by the cost of input
   tokens.
 - **Reservations that outlive their request.** A reservation goes back when
-  its request is accounted, or when it ends before reaching the provider.
-  If the process dies in between (not a graceful shutdown, which accounts),
-  or accounting fails after its retries, the reservation stays in its
-  period's row until the period ends: at most `llm.max_reservation_tokens`
-  per such request, for the rest of a day or month. `GET /v1/admin/limits`
-  shows what is reserved.
+  its request is accounted, or when it ends before reaching the provider,
+  also when the caller hangs up while the reservation is being taken: it
+  is taken in a task the caller cannot cut short (tested by hanging up at
+  every point of a request). If the process dies in between (not a
+  graceful shutdown, which accounts), or accounting fails after its
+  retries, the reservation stays in its period's row until the period
+  ends: at most `llm.max_reservation_tokens` per such request, for the rest
+  of a day or month. `GET /v1/admin/limits` shows what is reserved.
 - **Budgets count from when they are set.** A tenant budget set in the
   middle of a month does not count the month's earlier usage, and one
   removed and set again starts from the spend already in the period's row.

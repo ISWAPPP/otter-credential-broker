@@ -37,11 +37,11 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use broker_core::keeper::{Authorized, LlmGrant};
-use broker_core::limits::{LimitKind, LimitLevel, LimitRefusal, Reservation};
+use broker_core::limits::{LimitKind, LimitLevel, LimitRefusal, Limits, Reservation};
 use broker_core::llm::scrub::{StreamRedactor, scrub_error_body};
 use broker_core::llm::usage::{TapReport, Usage, UsageSource, UsageTap};
 use broker_core::llm::{Endpoint, HttpMethod, ProviderKind};
-use broker_core::store::NewUsageRow;
+use broker_core::store::{NewUsageRow, SpendRow};
 use broker_core::tokens::TokenDigest;
 use broker_core::{BrokerError, Keeper, Secret};
 use bytes::Bytes;
@@ -565,7 +565,7 @@ async fn proxy(
     // Budgets of the tenant and the provider: the request reserves its
     // most output on each, all or nothing, until it is accounted. The
     // token's own budget is checked above, as before.
-    let mut held = Held { keeper: st.keeper.clone(), tracker: px.tracker.clone(), reservations: Vec::new() };
+    let mut held = Held::none(&st.keeper, &px.tracker);
     if endpoint.billable && (auth.tenant_limits.has_budget() || provider.limits.has_budget()) {
         if request_price.is_none() {
             let whose = if auth.tenant_limits.has_usd_budget() {
@@ -590,10 +590,10 @@ async fn proxy(
         let micro_usd =
             request_price.map_or(0, |p| p.cost_micro_usd(&Usage { output_tokens: tokens, ..Usage::default() }));
         let tokens = i64::try_from(tokens).unwrap_or(i64::MAX);
-        match st.keeper.reserve(&auth, provider_id, &provider.limits, tokens, micro_usd).await {
-            Ok(r) => {
-                view.reserved(&auth.tenant_limits, &tenant, &r.rows);
-                held.reservations = r.reservations;
+        match reserve(&st.keeper, &px.tracker, &auth, provider_id, provider.limits, tokens, micro_usd).await {
+            Ok((h, rows)) => {
+                view.reserved(&auth.tenant_limits, &tenant, &rows);
+                held = h;
             }
             Err(e) => {
                 done!(match &e {
@@ -1041,6 +1041,10 @@ struct Held {
 }
 
 impl Held {
+    fn none(keeper: &Arc<Keeper>, tracker: &TaskTracker) -> Self {
+        Self { keeper: keeper.clone(), tracker: tracker.clone(), reservations: Vec::new() }
+    }
+
     fn take(&mut self) -> Vec<Reservation> {
         std::mem::take(&mut self.reservations)
     }
@@ -1069,6 +1073,39 @@ impl Drop for Held {
             }
         });
     }
+}
+
+/// Reserves on the budgets of the tenant and the provider, in a task of
+/// its own. Awaited in the handler, a reservation would be cut short when
+/// the handler is dropped (the caller goes away, the process shuts down),
+/// and one cut while its commit is under way can still be committed, with
+/// nobody left to give it back until its period ends. The task always runs
+/// to its end; when the handler is no longer there to take the
+/// reservations, they are dropped in the task, which gives them back.
+async fn reserve(
+    keeper: &Arc<Keeper>,
+    tracker: &TaskTracker,
+    auth: &Authorized,
+    provider: &str,
+    limits: Limits,
+    tokens: i64,
+    micro_usd: i64,
+) -> Result<(Held, Vec<SpendRow>), BrokerError> {
+    let (tx, rx) = oneshot::channel();
+    let task = {
+        let (keeper, tracker, auth, provider) = (keeper.clone(), tracker.clone(), auth.clone(), provider.to_owned());
+        async move {
+            let reserved = keeper.reserve(&auth, &provider, &limits, tokens, micro_usd).await.map(|r| {
+                let held = Held { keeper: keeper.clone(), tracker, reservations: r.reservations };
+                (held, r.rows)
+            });
+            // Refused once the handler is gone: dropping what it would
+            // have taken gives the reservations back.
+            let _ = tx.send(reserved);
+        }
+    };
+    tracker.spawn(task.in_current_span());
+    rx.await.unwrap_or_else(|_| Err(BrokerError::Internal("the reservation ended without an answer".into())))
 }
 
 impl Finisher {

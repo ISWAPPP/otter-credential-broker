@@ -452,8 +452,12 @@ exchange settles the reservations with the actual usage in the transaction
 that writes the usage row, in those periods: a stream that runs past
 midnight counts in the day it started. A request that ends before it
 reaches the provider (no key for it, the caller gone) gives its
-reservations back. A reservation stays until its period ends only if the
-process dies between the two, or accounting fails after its retries.
+reservations back. The reservation is taken in a task of its own, which
+runs to its end even when the caller goes away meanwhile, and then gives
+it back itself: a handler dropped while the reservation commits would
+otherwise leave it taken with nobody to return it. A reservation stays
+until its period ends only if the process dies between the two, or
+accounting fails after its retries.
 
 A USD budget needs prices: a provider with a USD budget must have prices
 (checked when the configuration is loaded), a tenant's is refused while the

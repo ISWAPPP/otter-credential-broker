@@ -425,6 +425,24 @@ async fn a_request_that_ends_before_the_provider_gives_its_reservation_back() {
     env.cleanup().await;
 }
 
+#[tokio::test]
+async fn a_caller_gone_at_any_point_leaves_no_reservation_behind() {
+    let Some(env) = env_with("budget_tokens = { day = 1_000_000 }").await else { return };
+    set_limits(&env, "tenant-a", json!({"budget_tokens": {"day": 1_000_000}})).await;
+    let (token, _) = env.llm_token("tenant-a", json!({"rate_limit_per_minute": 1000})).await;
+    // Hang up after 0 to 10 ms: before the reservation, while it commits,
+    // before the exchange takes it over and while the provider answers.
+    for i in 0..40 {
+        let request = in_background(&env, &token, "test-model", false);
+        tokio::time::sleep(Duration::from_micros(i * 250)).await;
+        request.abort();
+    }
+    env.settle().await;
+    let rows = spend(&env).await;
+    assert!(!rows.is_empty() && rows.iter().all(|r| r.6 == 0), "{rows:?}");
+    env.cleanup().await;
+}
+
 type Window = (String, String, String, i32);
 
 /// Every request window: level, tenant, provider and its count.
