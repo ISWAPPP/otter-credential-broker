@@ -437,6 +437,9 @@ async fn a_caller_gone_at_any_point_leaves_no_reservation_behind() {
         tokio::time::sleep(Duration::from_micros(i * 250)).await;
         request.abort();
     }
+    // On a fast machine every caller may hang up before its reservation; one
+    // request that completes makes sure the budget rows exist either way.
+    assert_eq!(send(&env, &token).await.status, StatusCode::OK);
     env.settle().await;
     let rows = spend(&env).await;
     assert!(!rows.is_empty() && rows.iter().all(|r| r.6 == 0), "{rows:?}");
