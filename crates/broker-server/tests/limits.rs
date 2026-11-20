@@ -543,8 +543,9 @@ async fn the_limits_endpoint_shows_the_callers_own_and_counts_no_request() {
     let exhausted = limits_of(&env, &a).await;
     let v = exhausted.json();
     assert_eq!(v["global"], json!([{"provider": "anthropic", "status": "exhausted", "resets_at": DAY0 + 86_400}]));
+    // tenant-b's budget would show as a number: random ids can hold "777".
     for text in [near.text(), exhausted.text()] {
-        assert!(!text.contains("tenant-b") && !text.contains(&b_id) && !text.contains("777"), "{text}");
+        assert!(!text.contains("tenant-b") && !text.contains(&b_id) && !text.contains(":777"), "{text}");
     }
     // tenant-b sees its own.
     let v = limits_of(&env, &b).await.json();
