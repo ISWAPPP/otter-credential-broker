@@ -9,7 +9,9 @@ All shared state (secrets, tokens, rate-limit windows, budgets, usage,
 audit) is in PostgreSQL, so the service runs as two or more interchangeable
 replicas (per-replica load limits are in memory, see D-015).
 Correctness-relevant updates are single atomic statements: token validation
-plus rate-limit counting, job token redemption, spend accounting.
+plus rate-limit counting, the request windows of a tenant and a provider,
+job token redemption; reservations on budgets and spend accounting are one
+transaction each.
 
 Queries are literal SQL checked at runtime (no build-time database needed);
 timestamps are unix seconds bound from an injectable clock, which keeps
@@ -122,8 +124,9 @@ Not chosen yet; `LICENSE` is a placeholder until it is.
   model the provider reports as having answered; one without a price is
   billed at the provider's highest configured price. Zero prices need
   `free = true`.
-- Usage writes are retried a few times. **Open:** a durable outbox, and
-  reservations to bound overshoot by concurrent requests.
+- Usage writes are retried a few times. Budgets of tenants and providers
+  are reserved before a request is sent (D-022). **Open:** a durable
+  outbox, and reservations on the token's own budget.
 
 ## D-011 Three listeners (accepted)
 
@@ -163,9 +166,10 @@ and the client address on every request. Limits that only bound one
 replica's load are kept in memory: requests in flight per LLM token and in
 total, and failed token checks per client address and minute (refused
 without a database lookup once over the limit). Limits that must hold across
-replicas (rate limit, budgets) stay in PostgreSQL. Shutdown is staged: stop
-accepting, give in-flight requests a grace period, then cut them and account
-conservatively.
+replicas (rate limits, budgets) stay in PostgreSQL. Caps on requests in
+flight per tenant and per provider (D-022) are kept the same way as the
+token's, per replica. Shutdown is staged: stop accepting, give in-flight
+requests a grace period, then cut them and account conservatively.
 
 ## D-016 Caller trace context is untrusted on the public listener (accepted)
 
@@ -196,9 +200,10 @@ their own; `/llm/anthropic/...` and `/llm/openai/<id>/...` stay as they
 were. The new route has its own prefix, so no provider id can shadow an
 older route. The ids `p` and `limits` are reserved anyway, so that no
 provider id reads like a path of the broker itself: `p` is the prefix of
-the route, and `limits` is kept for a later endpoint. Reserving names
-before a first release costs little, and giving them back later breaks
-nothing, while reserving them later would. It does turn away a
+the route, and `limits` names the endpoint where callers see their limits,
+`/llm/_/limits` (D-022). Reserving names before a first release costs
+little, and giving them back later breaks nothing, while reserving them
+later would. It does turn away a
 configuration that used either id for an `openai` provider, which loaded
 before: rename such a provider, store each tenant's key under the new
 `llm.<id>` and reissue tokens whose `providers` list names it.
@@ -298,3 +303,78 @@ configuration error.
 
 Both are part of the provider configuration: reloaded like the rest of it
 (D-019) and shown by `GET /v1/admin/providers` (D-017).
+
+## D-022 Limits on three levels (accepted)
+
+Only a token had limits (a rate, a budget for its life, requests in flight
+per replica), with a cap on requests in flight per replica, and callers
+could not see them. A platform also needs a ceiling per tenant, whatever
+the number of its tokens, and one per provider for everyone: an account at
+a provider has limits of its own, or an owner wants to cap what it spends
+there. Limits now apply on three levels, the strictest of which decides:
+the token as before; the tenant, set through the admin API and audited,
+since it is the platform's data about its tenants and changes often; and
+the provider for every tenant, `limits` in its configuration, reviewed
+like the rest of a provider and reloaded with it.
+
+**Order.** A level only counts a request that the levels below it let
+through. Counting every request on every level first and deciding after
+would let one token far over its own rate fill its tenant's window and the
+provider's, and refuse everyone else. The token's window is counted as
+before, in the statement that finds the token, because its row MAC is
+checked in the broker before anything above the token is touched; the
+tenant's and the provider's windows are one statement of conditional
+updates, which never count past a limit and report the level that refused.
+Requests in flight are checked in the same order, in memory.
+
+**Periods.** Budgets of tenants and providers are per UTC day and month, a
+period being a row keyed by its start: a new period starts from zero with
+no job to reset counters, and old rows are history. A request counts in the
+period it was authorized in, which travels with it to accounting, so a
+stream cannot move its cost into a fresh period by running past midnight.
+
+**Reservations.** Without them every request in flight passes a check of
+what is spent, and a tenant with many tokens and replicas could go over its
+budget by an amount no setting bounds. A billable request reserves its
+`max_tokens` (capped by `llm.max_reservation_tokens`) on each budget, all
+or nothing, and accounting replaces the reservation by the actual usage in
+the transaction that writes the usage row. A budget admits while spent
+plus reserved is below it, like the token's check, rather than requiring
+the reservation to fit: a request that will use far less than its
+`max_tokens` is not refused for it, and the overshoot stays bounded
+(THREAT_MODEL.md). The input of a request is not reserved: estimated from
+the size of the body it would count images and other encoded content far
+above their tokens, and refuse requests near a limit for nothing. The
+token's own budget keeps its pre-check.
+
+**USD budgets** need prices: over a provider or a model without one, a USD
+budget would never be used up, since such usage costs nothing. So it is
+refused where it shows: at load for a provider without prices, at `PUT`
+for a tenant holding a key for one, and per request for a model without a
+price.
+
+**Visibility.** Every answer shows callers their limits: the IETF
+`RateLimit-Policy` and `RateLimit` fields for requests per minute, which
+clients are starting to understand, and `ocb-budget-*` for the budget
+nearest to running out, since budgets in tokens or dollars per period have
+no standard field; `ocb-limit-level` names the level that refused, or that
+of the budget. `GET /llm/_/limits` shows all of a caller's limits with a
+small rate limit of its own instead of the token's, so an agent can look
+before it acts without using up what it looks at. A provider's numbers come
+from every tenant's requests, and agent pods are untrusted, so callers only
+learn whether a provider is `ok`, `near` or `exhausted` and when that
+changes; exact numbers are on the admin listener and in the metrics, like
+other data labelled by tenant (D-011). The `ratelimit*` and `ocb-*` names
+were already kept from providers (D-021), so an upstream cannot forge
+these headers.
+
+**Hot rows.** A provider's window and budget rows are touched by every
+request to it. Rows are locked in one order everywhere, a tenant's first
+and a provider's last, which rules out deadlocks and holds a provider's
+rows only until the commit. That measured at about 2000 billable requests
+per second for one provider on a laptop, well above LLM request rates;
+splitting a provider's rows into slots summed when read is the next step
+if it ever is not.
+
+**Open:** a reservation whose process died before accounting stays until
+its period ends; sweeping old reservations would need their age.

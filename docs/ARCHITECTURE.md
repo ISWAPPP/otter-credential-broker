@@ -16,11 +16,12 @@ flowchart LR
   prom[Prometheus] -- ":9090" --> B2
 ```
 
-Secrets, tokens, rate-limit windows, budgets, usage and audit live in
-PostgreSQL, so any replica can serve any request and two or more run behind a
-Service. What each replica keeps in memory are limits that only bound its own
-load: requests in flight and failed token checks per client address (see
-"Limits").
+Secrets, tokens, limits of tenants, rate-limit windows, budgets, usage and
+audit live in PostgreSQL, so any replica can serve any request and two or
+more run behind a Service. What each replica keeps in memory are limits that
+only bound its own load: requests in flight (per token, tenant and provider),
+failed token checks per client address and requests to `/llm/_/limits` per
+token (see "Limits").
 
 Crates:
 
@@ -37,8 +38,10 @@ Crates:
     identifier rules.
   - `llm`: endpoint allowlists, usage extraction (`UsageTap`), price table,
     scrubbing and streaming redaction.
+  - `limits`: the levels of limits, their settings and UTC periods.
 - `broker-server`: accept loop, routes, admin handlers, worker endpoint, LLM
-  proxy and its exchange tasks, limits, config validation, the provider
+  proxy and its exchange tasks, limits in memory, the limit headers,
+  `/llm/_/limits` and the limit gauges, config validation, the provider
   registry and its reload, TLS of upstream providers, spans and metrics.
 - `otter-credential-broker`: the binary and telemetry setup.
 
@@ -53,6 +56,28 @@ All timestamps are unix seconds. Every tenant-owned row carries `tenant_id`.
 | `job_tokens` | keyed digest of the token, `auth_mac`, tenant, job id, explicit list of secret names, optional job `trace_parent`, `expires_at`, `used_at`, `revoked_at`. |
 | `llm_usage` | one row per proxied request: token, tenant, run id, provider, endpoint, requested model, `response_model` (the model the provider reported), status, input/output/cache tokens, cost, `usage_source` (`reported`, `estimated`, `none`), duration, time to first token, trace id. |
 | `audit_log` | `ts, actor, action, tenant_id, secret_name, purpose, trace_id, detail`. Never values. |
+| `tenant_limits` | limits of a tenant set through the admin API: `rpm`, `concurrent`, token and micro-USD budgets per day and month; who and when. |
+| `limit_rpm` | the current one-minute window (`rl_window`, `rl_count`) of a tenant or a provider with a rate limit. |
+| `limit_spend` | spend of a tenant or a provider per UTC period (`period_kind` day or month, `period_start`): `spent_*`, `reserved_*` (held by requests in flight) and the limit in force at the last reservation. |
+
+On the tenant level `provider` is empty, on the global level `tenant_id`.
+
+### Migrations
+
+Migrations live in `crates/broker-core/migrations`; a released one is never
+edited, since sqlx checks their checksums. `0001_init` creates every table
+above except the last three; `0002_limits` adds those three and a partial
+index on the live labelled tokens (for their expiry metric). They run at
+start under sqlx's advisory lock (`database.run_migrations`), or with
+`otter-credential-broker migrate`.
+
+`0002` only adds. Its index is built inside the migration's transaction,
+which holds writes to `llm_tokens` while it is built: on a large table, run
+it at a quiet time. A binary older than `0002` refuses to start with
+`run_migrations = true` against a database that has it (sqlx reports a
+migration it does not know); to go back to one, set
+`database.run_migrations = false` for it. It leaves the new tables alone,
+and their rows apply again once the newer binary is back.
 
 ### Envelope encryption
 
@@ -110,9 +135,12 @@ sequenceDiagram
   participant P as provider
   A->>H: POST /llm/p/<provider>/v1/messages (x-api-key: ocb_llm_...)
   H->>H: take the provider snapshot; provider, endpoint and query allowlists, address limiter
-  H->>DB: UPDATE llm_tokens ... RETURNING (valid? MAC ok? count rate-limit window)
-  H->>H: in-flight permit, read body, parse model/stream/max_tokens only
-  H->>H: body policy (tools, mcp_servers), budget pre-check, price lookup
+  H->>DB: UPDATE llm_tokens ... RETURNING, with the tenant's limits and spend (valid? MAC ok? token window)
+  H->>H: in-flight permits: token, tenant, provider, total
+  H->>DB: count in the windows of the tenant, then of the provider (one statement)
+  H->>H: read body, parse model/stream/max_tokens only
+  H->>H: body policy (tools, mcp_servers), token budget pre-check, price lookup
+  H->>DB: reserve on the budgets of the tenant and the provider (one transaction, all or nothing)
   H->>DB: audit secret.decrypt, then SELECT sealed llm.<provider> of the token's tenant
   H->>X: spawn with request, key, permit
   X->>P: same body, allowed headers, x-api-key: <tenant key>, traceparent
@@ -120,7 +148,7 @@ sequenceDiagram
   X-->>H: response head (status, allowed headers)
   H-->>A: head; body chunks follow from the task
   X-->>A: same bytes (tap reads usage, redactor guards the key)
-  X->>DB: UPDATE spend + INSERT llm_usage (after the upstream body ends)
+  X->>DB: UPDATE spend + INSERT llm_usage + settle the reservations (after the upstream body ends)
 ```
 
 - **Routing.** `/llm/p/<id>/<path>` reaches any provider by id;
@@ -140,13 +168,17 @@ sequenceDiagram
   (fixed one-minute windows, atomic across replicas), followed by the row
   MAC check and the provider check: a token with a `providers` list may only
   use those, and a provider with `access = "explicit"` only serves tokens
-  whose list names it.
-- **Budgets.** Pre-check: refuse when `spent >= budget` (402). A token with a
-  USD budget may only use models that have a price (400 otherwise).
-  Post-accounting: after the upstream response ends, cost and tokens are
-  added atomically (saturating). Concurrent requests can each pass the
-  pre-check, so a budget can be exceeded by the cost of the requests in
-  flight at that moment (at most `max_concurrent_per_token` per replica).
+  whose list names it. The same statement reads the limits of the token's
+  tenant and its spend; the tenant's and the provider's limits come next
+  (see "Limits").
+- **Budgets.** The token's: pre-check, refuse when `spent >= budget` (402).
+  A token with a USD budget may only use models that have a price (400
+  otherwise). Post-accounting: after the upstream response ends, cost and
+  tokens are added atomically (saturating). Concurrent requests can each
+  pass the pre-check, so a token's budget can be exceeded by the cost of
+  its requests in flight at that moment (at most `max_concurrent_per_token`
+  per replica). Budgets of the tenant and the provider are reserved before
+  the request is sent and settled with its usage (see "Limits").
 - **Body policy.** A provider of kind `anthropic` with
   `body.deny_server_tools` refuses, with 400 `server_tool_denied`, a request
   to any of its POST endpoints whose `mcp_servers` is not empty or that has
@@ -182,8 +214,9 @@ sequenceDiagram
   `x-should-retry` (the provider telling SDKs whether to retry), and those
   that start with one of the provider's `headers.response_forward_prefixes`
   (never `set-cookie`, `www-authenticate`, `location`, `alt-svc`,
-  `ratelimit*`, `ocb-*`, framing or hop-by-hop headers). Success
-  bodies are streamed chunk by chunk; any occurrence of the provider key is
+  `ratelimit*`, `ocb-*`, framing or hop-by-hop headers), then the
+  broker's own limit headers (see "Limits"). Success bodies are streamed
+  chunk by chunk; any occurrence of the provider key is
   replaced by `[REDACTED]` (a tail that could be the start of the key is held
   back until the next chunk). Compressed success bodies are refused (502):
   they could be neither redacted nor accounted. Error bodies are read up to
@@ -242,6 +275,7 @@ URL, and optionally:
 | `tls` | `ca_file`, optionally `client_cert` and `client_key`: a client of its own that trusts only that CA and presents that certificate |
 | `headers` | `request_forward_prefixes`, `response_forward_prefixes`: more headers passed in each direction, by name prefix; none by default |
 | `body` | `deny_server_tools`, `server_tool_allowlist` (kind `anthropic`): refuse requests that would have the provider run tools or contact MCP servers itself; off by default |
+| `limits` | `rpm`, `concurrent`, `budget_tokens` and `budget_usd` per `day` and `month`: limits of the provider for every tenant together (see "Limits"); none by default |
 
 Several providers may share a kind; `/llm/p/<id>/...` reaches each of them.
 
@@ -256,9 +290,11 @@ configuration it started with, whatever a reload does in the meantime.
 
 What has to outlive a reload is not part of the snapshot and is never
 replaced: the exchange tasks (shutdown waits for them), the shutdown
-switch, the in-flight limits per token and in total, the failed-token
-limiter per address and the client shared by providers without `tls`. A
-reload neither resets limits nor hides a running stream from shutdown.
+switch, the counts of requests in flight per token, tenant and provider and
+in total, the failed-token limiter per address, the limiter of
+`/llm/_/limits` and the client shared by providers without `tls`. A reload
+neither resets limits nor hides a running stream from shutdown; a
+provider's `limits` are part of the snapshot and change with it.
 
 ### Reload
 
@@ -342,18 +378,117 @@ requests, and `GET /v1/admin/providers` shows them.
 
 ## Limits
 
-Per replica, in memory:
+Limits apply on three levels, and the strictest one decides:
+
+| Level | Requests per minute | Budget | Requests in flight | Set |
+|---|---|---|---|---|
+| token | the token's row | the token's row, for its whole life | per replica, in memory | when the token is issued |
+| tenant | `limit_rpm` | `limit_spend`, per UTC day and month | per replica, in memory | `PUT /v1/admin/tenants/{t}/limits`, audited |
+| global (a provider, for every tenant) | `limit_rpm` | `limit_spend`, per UTC day and month | per replica, in memory | `limits` of the provider in the configuration, reloaded with it |
+
+### Order of the checks
+
+A request is checked level by level, and a level only counts a request
+that the levels below it let through, so a caller over one level's limit
+cannot use up a higher level's for everyone else:
+
+1. The token: found, neither revoked nor expired, its row MAC intact, the
+   provider allowed, and its window within its rate limit. One statement
+   counts the request in the token's window, as before, and reads the
+   tenant's limits and its spend in the current day and month.
+2. Requests in flight, in memory: the token's cap, then the tenant's, then
+   the provider's, then the replica's total. A refused request is counted
+   nowhere.
+3. One statement counts the request in the window of the tenant and then
+   of the provider, each with
+   `INSERT ... ON CONFLICT DO UPDATE ... WHERE rl_count < limit`: the
+   provider's window only takes part when the tenant's let the request
+   through, neither counts past its limit, and the result says which level
+   refused. The token's own window is in the statement of step 1, because
+   the row MAC has to be checked in the broker before anything above the
+   token is touched.
+4. After the body is read, for billable endpoints: the token's budget as
+   before (`spent < budget`), then a reservation on the budgets of the
+   tenant and the provider (below).
+
+Windows are fixed one-minute windows keyed by the minute, like the
+token's; a replica whose clock is behind counts into the newer window it
+finds. A refusal is 429 (rate, requests in flight) or 402 (budget) and
+names its level, in the error body and in `ocb-limit-level`.
+
+### Budgets per period
+
+Budgets of a tenant and a provider are per UTC day and month. Each period
+is a row of `limit_spend` keyed by the start of the period, so a new period
+is a new row and nothing has to reset counters. A billable request reserves
+on each of them, in one transaction, all or nothing:
+`min(max_tokens, llm.max_reservation_tokens)` tokens (the cap itself when
+the request sets neither `max_tokens` nor `max_completion_tokens`), and
+their cost at the model's output price. A row takes the reservation while
+what it has spent and reserved is below its limit, so requests in flight
+cannot each pass a check of what is spent and go over together.
+
+The request carries the start of the periods it was authorized in. Its
+exchange settles the reservations with the actual usage in the transaction
+that writes the usage row, in those periods: a stream that runs past
+midnight counts in the day it started. A request that ends before it
+reaches the provider (no key for it, the caller gone) gives its
+reservations back. A reservation stays until its period ends only if the
+process dies between the two, or accounting fails after its retries.
+
+A USD budget needs prices: a provider with a USD budget must have prices
+(checked when the configuration is loaded), a tenant's is refused while the
+tenant holds a key for a configured provider without prices (checked at
+`PUT`), and while a USD budget applies, a request for a model without a
+price is refused (400). A budget counts the requests authorized while it is
+set; one set during a period does not count that period's earlier usage.
+
+Rows of `limit_spend` are locked in one order wherever they change, a
+tenant's before a provider's and then by key, so transactions never wait on
+each other in a cycle. A provider's rows, which every billable request to it
+touches, are taken last and held until the commit only. On a laptop with a
+local PostgreSQL (no fsync), the full sequence of a billable request
+reached about 2000 requests per second through one provider with day and
+month budgets and a rate limit, at 64 concurrent workers, against about
+6000 with limits on tenants only: well above the request rates of LLM
+traffic. If it ever is not, the provider's rows can be split into slots
+that are summed when read.
+
+### What callers see
+
+- Every answer to a request whose token was accepted carries
+  `RateLimit-Policy` and `RateLimit` for the requests per minute of the
+  token and of its tenant, `ocb-budget-*` for the budget of the token or
+  tenant nearest to running out, and `ocb-limit-level`. The broker sets
+  them last; no header of these names from a provider is ever passed on
+  (see "Header and body policies").
+- A provider's numbers are never shown to callers, since they come from
+  every tenant's requests: its refusals say when the budget renews, and
+  `/llm/_/limits` says only `ok`, `near` or `exhausted`, and when that
+  changes. The exact numbers are in the admin API and in the metrics.
+- `GET /llm/_/limits` checks the token with a read and its MAC, counts no
+  request, and has a limit of its own per token and replica.
+- `ocb_limit_quota`, `ocb_limit_remaining` and
+  `ocb_llm_token_expiry_timestamp` are read from the database every 30
+  seconds on each replica (OBSERVABILITY.md).
+
+### Per replica, in memory
 
 | Limit | Setting | Effect |
 |---|---|---|
-| Requests in flight per LLM token | `llm.max_concurrent_per_token` | 429 `too_many_in_flight`, `Retry-After: 1` |
-| Requests in flight in total | `llm.max_concurrent_total` | same |
-| Failed token checks per client address and minute | `http.auth_failures_per_minute` | 429 without a database lookup (proxy and worker endpoint) |
+| Requests in flight per LLM token | `llm.max_concurrent_per_token` | 429 `too_many_in_flight`, level `token`, `Retry-After: 1` |
+| Requests in flight per tenant | `concurrent` of the tenant | same, level `tenant` |
+| Requests in flight per provider | `concurrent` of the provider | same, level `global` |
+| Requests in flight in total | `llm.max_concurrent_total` | same, level `global` |
+| Requests to `/llm/_/limits` per token and minute | `llm.limits_endpoint_per_minute` | 429 |
+| Failed token checks per client address and minute | `http.auth_failures_per_minute` | 429 without a database lookup (proxy, `/llm/_/limits` and worker endpoint) |
 | Open connections per listener | `http.max_connections` | further clients wait in the listen backlog |
 | Time to receive complete request headers | `http.header_read_timeout_secs` | connection closed |
 
-The per-token rate limit and the budgets, which must hold across replicas,
-are enforced in PostgreSQL.
+Caps on requests in flight multiply with the replicas: with N replicas a
+tenant can have N × `concurrent` requests in flight. The counts belong to
+the process and are never replaced by a reload; the caps come with each
+request.
 
 ## Trace context
 

@@ -84,13 +84,21 @@ max_buffered_response_bytes = 33554432
 # Requests in flight per LLM token and in total, per replica.
 max_concurrent_per_token = 16
 max_concurrent_total = 1024
+# Most tokens a billable request reserves on the budgets of its tenant and
+# provider until it is accounted: its max_tokens up to this, and this when it
+# sets none. A budget refuses requests once what is spent and reserved
+# reaches it.
+max_reservation_tokens = 32000
+# Requests per LLM token and minute (per replica) to GET /llm/_/limits, where
+# agents see their own limits without using up their rate limit.
+limits_endpoint_per_minute = 30
 
 # Providers. The tenant's key for provider <id> is the secret `llm.<id>` of
 # kind `llm_api_key`. Clients use http://<broker>:8080/llm/p/<id> as their
 # base URL, whatever the kind; the older forms still work:
 #   Anthropic SDK:  base_url = http://<broker>:8080/llm/anthropic   (provider `anthropic`)
 #   OpenAI SDK:     base_url = http://<broker>:8080/llm/openai/<id>
-# The ids p, _ and limits are reserved.
+# The ids p and limits are reserved.
 #
 # Optional keys of a provider:
 #   endpoints = [...]      serve only these endpoints of its kind (anthropic:
@@ -126,6 +134,17 @@ max_concurrent_total = 1024
 #                          listed, compared exactly, version date included,
 #                          e.g. "web_search_20250305". Turn it on for
 #                          providers that agents use
+#   limits = { rpm = ..., concurrent = ..., budget_tokens = { day = ..., month = ... },
+#              budget_usd = { day = ..., month = ... } }
+#                          limits of the provider for every tenant together,
+#                          on top of those of each token and tenant (set
+#                          through the admin API); the strictest applies.
+#                          rpm: requests per minute, across replicas;
+#                          concurrent: requests in flight, per replica;
+#                          budgets per UTC day and month, in billable tokens
+#                          or USD (needs [[llm.pricing]] entries). Callers
+#                          never see these numbers, only whether the provider
+#                          is near or past them
 [llm.providers.anthropic]
 kind = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -145,7 +164,8 @@ base_url = "https://openrouter.ai/api/v1"
 # An Anthropic-compatible gateway on the internal network, reached over
 # mutual TLS, priced like `anthropic` and open only to tokens that name it.
 # It gets every anthropic-* header of the SDK, passes its rate-limit headers
-# back and refuses tools it would run itself.
+# back, refuses tools it would run itself, and caps what every tenant
+# together sends through it.
 # Mount the certificate Secret as a directory (no subPath) so renewed
 # certificates are picked up.
 # [llm.providers.gateway]
@@ -157,6 +177,7 @@ base_url = "https://openrouter.ai/api/v1"
 # tls = { ca_file = "/etc/otter-credential-broker/gateway-tls/ca.crt", client_cert = "/etc/otter-credential-broker/gateway-tls/tls.crt", client_key = "/etc/otter-credential-broker/gateway-tls/tls.key" }
 # headers = { request_forward_prefixes = ["anthropic-"], response_forward_prefixes = ["anthropic-ratelimit-"] }
 # body = { deny_server_tools = true }
+# limits = { rpm = 300, budget_tokens = { month = 50_000_000 } }
 
 # Prices in USD per million tokens. The entries below are placeholders:
 # replace the model ids and prices with the provider's current ones.

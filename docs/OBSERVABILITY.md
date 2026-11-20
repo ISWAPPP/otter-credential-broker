@@ -19,6 +19,12 @@ run itself, or MCP servers) is logged at warn, `request refused by the
 body policy of the provider`, with the provider, tenant, token id and what
 was refused (the tool's index and type); never the body.
 
+Refusals by limits are counted (`ocb_limit_denials_total`), not logged. A
+reservation that could not be given back after its retries is logged at
+error (`failed to give back a reservation; it stays until its period
+ends`) and counted in `ocb_llm_accounting_failures_total`; reading the
+limit gauges from the database is logged at warn when it fails.
+
 ## Traces
 
 A tracer provider always exists, so spans have real W3C trace and span ids.
@@ -54,6 +60,8 @@ Spans:
 | `http.request` | method, route, status, trace_id, caller_trace_id (public listener) | info |
 | `llm.request` | provider, endpoint, model (requested), response_model (reported by the provider), tenant, run_id, token_id, stream, status, input_tokens (all prompt tokens incl. cache), output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, ttft_ms (time to first generated content), duration_ms (until the upstream response ends), usage_source, outcome | info |
 | `keeper.llm.authorize` | provider | info |
+| `keeper.llm.count`, `keeper.llm.reserve` (windows and budgets of the tenant and the provider) | provider | info |
+| `llm.limits`, `keeper.llm.inspect` (`GET /llm/_/limits`) | | info |
 | `secret.resolve` | tenant, provider, purpose | info |
 | `secret.decrypt` | tenant, secret | info |
 | `keeper.job_token.redeem` | tenant, job_id | info |
@@ -89,7 +97,11 @@ Served on the metrics listener (`metrics_listen`, default `:9090`) at
 | `ocb_llm_time_to_first_token_seconds` | histogram | provider, model |
 | `ocb_llm_tokens_total` | counter | tenant, provider, model, type = input, output, cache_read, cache_write |
 | `ocb_llm_cost_microdollars_total` | counter | tenant, provider, model |
-| `ocb_llm_budget_denials_total` | counter | tenant, kind = tokens, usd, unpriced_model |
+| `ocb_llm_budget_denials_total` | counter | tenant, kind = tokens, usd, unpriced_model (refusals by the token's budget, and of unpriced models under a USD budget of any level) |
+| `ocb_limit_denials_total` | counter | level = token, tenant, global; kind = rpm, concurrent, budget; provider; tenant (the tenant of the refused request, whatever the level) |
+| `ocb_limit_quota` | gauge | level = tenant, global; tenant (empty for global); provider (empty for tenant); kind = tokens_day, tokens_month, usd_day, usd_month (the budget, USD in dollars) |
+| `ocb_limit_remaining` | gauge | same as `ocb_limit_quota`: what is left of the budget in the current period, reservations of requests in flight counted as used; NaN once the budget is removed |
+| `ocb_llm_token_expiry_timestamp` | gauge | tenant, label (live tokens with a label: the latest expiry per tenant and label, Unix seconds; NaN once none is left) |
 | `ocb_llm_rate_limited_total` | counter | tenant |
 | `ocb_llm_rejected_total` | counter | reason (error code of a request the proxy refused or could not complete, e.g. `unauthorized`, `rate_limited`, `too_many_in_flight`, `budget_exceeded`, `server_tool_denied`, `upstream_timeout`, `upstream_unavailable`, `upstream_bad_encoding`, `shutting_down`) |
 | `ocb_llm_errors_total` | counter | provider, kind = an `outcome` other than `complete` |
@@ -109,8 +121,18 @@ Served on the metrics listener (`metrics_listen`, default `:9090`) at
 Label cardinality is bounded: `model` is the configured price entry (prefix
 patterns without `*`), `max` for the highest-price fallback, or `other`,
 never a caller's string; `method` comes from a fixed set; `route` is the
-route template; `provider` is a configured provider id; `tenant` grows
-with the number of tenants.
+route template; `provider` is a configured provider id; `level` and `kind`
+come from fixed sets; `tenant` grows with the number of tenants. `label` of
+`ocb_llm_token_expiry_timestamp` is chosen by the platform when it issues
+a token: give tokens labels that name a role (`agent`, `probe`), not a run,
+since every tenant and label pair is a series. At most 1000 pairs are
+exported (a warning says when there are more).
+
+`ocb_limit_quota`, `ocb_limit_remaining` and
+`ocb_llm_token_expiry_timestamp` are read from the database every 30
+seconds on each replica, so every replica exports the same values (take
+`max` across them), and a budget's values are right as soon as a new
+period starts, before any request touches it.
 
 A configuration reload logs one line per change it looks at: `provider
 configuration reloaded` (info, with the new and previous version), a note
@@ -182,6 +204,18 @@ groups:
       - alert: CredentialBrokerBudgetDenials
         expr: sum by (tenant) (increase(ocb_llm_budget_denials_total[1h])) > 0
         annotations: { summary: "Tenant {{ $labels.tenant }} hit an LLM budget" }
+      - alert: CredentialBrokerTenantBudgetLow
+        expr: max by (tenant, kind) (ocb_limit_remaining{level="tenant"} / ocb_limit_quota{level="tenant"}) < 0.1
+        annotations: { summary: "Less than a tenth left of the {{ $labels.kind }} budget of tenant {{ $labels.tenant }}" }
+      - alert: CredentialBrokerProviderBudgetLow
+        expr: max by (provider, kind) (ocb_limit_remaining{level="global"} / ocb_limit_quota{level="global"}) < 0.1
+        annotations: { summary: "Less than a tenth left of the {{ $labels.kind }} budget of provider {{ $labels.provider }}" }
+      - alert: CredentialBrokerLimitDenials
+        expr: sum by (level, tenant) (increase(ocb_limit_denials_total{level!="token"}[15m])) > 0
+        annotations: { summary: "Requests of tenant {{ $labels.tenant }} refused by a {{ $labels.level }} limit" }
+      - alert: CredentialBrokerLabelledTokenExpiring
+        expr: max by (tenant, label) (ocb_llm_token_expiry_timestamp) - time() < 86400
+        annotations: { summary: "The {{ $labels.label }} token of tenant {{ $labels.tenant }} expires within a day" }
       - alert: CredentialBrokerSlowFirstToken
         expr: histogram_quantile(0.95, sum by (le, provider) (rate(ocb_llm_time_to_first_token_seconds_bucket[10m]))) > 20
         for: 15m

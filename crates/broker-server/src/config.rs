@@ -922,4 +922,14 @@ mod tests {
         assert_eq!(gw.headers.response_forward_prefixes, ["anthropic-ratelimit-"]);
         assert!(gw.body.deny_server_tools);
     }
+
+    #[test]
+    fn the_example_gateway_has_limits() {
+        let cfg = ServerConfig::parse(&example_with_gateway()).unwrap();
+        assert_eq!((cfg.llm.max_reservation_tokens, cfg.llm.limits_endpoint_per_minute), (32_000, 30));
+        let (providers, _) = cfg.llm.validate().unwrap();
+        let limits = &providers["gateway"].limits;
+        assert_eq!((limits.rpm, limits.tokens(Period::Month)), (Some(300), Some(50_000_000)));
+        assert!(providers["anthropic"].limits.is_empty());
+    }
 }

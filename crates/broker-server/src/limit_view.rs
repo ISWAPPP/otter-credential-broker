@@ -1,5 +1,5 @@
 //! What a caller sees of its limits on every proxied response, once its
-//! token is known:
+//! token is accepted for the provider:
 //!
 //! - `RateLimit-Policy` and `RateLimit` (IETF HTTP API rate limit fields)
 //!   for the requests per minute of the token and, if it has a limit, of
