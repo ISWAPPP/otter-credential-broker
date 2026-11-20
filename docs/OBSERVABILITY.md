@@ -103,8 +103,8 @@ Served on the metrics listener (`metrics_listen`, default `:9090`) at
 | `ocb_llm_budget_denials_total` | counter | tenant, kind = tokens, usd, unpriced_model (refusals by the token's budget, and of unpriced models under a USD budget of any level) |
 | `ocb_limit_denials_total` | counter | level = token, tenant, global; kind = rpm, concurrent, budget; provider (empty when the replica's total of requests in flight refused); tenant (the tenant of the refused request, whatever the level) |
 | `ocb_limit_quota` | gauge | level = tenant, global; tenant (empty for global); provider (empty for tenant); kind = tokens_day, tokens_month, usd_day, usd_month (the budget, USD in dollars) |
-| `ocb_limit_remaining` | gauge | same as `ocb_limit_quota`: what is left of the budget in the current period, reservations of requests in flight counted as used; NaN once the budget is removed |
-| `ocb_llm_token_expiry_timestamp` | gauge | tenant, label (live tokens with a label: the latest expiry per tenant and label, Unix seconds; NaN once none is left) |
+| `ocb_limit_remaining` | gauge | same as `ocb_limit_quota`: what is left of the budget in the current period, reservations of requests in flight counted as used; both series are gone once the budget is removed |
+| `ocb_llm_token_expiry_timestamp` | gauge | tenant, label (live tokens with a label: the latest expiry per tenant and label, Unix seconds; the series is gone once none is left) |
 | `ocb_llm_rate_limited_total` | counter | tenant |
 | `ocb_llm_rejected_total` | counter | reason (error code of a request the proxy refused or could not complete, e.g. `unauthorized`, `rate_limited`, `too_many_in_flight`, `budget_exceeded`, `server_tool_denied`, `upstream_timeout`, `upstream_unavailable`, `upstream_bad_encoding`, `shutting_down`) |
 | `ocb_llm_errors_total` | counter | provider, kind = an `outcome` other than `complete` |
@@ -135,7 +135,11 @@ exported (a warning says when there are more).
 `ocb_llm_token_expiry_timestamp` are read from the database every 30
 seconds on each replica, so every replica exports the same values (take
 `max` across them), and a budget's values are right as soon as a new
-period starts, before any request touches it.
+period starts, before any request touches it. Each read replaces all of
+them: they are not kept by the metrics recorder, which keeps every series
+it was given for the life of the process, so a series whose budget or
+tokens are gone leaves the output, and the bound of 1000 tenant and label
+pairs holds for as long as the process runs.
 
 A configuration reload logs one line per change it looks at: `provider
 configuration reloaded` (info, with the new and previous version), a note

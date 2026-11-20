@@ -14,11 +14,15 @@
 //!   exported, so a label per token (a run id, say) cannot grow the series
 //!   without bound, but would crowd out the ones that matter.
 //!
-//! A series whose budget or token is gone is set to NaN rather than left at
-//! its last value.
+//! These series are not kept by the metrics recorder, which keeps every
+//! series it was ever given for the life of the process: a budget removed
+//! or a label whose tokens are all gone would stay. Each refresh replaces
+//! the series instead, and `/metrics` renders the last ones after the
+//! recorder's, so a series that is gone is gone from the output too.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::fmt::Write;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use broker_core::limits::{Limits, Period};
@@ -37,12 +41,78 @@ pub const MAX_LABELLED_TOKENS: i64 = 1000;
 /// level, tenant, provider, kind
 type BudgetSeries = (&'static str, String, String, &'static str);
 
+/// The series of the last refresh, shared with `/metrics`.
+#[derive(Clone, Default)]
+pub struct LimitSeries(Arc<RwLock<Series>>);
+
+#[derive(Default)]
+struct Series {
+    /// Quota and remaining of each budget.
+    budgets: BTreeMap<BudgetSeries, (f64, f64)>,
+    /// Latest expiry per tenant and label.
+    expiries: BTreeMap<(String, String), f64>,
+}
+
+impl LimitSeries {
+    /// The series in the Prometheus text format, a family only when it has
+    /// a series.
+    pub fn render(&self) -> String {
+        let s = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        let mut out = String::new();
+        let budget_labels = ["level", "tenant", "provider", "kind"];
+        for (name, pick) in [("ocb_limit_quota", 0), ("ocb_limit_remaining", 1)] {
+            let samples = s.budgets.iter().map(|((level, tenant, provider, kind), values)| {
+                ([*level, tenant.as_str(), provider.as_str(), *kind], if pick == 0 { values.0 } else { values.1 })
+            });
+            family(&mut out, name, budget_labels, samples);
+        }
+        let samples = s.expiries.iter().map(|((tenant, label), at)| ([tenant.as_str(), label.as_str()], *at));
+        family(&mut out, "ocb_llm_token_expiry_timestamp", ["tenant", "label"], samples);
+        out
+    }
+
+    fn replace(&self, next: Series) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = next;
+    }
+}
+
+/// Writes one gauge family: its type line, then a line per series.
+fn family<'a, const N: usize>(
+    out: &mut String,
+    name: &str,
+    labels: [&str; N],
+    samples: impl Iterator<Item = ([&'a str; N], f64)>,
+) {
+    let mut samples = samples.peekable();
+    if samples.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(out, "# TYPE {name} gauge");
+    for (values, value) in samples {
+        out.push_str(name);
+        out.push('{');
+        for (i, (label, v)) in labels.iter().zip(values).enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{label}=\"{}\"", escape(v));
+        }
+        let _ = writeln!(out, "}} {value}");
+    }
+    out.push('\n');
+}
+
+/// A label value as the Prometheus text format writes it. Tenant ids,
+/// labels and provider ids have none of these characters; this keeps the
+/// output valid should that ever change.
+fn escape(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
 pub struct LimitGauges {
     keeper: Arc<Keeper>,
     proxy: Arc<LlmProxy>,
-    /// Series set by the last refresh.
-    budgets: BTreeSet<BudgetSeries>,
-    expiries: BTreeSet<(String, String)>,
+    series: LimitSeries,
 }
 
 fn kind(period: Period, usd: bool) -> &'static str {
@@ -56,10 +126,16 @@ fn kind(period: Period, usd: bool) -> &'static str {
 
 impl LimitGauges {
     pub fn new(keeper: Arc<Keeper>, proxy: Arc<LlmProxy>) -> Self {
-        Self { keeper, proxy, budgets: BTreeSet::new(), expiries: BTreeSet::new() }
+        Self { keeper, proxy, series: LimitSeries::default() }
     }
 
-    /// Reads the budgets and labelled tokens once and sets the gauges.
+    /// The series `/metrics` renders; they change with every refresh.
+    pub fn series(&self) -> LimitSeries {
+        self.series.clone()
+    }
+
+    /// Reads the budgets and labelled tokens once and replaces the series.
+    /// When reading fails, the series of the last refresh stay.
     pub async fn refresh(&mut self) -> Result<(), BrokerError> {
         let at = self.keeper.now();
         let snap = self.proxy.snapshot();
@@ -72,7 +148,7 @@ impl LimitGauges {
         }
         let scopes: Vec<LimitScope> = levels.iter().map(|(s, _)| s.clone()).collect();
         let (_, spend) = self.keeper.limit_usage(&scopes, at).await?;
-        let mut budgets = BTreeSet::new();
+        let mut next = Series::default();
         for (scope, limits) in &levels {
             for period in limits.budget_periods() {
                 let s = spend.iter().find(|r| r.is(scope, period)).map(SpendRow::spend).unwrap_or_default();
@@ -84,17 +160,10 @@ impl LimitGauges {
                     let amount = |v: i64| if usd { v as f64 / 1_000_000.0 } else { v as f64 };
                     let series =
                         (scope.level.as_str(), scope.tenant.clone(), scope.provider.clone(), kind(period, usd));
-                    set_budget(&series, "ocb_limit_quota", amount(limit));
-                    set_budget(&series, "ocb_limit_remaining", amount(limit.saturating_sub(used).max(0)));
-                    budgets.insert(series);
+                    next.budgets.insert(series, (amount(limit), amount(limit.saturating_sub(used).max(0))));
                 }
             }
         }
-        for gone in self.budgets.difference(&budgets) {
-            set_budget(gone, "ocb_limit_quota", f64::NAN);
-            set_budget(gone, "ocb_limit_remaining", f64::NAN);
-        }
-        self.budgets = budgets;
 
         let mut tokens = self.keeper.labelled_token_expiry(MAX_LABELLED_TOKENS + 1).await?;
         if tokens.len() > usize::try_from(MAX_LABELLED_TOKENS).unwrap_or(usize::MAX) {
@@ -104,15 +173,10 @@ impl LimitGauges {
             );
             tokens.truncate(usize::try_from(MAX_LABELLED_TOKENS).unwrap_or(usize::MAX));
         }
-        let mut expiries = BTreeSet::new();
         for t in tokens {
-            set_expiry(&t.tenant_id, &t.label, t.expires_at as f64);
-            expiries.insert((t.tenant_id, t.label));
+            next.expiries.insert((t.tenant_id, t.label), t.expires_at as f64);
         }
-        for (tenant, label) in self.expiries.difference(&expiries) {
-            set_expiry(tenant, label, f64::NAN);
-        }
-        self.expiries = expiries;
+        self.series.replace(next);
         Ok(())
     }
 
@@ -132,13 +196,44 @@ impl LimitGauges {
     }
 }
 
-fn set_budget(s: &BudgetSeries, name: &'static str, value: f64) {
-    let (level, tenant, provider, kind) = s;
-    metrics::gauge!(name, "level" => *level, "tenant" => tenant.clone(), "provider" => provider.clone(), "kind" => *kind)
-        .set(value);
-}
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
 
-fn set_expiry(tenant: &str, label: &str, value: f64) {
-    metrics::gauge!("ocb_llm_token_expiry_timestamp", "tenant" => tenant.to_owned(), "label" => label.to_owned())
-        .set(value);
+    #[test]
+    fn series_render_in_the_text_format_and_only_while_they_exist() {
+        let series = LimitSeries::default();
+        assert_eq!(series.render(), "", "no family without a series");
+        let mut s = Series::default();
+        s.budgets.insert(("tenant", "t1".into(), String::new(), "tokens_day"), (1000.0, 750.0));
+        s.budgets.insert(("global", String::new(), "anthropic".into(), "usd_month"), (50.0, 49.998_65));
+        s.expiries.insert(("t1".into(), "agent".into()), 1_900_007_200.0);
+        series.replace(s);
+        assert_eq!(
+            series.render(),
+            concat!(
+                "# TYPE ocb_limit_quota gauge\n",
+                "ocb_limit_quota{level=\"global\",tenant=\"\",provider=\"anthropic\",kind=\"usd_month\"} 50\n",
+                "ocb_limit_quota{level=\"tenant\",tenant=\"t1\",provider=\"\",kind=\"tokens_day\"} 1000\n",
+                "\n",
+                "# TYPE ocb_limit_remaining gauge\n",
+                "ocb_limit_remaining{level=\"global\",tenant=\"\",provider=\"anthropic\",kind=\"usd_month\"} 49.99865\n",
+                "ocb_limit_remaining{level=\"tenant\",tenant=\"t1\",provider=\"\",kind=\"tokens_day\"} 750\n",
+                "\n",
+                "# TYPE ocb_llm_token_expiry_timestamp gauge\n",
+                "ocb_llm_token_expiry_timestamp{tenant=\"t1\",label=\"agent\"} 1900007200\n",
+                "\n",
+            )
+        );
+        // A refresh replaces every series: what is gone is not rendered.
+        let mut s = Series::default();
+        s.expiries.insert(("t1".into(), "probe".into()), 1.0);
+        series.replace(s);
+        assert_eq!(
+            series.render(),
+            "# TYPE ocb_llm_token_expiry_timestamp gauge\nocb_llm_token_expiry_timestamp{tenant=\"t1\",label=\"probe\"} 1\n\n"
+        );
+        assert_eq!(escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
 }

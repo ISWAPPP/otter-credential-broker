@@ -55,6 +55,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 pub use config::ServerConfig;
+use limit_metrics::LimitSeries;
 use limits::AuthFailureLimiter;
 pub use proxy::LlmProxy;
 use reload::Reloader;
@@ -168,15 +169,23 @@ pub fn public_router(state: AppState, o: PublicOptions) -> Router {
     )
 }
 
-/// Metrics listener.
-pub fn metrics_router(handle: Option<PrometheusHandle>) -> Router {
+/// Metrics listener: the recorder's series, then the limit gauges read from
+/// the database (see [`limit_metrics`]).
+pub fn metrics_router(handle: Option<PrometheusHandle>, limits: LimitSeries) -> Router {
     Router::new().route("/healthz", get(healthz)).route(
         "/metrics",
         get(move || {
-            let handle = handle.clone();
+            let (handle, limits) = (handle.clone(), limits.clone());
             async move {
                 match handle {
-                    Some(h) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], h.render()).into_response(),
+                    Some(h) => {
+                        let mut text = h.render();
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str(&limits.render());
+                        ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
+                    }
                     None => StatusCode::NOT_FOUND.into_response(),
                 }
             }
@@ -358,14 +367,14 @@ pub async fn serve(cfg: ServerConfig, config_file: Option<PathBuf>) -> anyhow::R
         },
     );
     let admin = admin_router(state.clone(), timeout, cfg.http.body_limit_bytes);
-    let metrics_app = metrics_router(Some(metrics));
+    let gauges = limit_metrics::LimitGauges::new(state.keeper.clone(), proxy.clone());
+    let metrics_app = metrics_router(Some(metrics), gauges.series());
     let opts = ServeOptions {
         header_read_timeout: Duration::from_secs(cfg.http.header_read_timeout_secs.max(1)),
         max_connections: cfg.http.max_connections,
     };
 
     let stop = CancellationToken::new();
-    let gauges = limit_metrics::LimitGauges::new(state.keeper.clone(), proxy.clone());
     tokio::spawn(gauges.run(limit_metrics::REFRESH_EVERY, stop.clone()));
     if cfg.reload_interval_secs > 0 {
         let reloader = Reloader::new(config_file, cfg.clone(), proxy.clone());

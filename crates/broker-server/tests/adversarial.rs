@@ -490,7 +490,7 @@ async fn admin_and_metrics_are_not_on_the_public_listener() {
         let (s, _) = call(&env.admin, "POST", uri, &[("authorization", &auth)], Some("{}".into())).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
     }
-    let m = broker_server::metrics_router(None);
+    let m = broker_server::metrics_router(None, Default::default());
     let (s, _) = call(&m, "GET", "/v1/admin/audit", &[("authorization", &auth)], None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     let _: Value = Value::Null;
