@@ -215,11 +215,12 @@ sequenceDiagram
   that start with one of the provider's `headers.response_forward_prefixes`
   (never `authorization`, `proxy-authorization`, `x-api-key`,
   `set-cookie`, `www-authenticate`, `location`, `alt-svc`, `ratelimit*`,
-  `ocb-*`, framing or hop-by-hop headers), then the
-  broker's own limit headers (see "Limits"). Success bodies are streamed
-  chunk by chunk; any occurrence of the provider key is
-  replaced by `[REDACTED]` (a tail that could be the start of the key is held
-  back until the next chunk). Compressed success bodies are refused (502):
+  `ocb-*`, framing or hop-by-hop headers), then the broker's own limit
+  headers (see "Limits"). A header whose value holds the provider key or
+  the caller's token is dropped. Success bodies are streamed chunk by
+  chunk; any occurrence of the provider key is replaced by `[REDACTED]` (a
+  tail that could be the start of the key is held back until the next
+  chunk). Compressed success bodies are refused (502):
   they could be neither redacted nor accounted. Error bodies are read up to
   `max_error_body_bytes` plus the length of the key and the caller's token,
   scrubbed of both and of anything that looks like a credential, and only

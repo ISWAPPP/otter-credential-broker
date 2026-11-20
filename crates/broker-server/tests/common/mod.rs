@@ -207,6 +207,16 @@ async fn upstream_handler(State(up): State<Upstream>, req: Request) -> Response 
                        "usage":{"input_tokens":5,"output_tokens":5}})
                 .to_string(),
             ),
+            // The key in response headers: one every caller gets, one passed
+            // only by prefix; and a harmless one next to them.
+            "echo-key-header" => {
+                let mut resp = json_resp(StatusCode::OK, ANTHROPIC_JSON.into());
+                let h = resp.headers_mut();
+                h.insert("request-id", HeaderValue::from_str(&format!("req_{key}")).unwrap());
+                h.insert("x-upstream-debug", HeaderValue::from_str(&format!("auth={key}")).unwrap());
+                h.insert("x-upstream-trace", HeaderValue::from_static("t-1"));
+                resp
+            }
             "slow-headers" => {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 json_resp(StatusCode::OK, ANTHROPIC_JSON.into())

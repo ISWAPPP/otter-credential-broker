@@ -109,7 +109,7 @@ Served on the metrics listener (`metrics_listen`, default `:9090`) at
 | `ocb_llm_unpriced_response_model_total` | counter | provider (billed at the highest configured price) |
 | `ocb_llm_inflight_requests` | gauge | provider |
 | `ocb_llm_accounting_failures_total` | counter | (usage write failed after retries) |
-| `ocb_llm_key_redactions_total` | counter | provider |
+| `ocb_llm_key_redactions_total` | counter | provider (the provider key redacted from a success body, or a response header dropped because it held the key or the caller's token) |
 | `ocb_integrity_failures_total` | counter | table = llm_tokens, job_tokens (row MAC check failed) |
 | `ocb_secret_decrypts_total` | counter | purpose = llm.proxy, job |
 | `ocb_job_redemptions_total` | counter | result = ok, unauthorized, error |

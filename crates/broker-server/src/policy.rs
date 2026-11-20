@@ -177,16 +177,29 @@ pub(crate) fn request_headers(kind: ProviderKind, h: &ProviderHeaders, caller: &
 
 /// The upstream response headers passed back: those on
 /// [`FORWARDED_RESPONSE_HEADERS`] and those that start with one of the
-/// provider's response prefixes.
-pub(crate) fn response_headers(h: &ProviderHeaders, upstream: &HeaderMap) -> HeaderMap {
+/// provider's response prefixes, except a header whose value holds one of
+/// `secrets` (the provider key and the caller's token), which is dropped
+/// whole. Also returns how many were dropped that way.
+pub(crate) fn response_headers(h: &ProviderHeaders, upstream: &HeaderMap, secrets: &[&[u8]]) -> (HeaderMap, usize) {
     let mut out = HeaderMap::new();
+    let mut dropped = 0;
     for (name, value) in upstream {
         let n = name.as_str();
-        if FORWARDED_RESPONSE_HEADERS.contains(&n) || by_prefix(n, &h.response_forward_prefixes, NEVER_BACK) {
+        if !FORWARDED_RESPONSE_HEADERS.contains(&n) && !by_prefix(n, &h.response_forward_prefixes, NEVER_BACK) {
+            continue;
+        }
+        if holds_any(value.as_bytes(), secrets) {
+            dropped += 1;
+        } else {
             out.append(name.clone(), value.clone());
         }
     }
-    out
+    (out, dropped)
+}
+
+/// Whether `value` holds one of the non-empty `secrets`, byte for byte.
+fn holds_any(value: &[u8], secrets: &[&[u8]]) -> bool {
+    secrets.iter().any(|s| !s.is_empty() && value.windows(s.len()).any(|w| w == *s))
 }
 
 /// Checks the `body` of provider `id`, of kind `kind`.
@@ -437,7 +450,7 @@ mod tests {
         );
         let upstream =
             headers(&["content-type", "x-should-retry", "anthropic-ratelimit-tokens-remaining", "set-cookie"]);
-        assert_eq!(names(&response_headers(&none, &upstream)), ["content-type", "x-should-retry"]);
+        assert_eq!(names(&response_headers(&none, &upstream, &[]).0), ["content-type", "x-should-retry"]);
     }
 
     #[test]
@@ -449,7 +462,10 @@ mod tests {
         assert_eq!(names(&out), ["anthropic-foo", "anthropic-version", "x-stainless-os"]);
         assert_eq!(out.get_all("anthropic-foo").iter().collect::<Vec<_>>(), ["v", "second"]);
         let upstream = headers(&["anthropic-ratelimit-unified-status", "anthropic-organization-id", "request-id"]);
-        assert_eq!(names(&response_headers(&p, &upstream)), ["anthropic-ratelimit-unified-status", "request-id"]);
+        assert_eq!(
+            names(&response_headers(&p, &upstream, &[]).0),
+            ["anthropic-ratelimit-unified-status", "request-id"]
+        );
     }
 
     /// Validation refuses these prefixes; forwarding drops the headers they
@@ -500,7 +516,31 @@ mod tests {
             "alt-svc",
             "x-custom",
         ]);
-        assert_eq!(names(&response_headers(&p, &upstream)), ["x-custom"]);
+        assert_eq!(names(&response_headers(&p, &upstream, &[]).0), ["x-custom"]);
+    }
+
+    #[test]
+    fn response_headers_that_hold_a_secret_are_dropped() {
+        let key = b"sk-ant-api03-FAKE-key";
+        let token = b"ocb_llm_0123";
+        let mut upstream = HeaderMap::new();
+        for (name, value) in [
+            ("content-type", "application/json"),
+            ("request-id", "req_sk-ant-api03-FAKE-key"),
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-debug", "token=ocb_llm_0123; more"),
+            ("anthropic-echo", "sk-ant-api03-FAKE"),
+        ] {
+            upstream.append(HeaderName::from_static(name), HeaderValue::from_static(value));
+        }
+        let p = prefixes(&[], &["anthropic-"]);
+        let (out, dropped) = response_headers(&p, &upstream, &[key, token]);
+        // Dropped whole, wherever the secret sits in the value; part of the
+        // key alone is not the key.
+        assert_eq!(names(&out), ["anthropic-echo", "anthropic-ratelimit-unified-status", "content-type"]);
+        assert_eq!(dropped, 2);
+        // Empty secrets match nothing.
+        assert_eq!(response_headers(&p, &upstream, &[b"", b""]).1, 0);
     }
 
     fn deny(allow: &[&str]) -> ProviderBody {

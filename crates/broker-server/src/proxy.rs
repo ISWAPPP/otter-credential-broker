@@ -18,7 +18,8 @@
 //! 4. hands the upstream exchange to its own task. That task streams the
 //!    response back unchanged (status, the headers the provider lets
 //!    through, body bytes) while a tap extracts usage and a redactor
-//!    replaces the provider key should it ever appear. It owns accounting:
+//!    replaces the provider key should it ever appear (a header that holds
+//!    the key or the caller's token is dropped). It owns accounting:
 //!    when the caller disconnects, reads too slowly, or gives up waiting, the
 //!    task keeps reading the upstream response to its end, so usage comes
 //!    from the provider's own report and cannot be avoided by hanging up;
@@ -871,7 +872,12 @@ impl Exchange {
 
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         fin.status = status.as_u16();
-        let headers = response_headers(&header_policy, resp.headers());
+        let (headers, dropped) =
+            response_headers(&header_policy, resp.headers(), &[key.expose().as_bytes(), token.expose().as_bytes()]);
+        if dropped > 0 {
+            tracing::warn!(count = dropped, "provider key or caller token found in upstream response headers; dropped");
+            metrics::counter!("ocb_llm_key_redactions_total", "provider" => provider.clone()).increment(dropped as u64);
+        }
         if !status.is_success() {
             // Read a little more than the limit so a key straddling the cut is
             // still found whole, scrub, then cut.

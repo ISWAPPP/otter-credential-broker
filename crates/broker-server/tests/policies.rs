@@ -260,6 +260,25 @@ async fn broad_response_prefixes_never_pass_cookies_challenges_or_redirects() {
     env.cleanup().await;
 }
 
+#[tokio::test]
+async fn a_response_header_that_holds_the_provider_key_is_dropped() {
+    let Some(env) = prefix_env().await else { return };
+    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    let redactions = "ocb_llm_key_redactions_total{provider=\"wide\"}";
+    let before = counter(redactions);
+    let body = Some(anthropic_body("echo-key-header", false));
+    let r = env.llm("POST", "/llm/p/wide/v1/messages", &[("x-api-key", token.as_str())], body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // Whether every caller gets it or a prefix passes it.
+    for dropped in ["request-id", "x-upstream-debug"] {
+        assert!(r.headers.get(dropped).is_none(), "{dropped}");
+    }
+    assert_eq!(r.headers.get("x-upstream-trace").unwrap(), "t-1");
+    assert!(!format!("{:?}", r.headers).contains(&KEY_A[8..]));
+    assert_eq!(counter(redactions), before + 2);
+    env.cleanup().await;
+}
+
 /// Providers on one fake upstream: `anthropic` with the defaults and
 /// `gateway`, which refuses tools it would run itself except web search of
 /// one version. tenant-a has a key for each.
