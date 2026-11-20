@@ -68,9 +68,13 @@ impl LimitKind {
     }
 }
 
-/// A request refused by a limit of the tenant or of a provider. (The
-/// token's own limits are reported as before, with the variants of
-/// [`crate::BrokerError`] for rate limits, requests in flight and budgets.)
+/// A request refused by a limit: its level, what it counts, and what the
+/// caller is told. Refusals by a rate limit or a cap on requests in flight
+/// of every level, the token's included, and by a budget of the tenant or
+/// of a provider take this form. The keeper's checks of a token alone
+/// return [`crate::BrokerError::RateLimited`] and
+/// [`crate::BrokerError::BudgetExceeded`], and the proxy reports a token's
+/// budget as the latter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitRefusal {
     pub level: LimitLevel,

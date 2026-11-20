@@ -235,7 +235,6 @@ fn refused(
     let what = match e {
         BrokerError::Limit(r) => r.kind.as_str(),
         BrokerError::RateLimited { .. } => LimitKind::Rate.as_str(),
-        BrokerError::TooManyInFlight(_) => LimitKind::InFlight.as_str(),
         _ => LimitKind::Budget.as_str(),
     };
     metrics::counter!(

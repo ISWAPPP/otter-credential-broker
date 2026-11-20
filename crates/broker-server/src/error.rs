@@ -21,7 +21,6 @@ pub fn classify(e: &BrokerError) -> (StatusCode, &'static str) {
         BrokerError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
         BrokerError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
         BrokerError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-        BrokerError::TooManyInFlight(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight"),
         // 402: not retried by the common SDKs, unlike 429.
         BrokerError::BudgetExceeded(_) => (StatusCode::PAYMENT_REQUIRED, "budget_exceeded"),
         BrokerError::Limit(r) => match r.kind {
@@ -49,7 +48,6 @@ fn public_message(e: &BrokerError, status: StatusCode) -> String {
 fn retry_after(e: &BrokerError, resp: &mut Response) {
     let secs = match e {
         BrokerError::RateLimited { retry_after_secs } => *retry_after_secs,
-        BrokerError::TooManyInFlight(_) => 1,
         BrokerError::Limit(r) => match (r.kind, r.retry_after_secs) {
             (_, Some(secs)) => secs,
             (LimitKind::InFlight, None) => 1,

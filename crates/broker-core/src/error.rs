@@ -22,14 +22,19 @@ pub enum BrokerError {
     Unauthorized,
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// A rate limit without a level: the token's own as the keeper checks
+    /// it, or failed token checks from one address. The proxy reports the
+    /// token's as a [`BrokerError::Limit`] of the token's level.
     #[error("rate limit exceeded, retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
-    #[error("too many requests in flight: {0}")]
-    TooManyInFlight(String),
+    /// The token's budget is used up. The proxy reports it as it is, naming
+    /// the token's level.
     #[error("budget exceeded: {0}")]
     BudgetExceeded(String),
-    /// A limit of the tenant or of a provider (the token's own limits use
-    /// the three variants above).
+    /// A request refused by a limit, with its level and kind. The proxy
+    /// reports every refusal by a rate limit or a cap on requests in flight
+    /// this way, the token's own included, and those by a budget of the
+    /// tenant or of a provider.
     #[error("{0}")]
     Limit(LimitRefusal),
     #[error("crypto failure")]
