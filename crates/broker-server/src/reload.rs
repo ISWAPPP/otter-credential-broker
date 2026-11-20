@@ -214,6 +214,9 @@ impl Reloader {
         self.running = next;
         let current = self.proxy.snapshot().version();
         if snapshot.version() == current {
+            if !self.first {
+                tracing::info!(version = current, %file, "the config file changed but not its providers or prices");
+            }
             return ReloadResult::Unchanged;
         }
         tracing::info!(
@@ -246,6 +249,7 @@ impl Reloader {
         }
         let result = match self.proxy.prepare(&self.running.llm) {
             Ok(next) if next.version() == current.version() => {
+                tracing::info!(version = current.version(), "TLS files of a provider are back to the ones in use");
                 self.failed_tls = None;
                 ReloadResult::Unchanged
             }

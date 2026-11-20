@@ -228,11 +228,12 @@ async fn an_invalid_configuration_is_refused_and_the_current_one_kept() {
     assert_eq!(reloader.check(), Some(ReloadResult::Invalid));
     assert_eq!(reloader.check(), None);
     assert!(reloader.pending());
-    // Back to the content in use: nothing to apply.
+    // Back to the content in use: nothing to apply, which is logged too.
     write(&path, &cfg.toml());
     assert_eq!(reloader.check(), Some(ReloadResult::Unchanged));
     assert_eq!(proxy.snapshot().version(), version);
     assert!(!reloader.pending());
+    assert!(telemetry().logs.contents().contains("the config file changed but not its providers or prices"));
 }
 
 #[tokio::test]

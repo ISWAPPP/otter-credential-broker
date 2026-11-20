@@ -108,9 +108,12 @@ route template; `provider` is a configured provider id; `tenant` grows
 with the number of tenants.
 
 A configuration reload logs one line per change it looks at: `provider
-configuration reloaded` (info, with the new and previous version), or a
-warning that names the problem (a validation error, or the keys that need
-a restart; never their values).
+configuration reloaded` (info, with the new and previous version), a note
+that the file changed but not its providers or prices (info, `unchanged`),
+or a warning that names the problem (a validation error, TLS files that
+cannot be used, or the keys that need a restart; never their values). The
+first look after start, which finds the file the process started with, is
+neither logged nor counted.
 
 ### Prometheus scrape config
 
