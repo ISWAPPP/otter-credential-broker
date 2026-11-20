@@ -7,10 +7,11 @@
 //! direction by name prefix (`headers` in its configuration); without
 //! prefixes it forwards exactly the allowlists. Some headers are never
 //! forwarded, whatever the prefixes say: those that carry credentials or
-//! cookies, decide where a request goes or how a body is framed, hop-by-hop
-//! headers, and headers the broker sets itself. A prefix that could match
-//! one of them is refused when the configuration is loaded, and every header
-//! forwarded by prefix is checked against them again.
+//! cookies, decide where a request goes or with which method, name the
+//! client's address, or frame the body, hop-by-hop headers, and headers the
+//! broker sets itself. A prefix that could match one of them is refused when
+//! the configuration is loaded, and every header forwarded by prefix is
+//! checked against them again.
 //!
 //! Body. A provider of kind `anthropic` with `body.deny_server_tools`
 //! refuses requests that would have it reach out on its own: MCP servers it
@@ -78,11 +79,24 @@ const NEVER_UPSTREAM: &[Name] = &[
     Name::Exact("x-api-key"),
     Name::Exact("proxy-authorization"),
     Name::Exact("cookie"),
-    // Where the request goes, and how its body is framed and encoded: the
-    // provider must read the body as the broker did.
+    // Where the request goes, and with which method: a gateway on the way
+    // may honour an override of either.
     Name::Exact("host"),
     Name::Exact("forwarded"),
     Name::Prefix("x-forwarded-"),
+    Name::Exact("via"),
+    Name::Prefix("x-http-method"),
+    Name::Exact("x-method-override"),
+    Name::Exact("x-original-method"),
+    Name::Exact("x-original-url"),
+    Name::Exact("x-rewrite-url"),
+    // Who the client is, as proxies and CDNs tell it.
+    Name::Exact("x-real-ip"),
+    Name::Exact("x-client-ip"),
+    Name::Exact("true-client-ip"),
+    Name::Exact("cf-connecting-ip"),
+    // How the body is framed and encoded: the provider must read it as the
+    // broker did.
     Name::Exact("content-length"),
     Name::Exact("content-encoding"),
     Name::Exact("transfer-encoding"),
@@ -367,8 +381,8 @@ mod tests {
         assert!(
             ok(&["anthropic-", "x-stainless-", "x-app"], &["anthropic-ratelimit-", "x-ratelimit-", "retry"]).is_ok()
         );
-        // `x-forwarded` and `ratelimit` are families: a longer prefix inside
-        // one is refused as well as a shorter one.
+        // `x-forwarded`, `x-http-method` and `ratelimit` are families: a
+        // longer prefix inside one is refused as well as a shorter one.
         for bad in [
             "",
             "x-",
@@ -376,6 +390,15 @@ mod tests {
             "x-api",
             "x-forwarded",
             "x-forwarded-for",
+            "x-http",
+            "x-http-method-override-",
+            "x-o",
+            "x-r",
+            "x-real",
+            "true",
+            "cf-",
+            "v",
+            "via",
             "auth",
             "a",
             "cookie",
@@ -494,6 +517,17 @@ mod tests {
             "accept-encoding",
             "traceparent",
             "tracestate",
+            "via",
+            "x-http-method",
+            "x-http-method-override",
+            "x-method-override",
+            "x-original-method",
+            "x-original-url",
+            "x-rewrite-url",
+            "x-real-ip",
+            "x-client-ip",
+            "true-client-ip",
+            "cf-connecting-ip",
             "x-custom",
         ]);
         assert_eq!(names(&request_headers(ProviderKind::Anthropic, &p, &caller)), ["x-custom"]);

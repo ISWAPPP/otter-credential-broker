@@ -194,8 +194,9 @@ sequenceDiagram
   OpenAI-compatible) and those that start with one of the provider's
   `headers.request_forward_prefixes`, provider auth set by the broker
   (marked sensitive), `accept-encoding: identity`, `traceparent`.
-  Credentials, cookies, routing, framing and hop-by-hop headers, and those
-  the broker sets, are never taken from the caller (see "Header and body
+  Credentials, cookies, routing (host, forwarding, method override, URL
+  rewrite), client address, framing and hop-by-hop headers, and those the
+  broker sets, are never taken from the caller (see "Header and body
   policies"). The body bytes are forwarded unchanged. No redirects are
   followed and proxy environment variables are ignored. A provider with
   `tls` is reached through a client of its own; the others share one (see
@@ -360,7 +361,7 @@ headers never pass, whatever the prefixes:
 
 | Direction | Never forwarded |
 |---|---|
-| caller to provider | `authorization`, `x-api-key`, `proxy-authorization`, `cookie`; `host`, `forwarded`, `x-forwarded-*`; `content-length`, `content-encoding`, `transfer-encoding`; hop-by-hop headers; `accept-encoding`, `traceparent`, `tracestate` (set by the broker) |
+| caller to provider | `authorization`, `x-api-key`, `proxy-authorization`, `cookie`; `host`, `forwarded`, `x-forwarded-*`, `via`; `x-http-method*`, `x-method-override`, `x-original-method`, `x-original-url`, `x-rewrite-url`; `x-real-ip`, `x-client-ip`, `true-client-ip`, `cf-connecting-ip`; `content-length`, `content-encoding`, `transfer-encoding`; hop-by-hop headers; `accept-encoding`, `traceparent`, `tracestate` (set by the broker) |
 | provider to caller | `authorization`, `proxy-authorization`, `x-api-key` (the credentials the broker sends, should an upstream echo them); `content-length`, `content-encoding`, `transfer-encoding`; hop-by-hop headers and `proxy-authenticate`; `set-cookie*`, `www-authenticate`; `ratelimit*`, `ocb-*` (kept for the broker's own limit headers); `location`, `alt-svc` |
 
 A prefix that could match one of them (`x-` matches `x-api-key`, in

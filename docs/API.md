@@ -48,8 +48,9 @@ broker sets the provider's auth, `accept-encoding: identity` and
 `cache-control`, `retry-after`, `request-id`, `x-request-id` and
 `x-should-retry`. A provider can pass more in either direction by name
 prefix (`headers` in its configuration). Never passed, whatever the
-prefixes: headers with credentials or cookies, routing, framing and
-hop-by-hop headers, the ones the broker sets, and on the way back
+prefixes: headers with credentials or cookies, routing (host,
+forwarding, method override, URL rewrite), the client's address, framing
+and hop-by-hop headers, the ones the broker sets, and on the way back
 `set-cookie`, `www-authenticate`, `location`, `alt-svc`, `ratelimit*` and
 `ocb-*`.
 
