@@ -1,65 +1,151 @@
-//! In-process limits of one replica: requests in flight (per LLM token and
-//! in total) and failed token checks per client address. They bound memory
-//! and database load; budgets and the per-token rate limit, which must hold
-//! across replicas, live in PostgreSQL.
+//! In-process limits of one replica: requests in flight (per LLM token, per
+//! tenant and per provider where their limits set a cap, and in total) and
+//! failed token checks per client address. They bound memory and database
+//! load; budgets and rate limits, which must hold across replicas, live in
+//! PostgreSQL.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use broker_core::limits::LimitLevel;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Caps on concurrent proxied requests.
+/// Caps on concurrent proxied requests. The counts live as long as the
+/// process; caps of tenants and providers come with each request, so a
+/// changed cap applies to the requests already counted.
 pub struct Inflight {
-    per_token: Mutex<HashMap<String, u32>>,
+    counts: Mutex<Counts>,
     max_per_token: u32,
     total: Arc<Semaphore>,
+}
+
+#[derive(Default)]
+struct Counts {
+    tokens: HashMap<String, u32>,
+    tenants: HashMap<String, u32>,
+    providers: HashMap<String, u32>,
+}
+
+/// One request for [`Inflight::acquire_for`]: its token, its tenant and its
+/// provider, with the caps of the tenant and the provider on this replica.
+pub struct InflightKey<'a> {
+    pub token_id: &'a str,
+    pub tenant: &'a str,
+    pub tenant_max: Option<u32>,
+    pub provider: &'a str,
+    pub provider_max: Option<u32>,
 }
 
 /// Held for the whole life of a proxied request, including accounting.
 pub struct InflightPermit {
     inflight: Arc<Inflight>,
     token_id: String,
+    tenant: Option<String>,
+    provider: Option<String>,
     _total: OwnedSemaphorePermit,
+}
+
+fn add(map: &mut HashMap<String, u32>, key: &str) {
+    *map.entry(key.to_owned()).or_insert(0) += 1;
+}
+
+fn sub(map: &mut HashMap<String, u32>, key: &str) {
+    if let Some(n) = map.get_mut(key) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            map.remove(key);
+        }
+    }
 }
 
 impl Inflight {
     pub fn new(max_per_token: u32, max_total: u32) -> Arc<Self> {
         Arc::new(Self {
-            per_token: Mutex::new(HashMap::new()),
+            counts: Mutex::new(Counts::default()),
             max_per_token: max_per_token.max(1),
             total: Arc::new(Semaphore::new(usize::try_from(max_total.max(1)).unwrap_or(usize::MAX))),
         })
     }
 
+    // Counts are changed under the lock in one go, so a poisoned lock
+    // still holds consistent counts.
+    fn counts(&self) -> MutexGuard<'_, Counts> {
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// `None` when the token or the replica is at its limit.
     pub fn acquire(self: &Arc<Self>, token_id: &str) -> Option<InflightPermit> {
-        let total = self.total.clone().try_acquire_owned().ok()?;
-        let mut map = self.per_token.lock().ok()?;
-        let n = map.entry(token_id.to_owned()).or_insert(0);
-        if *n >= self.max_per_token {
+        let mut c = self.counts();
+        if c.tokens.get(token_id).copied().unwrap_or(0) >= self.max_per_token {
             return None;
         }
-        *n += 1;
-        Some(InflightPermit { inflight: self.clone(), token_id: token_id.to_owned(), _total: total })
+        let total = self.total.clone().try_acquire_owned().ok()?;
+        add(&mut c.tokens, token_id);
+        Some(InflightPermit {
+            inflight: self.clone(),
+            token_id: token_id.to_owned(),
+            tenant: None,
+            provider: None,
+            _total: total,
+        })
+    }
+
+    /// A permit for a request, checked level by level: the token, then its
+    /// tenant, then its provider, then the replica's total. A refusal names
+    /// the first level at its cap (the replica's total counts as global),
+    /// and nothing is counted for a refused request.
+    pub fn acquire_for(self: &Arc<Self>, k: InflightKey<'_>) -> Result<InflightPermit, LimitLevel> {
+        let mut c = self.counts();
+        let at_cap = |map: &HashMap<String, u32>, key: &str, max: u32| map.get(key).copied().unwrap_or(0) >= max;
+        if at_cap(&c.tokens, k.token_id, self.max_per_token) {
+            return Err(LimitLevel::Token);
+        }
+        if k.tenant_max.is_some_and(|m| at_cap(&c.tenants, k.tenant, m)) {
+            return Err(LimitLevel::Tenant);
+        }
+        if k.provider_max.is_some_and(|m| at_cap(&c.providers, k.provider, m)) {
+            return Err(LimitLevel::Global);
+        }
+        let total = self.total.clone().try_acquire_owned().map_err(|_| LimitLevel::Global)?;
+        add(&mut c.tokens, k.token_id);
+        add(&mut c.tenants, k.tenant);
+        add(&mut c.providers, k.provider);
+        Ok(InflightPermit {
+            inflight: self.clone(),
+            token_id: k.token_id.to_owned(),
+            tenant: Some(k.tenant.to_owned()),
+            provider: Some(k.provider.to_owned()),
+            _total: total,
+        })
     }
 
     /// Requests in flight for a token (for tests and diagnostics).
     pub fn count(&self, token_id: &str) -> u32 {
-        self.per_token.lock().ok().and_then(|m| m.get(token_id).copied()).unwrap_or(0)
+        self.counts().tokens.get(token_id).copied().unwrap_or(0)
+    }
+
+    /// Requests in flight for a tenant, on this replica.
+    pub fn tenant_count(&self, tenant: &str) -> u32 {
+        self.counts().tenants.get(tenant).copied().unwrap_or(0)
+    }
+
+    /// Requests in flight to a provider, on this replica.
+    pub fn provider_count(&self, provider: &str) -> u32 {
+        self.counts().providers.get(provider).copied().unwrap_or(0)
     }
 }
 
 impl Drop for InflightPermit {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.inflight.per_token.lock()
-            && let Some(n) = map.get_mut(&self.token_id)
-        {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                map.remove(&self.token_id);
-            }
+        let mut c = self.inflight.counts();
+        sub(&mut c.tokens, &self.token_id);
+        if let Some(t) = &self.tenant {
+            sub(&mut c.tenants, t);
+        }
+        if let Some(p) = &self.provider {
+            sub(&mut c.providers, p);
         }
     }
 }
@@ -131,6 +217,33 @@ mod tests {
         drop(a1);
         assert_eq!(f.count("a"), 1);
         assert!(f.acquire("c").is_some());
+    }
+
+    #[test]
+    fn inflight_caps_per_level() {
+        let f = Inflight::new(2, 4);
+        let key = |token_id, tenant, provider| InflightKey {
+            token_id,
+            tenant,
+            tenant_max: Some(2),
+            provider,
+            provider_max: Some(3),
+        };
+        let a1 = f.acquire_for(key("a", "t1", "p")).unwrap();
+        let _a2 = f.acquire_for(key("a", "t1", "p")).unwrap();
+        assert_eq!(f.acquire_for(key("a", "t1", "p")).err(), Some(LimitLevel::Token));
+        assert_eq!(f.acquire_for(key("b", "t1", "p")).err(), Some(LimitLevel::Tenant), "t1 holds two");
+        let _c1 = f.acquire_for(key("c", "t2", "p")).unwrap();
+        assert_eq!(f.acquire_for(key("d", "t3", "p")).err(), Some(LimitLevel::Global), "p holds three");
+        let _e1 = f.acquire_for(key("e", "t3", "q")).unwrap();
+        assert_eq!(f.acquire_for(key("f", "t4", "r")).err(), Some(LimitLevel::Global), "the replica holds four");
+        assert_eq!((f.tenant_count("t1"), f.provider_count("p"), f.count("b")), (2, 3, 0), "refusals count nothing");
+        drop(a1);
+        assert_eq!((f.count("a"), f.tenant_count("t1"), f.provider_count("p")), (1, 1, 2));
+        // Without caps, a tenant and a provider are counted all the same.
+        let open = InflightKey { token_id: "g", tenant: "t5", tenant_max: None, provider: "q", provider_max: None };
+        let _g = f.acquire_for(open).unwrap();
+        assert_eq!((f.tenant_count("t5"), f.provider_count("q")), (1, 2));
     }
 
     #[test]

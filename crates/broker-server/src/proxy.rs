@@ -35,7 +35,8 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use broker_core::keeper::LlmGrant;
+use broker_core::keeper::{Authorized, LlmGrant};
+use broker_core::limits::{LimitKind, LimitLevel, LimitRefusal};
 use broker_core::llm::scrub::{StreamRedactor, scrub_error_body};
 use broker_core::llm::usage::{TapReport, Usage, UsageSource, UsageTap};
 use broker_core::llm::{Endpoint, HttpMethod, ProviderKind};
@@ -53,8 +54,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::AppState;
 use crate::admin::auth_failure;
 use crate::config::{LlmConfig, ProviderHeaders};
-use crate::error::{classify, llm_error, llm_error_response};
-use crate::limits::{Inflight, InflightPermit, seconds_to_next_minute};
+use crate::error::{classify, llm_error, llm_error_response, llm_limit_error};
+use crate::limits::{Inflight, InflightKey, InflightPermit, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
 use crate::policy::{BodyRefusal, check_body, request_headers, response_headers};
 use crate::registry::{ProviderSnapshot, SnapshotCell, publish};
@@ -197,6 +198,49 @@ fn reject(kind: ProviderKind, e: &BrokerError) -> Response {
     let (_, code) = classify(e);
     metrics::counter!("ocb_llm_rejected_total", "reason" => code).increment(1);
     llm_error(kind, e)
+}
+
+/// 402 or 429 for a request refused by a limit of `level`, which the
+/// response names.
+fn refused(kind: ProviderKind, provider: &str, tenant: &str, level: LimitLevel, e: &BrokerError) -> Response {
+    let (_, code) = classify(e);
+    metrics::counter!("ocb_llm_rejected_total", "reason" => code).increment(1);
+    let what = match e {
+        BrokerError::Limit(r) => r.kind.as_str(),
+        BrokerError::RateLimited { .. } => LimitKind::Rate.as_str(),
+        BrokerError::TooManyInFlight(_) => LimitKind::InFlight.as_str(),
+        _ => LimitKind::Budget.as_str(),
+    };
+    metrics::counter!(
+        "ocb_limit_denials_total",
+        "level" => level.as_str(), "kind" => what, "provider" => provider.to_owned(), "tenant" => tenant.to_owned()
+    )
+    .increment(1);
+    llm_limit_error(kind, level, e)
+}
+
+/// The token's own rate limit refusal, worded like those of the other levels.
+fn token_rate_refusal(auth: &Authorized, e: BrokerError) -> BrokerError {
+    let BrokerError::RateLimited { retry_after_secs } = e else { return e };
+    BrokerError::Limit(LimitRefusal {
+        level: LimitLevel::Token,
+        kind: LimitKind::Rate,
+        message: format!(
+            "rate limit of this LLM token exceeded ({} requests per minute), retry after {retry_after_secs}s",
+            auth.token_rpm.limit
+        ),
+        retry_after_secs: Some(retry_after_secs),
+    })
+}
+
+/// A request over a cap on requests in flight of `level`, on this replica.
+fn in_flight_refusal(level: LimitLevel, provider: &str) -> BrokerError {
+    let message = match level {
+        LimitLevel::Token => "this LLM token has too many requests in flight".to_owned(),
+        LimitLevel::Tenant => "the tenant has too many requests in flight".to_owned(),
+        LimitLevel::Global => format!("too many requests in flight for provider {provider}"),
+    };
+    BrokerError::Limit(LimitRefusal { level, kind: LimitKind::InFlight, message, retry_after_secs: None })
 }
 
 /// 400 for a request the provider's body policy refuses. A refused tool is
@@ -352,8 +396,8 @@ async fn proxy(
             return reject(kind, &e);
         }
     };
-    let grant = match st.keeper.authorize_llm(token.expose(), provider_id, provider.access).await {
-        Ok(g) => g,
+    let auth = match st.keeper.authorize(token.expose(), provider_id, provider.access).await {
+        Ok(a) => a,
         Err(e) => {
             if matches!(e, BrokerError::Unauthorized) {
                 st.limiter.failed(peer);
@@ -362,9 +406,30 @@ async fn proxy(
             return reject(kind, &e);
         }
     };
-    let Some(permit) = px.inflight.acquire(&grant.token_id) else {
-        return reject(kind, &BrokerError::TooManyInFlight("this LLM token has too many requests in flight".into()));
+    // Limits, level by level: a level only counts a request the levels
+    // below it let through, so a token over its limits never uses up its
+    // tenant's, and a tenant over its limits never the provider's.
+    let tenant = auth.grant.tenant.clone();
+    if let Err(e) = auth.check_token_rate() {
+        return refused(kind, provider_id, &tenant, LimitLevel::Token, &token_rate_refusal(&auth, e));
+    }
+    let permit = match px.inflight.acquire_for(InflightKey {
+        token_id: &auth.grant.token_id,
+        tenant: &tenant,
+        tenant_max: auth.tenant_limits.concurrent,
+        provider: provider_id,
+        provider_max: provider.limits.concurrent,
+    }) {
+        Ok(p) => p,
+        Err(level) => return refused(kind, provider_id, &tenant, level, &in_flight_refusal(level, provider_id)),
     };
+    if let Err(e) = st.keeper.count_request(&auth, provider_id, provider.limits.rpm).await {
+        return match &e {
+            BrokerError::Limit(r) => refused(kind, provider_id, &tenant, r.level, &e),
+            _ => reject(kind, &e),
+        };
+    }
+    let grant = auth.grant.clone();
 
     let (parts, body) = req.into_parts();
     let read = tokio::time::timeout(
@@ -406,7 +471,10 @@ async fn proxy(
             };
             metrics::counter!("ocb_llm_budget_denials_total", "tenant" => grant.tenant.clone(), "kind" => what)
                 .increment(1);
-            return reject(kind, &e);
+            return match e {
+                BrokerError::BudgetExceeded(_) => refused(kind, provider_id, &tenant, LimitLevel::Token, &e),
+                _ => reject(kind, &e),
+            };
         }
         if kind == ProviderKind::Openai
             && streaming
