@@ -29,9 +29,11 @@ pub fn classify(e: &BrokerError) -> (StatusCode, &'static str) {
             LimitKind::InFlight => (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight"),
             LimitKind::Budget => (StatusCode::PAYMENT_REQUIRED, "budget_exceeded"),
         },
-        BrokerError::Crypto(_) | BrokerError::Storage(_) | BrokerError::Migrate(_) | BrokerError::Internal(_) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        }
+        BrokerError::Crypto(_)
+        | BrokerError::Storage(_)
+        | BrokerError::Migrate(_)
+        | BrokerError::CommitUnknown(_)
+        | BrokerError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
 

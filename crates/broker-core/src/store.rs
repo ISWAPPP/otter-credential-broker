@@ -1032,7 +1032,10 @@ impl Store {
 
     /// Like [`Store::record_usage`], and in the same transaction settles the
     /// request's reservations: each is released, and the request's cost and
-    /// tokens are added to the spend of the period it was reserved in.
+    /// tokens are added to the spend of the period it was reserved in. Any
+    /// error but [`BrokerError::CommitUnknown`] means nothing was written,
+    /// and the call may be repeated: a commit without an answer is looked up
+    /// before an error is returned.
     #[tracing::instrument(name = "db.record_usage", level = "debug", skip_all)]
     pub async fn record_usage_settling(&self, u: &NewUsageRow, settle: &[Reservation]) -> Result<(), BrokerError> {
         let mut tx = self.pool.begin().await?;
@@ -1050,11 +1053,12 @@ impl Store {
         .bind(u.ts)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
+        let xid: String = sqlx::query_scalar(
             "INSERT INTO llm_usage (ts, token_id, tenant_id, run_id, provider, endpoint, model, status, input_tokens,
                                     output_tokens, cache_read_tokens, cache_write_tokens, cost_micro_usd,
                                     usage_source, duration_ms, ttft_ms, trace_id, response_model)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+             RETURNING pg_current_xact_id()::text",
         )
         .bind(u.ts)
         .bind(&u.token_id)
@@ -1074,15 +1078,49 @@ impl Store {
         .bind(u.ttft_ms)
         .bind(u.trace_id.as_deref())
         .bind(u.response_model.as_deref())
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
         // Last, so the budget rows, a provider's shared by every tenant, are
         // held until the commit only.
         if !settle.is_empty() {
             Self::settle_tx(&mut tx, settle, u.billable_tokens, u.cost_micro_usd).await?;
         }
-        tx.commit().await?;
-        Ok(())
+        self.commit_accounting(tx, &xid).await
+    }
+
+    /// Commits a transaction of accounting whose id is `xid`. A commit that
+    /// fails without an answer, the connection lost, may still have taken
+    /// effect, and a caller that repeats the write would then add usage and
+    /// give back reservations twice. So its outcome is asked of PostgreSQL,
+    /// which keeps the status of recent transactions (`pg_xact_status`),
+    /// waiting a little while it is still running: `Ok` once it took effect,
+    /// the commit's error once it did not, and
+    /// [`BrokerError::CommitUnknown`] when that cannot be told.
+    async fn commit_accounting(&self, tx: Transaction<'_, Postgres>, xid: &str) -> Result<(), BrokerError> {
+        let Err(e) = tx.commit().await else { return Ok(()) };
+        for wait_ms in [0, 50, 200, 500] {
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            match self.transaction_committed(xid).await {
+                Ok(Some(true)) => return Ok(()),
+                Ok(Some(false)) => return Err(e.into()),
+                Ok(None) | Err(_) => {}
+            }
+        }
+        Err(BrokerError::CommitUnknown(e.to_string()))
+    }
+
+    /// Whether the transaction `xid` (as `pg_current_xact_id()` gave it)
+    /// was committed: `None` while it runs, or once PostgreSQL no longer
+    /// keeps its status.
+    #[tracing::instrument(name = "db.transaction_committed", level = "debug", skip_all)]
+    pub async fn transaction_committed(&self, xid: &str) -> Result<Option<bool>, BrokerError> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT pg_xact_status($1::xid8)").bind(xid).fetch_one(&self.pool).await?;
+        Ok(match status.as_deref() {
+            Some("committed") => Some(true),
+            Some("aborted") => Some(false),
+            _ => None,
+        })
     }
 
     #[tracing::instrument(name = "db.list_usage", level = "debug", skip_all)]
@@ -1413,16 +1451,17 @@ impl Store {
     }
 
     /// Gives back reservations of requests that ended before they were
-    /// sent upstream.
+    /// sent upstream. Any error but [`BrokerError::CommitUnknown`] means
+    /// nothing was given back, and the call may be repeated.
     #[tracing::instrument(name = "db.release", level = "debug", skip_all)]
     pub async fn release(&self, reservations: &[Reservation]) -> Result<(), BrokerError> {
         if reservations.is_empty() {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
+        let xid: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text").fetch_one(&mut *tx).await?;
         Self::settle_tx(&mut tx, reservations, 0, 0).await?;
-        tx.commit().await?;
-        Ok(())
+        self.commit_accounting(tx, &xid).await
     }
 
     /// Releases `reservations` and adds `tokens` and `micro_usd` to the

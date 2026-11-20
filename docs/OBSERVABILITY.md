@@ -22,7 +22,10 @@ was refused (the tool's index and type); never the body.
 Refusals by limits are counted (`ocb_limit_denials_total`), not logged. A
 reservation that could not be given back after its retries is logged at
 error (`failed to give back a reservation; it stays until its period
-ends`) and counted in `ocb_llm_accounting_failures_total`; reading the
+ends`) and counted in `ocb_llm_accounting_failures_total`, as is a write of
+accounting whose commit got no answer and whose outcome PostgreSQL could
+not tell (`LLM usage may not have been recorded; not retried`, `a
+reservation may not have been given back; not retried`); reading the
 limit gauges from the database is logged at warn when it fails.
 
 ## Traces
@@ -108,7 +111,7 @@ Served on the metrics listener (`metrics_listen`, default `:9090`) at
 | `ocb_llm_usage_estimated_total` | counter | provider |
 | `ocb_llm_unpriced_response_model_total` | counter | provider (billed at the highest configured price) |
 | `ocb_llm_inflight_requests` | gauge | provider |
-| `ocb_llm_accounting_failures_total` | counter | (usage write failed after retries) |
+| `ocb_llm_accounting_failures_total` | counter | (a usage write, or giving back a reservation, failed after its retries or with a commit whose outcome could not be told) |
 | `ocb_llm_key_redactions_total` | counter | provider (the provider key redacted from a success body, or a response header dropped because it held the key or the caller's token) |
 | `ocb_integrity_failures_total` | counter | table = llm_tokens, job_tokens (row MAC check failed) |
 | `ocb_secret_decrypts_total` | counter | purpose = llm.proxy, job |

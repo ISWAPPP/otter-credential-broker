@@ -198,6 +198,61 @@ async fn reservations_are_all_or_nothing_and_settled_in_the_authorizing_period()
     fx.db.cleanup().await;
 }
 
+/// The id of a transaction that wrote nothing and was committed or rolled
+/// back.
+async fn finished_transaction(k: &Keeper, commit: bool) -> String {
+    let mut tx = k.store().pool().begin().await.unwrap();
+    let xid: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text").fetch_one(&mut *tx).await.unwrap();
+    if commit {
+        tx.commit().await.unwrap();
+    } else {
+        tx.rollback().await.unwrap();
+    }
+    xid
+}
+
+#[tokio::test]
+async fn a_commit_that_fails_is_looked_up_before_the_write_is_repeated() {
+    let Some(fx) = fixture().await else { return };
+    let k = &fx.keeper;
+    let store = k.store();
+    // What PostgreSQL keeps of transactions that ended, and of one that runs.
+    assert_eq!(store.transaction_committed(&finished_transaction(k, true).await).await.unwrap(), Some(true));
+    assert_eq!(store.transaction_committed(&finished_transaction(k, false).await).await.unwrap(), Some(false));
+    let mut open = store.pool().begin().await.unwrap();
+    let xid: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text").fetch_one(&mut *open).await.unwrap();
+    assert_eq!(store.transaction_committed(&xid).await.unwrap(), None);
+    open.rollback().await.unwrap();
+
+    // A commit that fails is looked up. This one did not take effect: the
+    // error is an ordinary one, nothing was written, and the write is
+    // repeated once, reservations given back once.
+    k.set_tenant_limits(ADMIN, "tenant-a", tokens_per_day(1000)).await.unwrap();
+    let t = token(k, "tenant-a", 100).await;
+    let a = k.authorize(&t, "anthropic", Implicit).await.unwrap();
+    let held = k.reserve(&a, "anthropic", &Limits::default(), 64, 0).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'at commit'; END $$;
+         CREATE CONSTRAINT TRIGGER refuse_usage AFTER INSERT ON llm_usage
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse();",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let e = k.record_usage_settling(&usage(&a, 30, 0, T0), &held.reservations).await.unwrap_err();
+    assert!(matches!(e, BrokerError::Storage(_)), "{e:?}");
+    let tenant = LimitScope::tenant("tenant-a");
+    let day = row(k, &tenant, Period::Day, T0).await.unwrap();
+    assert_eq!((day.spent_tokens, day.reserved_tokens), (0, 64), "nothing written");
+    sqlx::raw_sql("DROP TRIGGER refuse_usage ON llm_usage").execute(store.pool()).await.unwrap();
+    k.record_usage_settling(&usage(&a, 30, 0, T0), &held.reservations).await.unwrap();
+    let day = row(k, &tenant, Period::Day, T0).await.unwrap();
+    assert_eq!((day.spent_tokens, day.reserved_tokens), (30, 0));
+    let (rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM llm_usage").fetch_one(store.pool()).await.unwrap();
+    assert_eq!(rows, 1);
+    fx.db.cleanup().await;
+}
+
 #[tokio::test]
 async fn zero_and_usd_budgets() {
     let Some(fx) = fixture().await else { return };

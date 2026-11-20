@@ -175,7 +175,11 @@ sequenceDiagram
 - **Budgets.** The token's: pre-check, refuse when `spent >= budget` (402).
   A token with a USD budget may only use models that have a price (400
   otherwise). Post-accounting: after the upstream response ends, cost and
-  tokens are added atomically (saturating). Concurrent requests can each
+  tokens are added atomically (saturating). A write of accounting whose
+  commit gets no answer is looked up with PostgreSQL's `pg_xact_status`
+  (hence PostgreSQL 13 or later) before it is repeated, so that it never
+  counts twice; one whose outcome cannot be told is not repeated, and is
+  counted as a failure. Concurrent requests can each
   pass the pre-check, so a token's budget can be exceeded by the cost of
   its requests in flight at that moment (at most `max_concurrent_per_token`
   per replica). Budgets of the tenant and the provider are reserved before
@@ -457,7 +461,8 @@ runs to its end even when the caller goes away meanwhile, and then gives
 it back itself: a handler dropped while the reservation commits would
 otherwise leave it taken with nobody to return it. A reservation stays
 until its period ends only if the process dies between the two, or
-accounting fails after its retries.
+accounting fails after its retries or with a commit whose outcome cannot
+be told.
 
 A USD budget needs prices: a provider with a USD budget must have prices
 (checked when the configuration is loaded), a tenant's is refused while the
@@ -531,6 +536,7 @@ request.
 - Two or more replicas, rolling updates, a PodDisruptionBudget. Migrations
   run at startup (sqlx takes an advisory lock) or separately with
   `otter-credential-broker migrate` and `run_migrations = false`.
+  PostgreSQL 13 or later.
 - Three ports: 8080 (agent pods and workers), 8081 (platform core), 9090
   (monitoring), each with its own Service and NetworkPolicy rule. Egress:
   DNS, PostgreSQL and HTTPS to public addresses.

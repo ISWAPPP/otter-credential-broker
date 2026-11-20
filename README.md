@@ -44,7 +44,7 @@ Vault Transit or a cloud KMS can be added behind the `KeyProvider` trait.
 ## Quick start
 
 You need the toolchain pinned in `rust-toolchain.toml` and a PostgreSQL
-server at the URL in `config/dev.toml`.
+server (13 or later) at the URL in `config/dev.toml`.
 
 ```sh
 make run-dev   # creates ./secrets (KEK, token key, admin token), listens on localhost:8080/8081/9090

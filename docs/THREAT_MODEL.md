@@ -136,7 +136,11 @@
   reports.
 - **Lost accounting writes.** A usage write is retried three times and then
   dropped (counted in `ocb_llm_accounting_failures_total`); a durable outbox
-  would remove that window.
+  would remove that window. A write whose commit got no answer may have
+  taken effect, and repeating it would bill the usage twice and give back
+  reservations that other requests hold; so its outcome is looked up in
+  PostgreSQL first, and a write whose outcome cannot be told is not
+  repeated but dropped and counted the same way.
 - **Exact-match redaction** only catches the key as one contiguous byte
   sequence. A key split across separately encoded fragments would not be
   caught; the model never sees the key, so only a reflecting upstream could

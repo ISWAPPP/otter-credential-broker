@@ -1061,6 +1061,13 @@ impl Drop for Held {
             for (attempt, wait_ms) in [(1, 200u64), (2, 1000), (3, 0)] {
                 match keeper.release(&reservations).await {
                     Ok(()) => return,
+                    // Given back twice, they would free what other requests
+                    // in flight hold.
+                    Err(e @ BrokerError::CommitUnknown(_)) => {
+                        tracing::error!(error = %e, "a reservation may not have been given back; not retried");
+                        metrics::counter!("ocb_llm_accounting_failures_total").increment(1);
+                        return;
+                    }
                     Err(e) if attempt < 3 => {
                         tracing::warn!(error = %e, attempt, "giving back a reservation failed; retrying");
                         tokio::time::sleep(Duration::from_millis(wait_ms)).await;
@@ -1237,10 +1244,17 @@ impl Finisher {
             trace_id: self.trace_id.clone(),
             billable_tokens: i64c(u.billable_tokens()),
         };
-        // A few retries ride out a briefly unavailable database.
+        // A few retries ride out a briefly unavailable database. A write
+        // that may have taken effect is not repeated: it would bill the
+        // usage twice and give back reservations other requests hold.
         for (attempt, wait_ms) in [(1, 200u64), (2, 1000), (3, 0)] {
             match self.keeper.record_usage_settling(&row, &self.reservations).await {
                 Ok(()) => return,
+                Err(e @ BrokerError::CommitUnknown(_)) => {
+                    tracing::error!(error = %e, "LLM usage may not have been recorded; not retried");
+                    metrics::counter!("ocb_llm_accounting_failures_total").increment(1);
+                    return;
+                }
                 Err(e) if attempt < 3 => {
                     tracing::warn!(error = %e, attempt, "recording LLM usage failed; retrying");
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;

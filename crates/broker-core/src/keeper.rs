@@ -800,7 +800,7 @@ impl Keeper {
     }
 
     /// Gives back what a request reserved when it ends before it reaches
-    /// the provider.
+    /// the provider. Not to be repeated after [`BrokerError::CommitUnknown`].
     pub async fn release(&self, reservations: &[Reservation]) -> Result<(), BrokerError> {
         self.store.release(reservations).await
     }
@@ -809,6 +809,7 @@ impl Keeper {
     /// one transaction, the reservations are given back and the usage is
     /// added to the token, to the budgets the reservations were taken on
     /// (in the periods the request was authorized in) and to the usage log.
+    /// Not to be repeated after [`BrokerError::CommitUnknown`].
     pub async fn record_usage_settling(&self, row: &NewUsageRow, settle: &[Reservation]) -> Result<(), BrokerError> {
         self.store.record_usage_settling(row, settle).await
     }

@@ -38,6 +38,11 @@ pub enum BrokerError {
     Storage(#[from] sqlx::Error),
     #[error("migration failure: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    /// A write whose commit got no answer, and whose outcome the database
+    /// could not tell afterwards: it may or may not have taken effect, so
+    /// it must not be retried.
+    #[error("outcome of a commit unknown: {0}")]
+    CommitUnknown(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
