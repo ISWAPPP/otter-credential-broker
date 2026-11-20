@@ -121,6 +121,11 @@ impl Inflight {
         })
     }
 
+    /// The cap on requests in flight per token.
+    pub fn max_per_token(&self) -> u32 {
+        self.max_per_token
+    }
+
     /// Requests in flight for a token (for tests and diagnostics).
     pub fn count(&self, token_id: &str) -> u32 {
         self.counts().tokens.get(token_id).copied().unwrap_or(0)
@@ -147,6 +152,35 @@ impl Drop for InflightPermit {
         if let Some(p) = &self.provider {
             sub(&mut c.providers, p);
         }
+    }
+}
+
+/// Fixed one-minute windows of requests per key, for endpoints that are
+/// cheap to call in a loop and should not be.
+pub struct MinuteLimiter<K> {
+    max_per_minute: u32,
+    windows: Mutex<HashMap<K, (u64, u32)>>,
+}
+
+impl<K: Eq + std::hash::Hash + Clone> MinuteLimiter<K> {
+    pub fn new(max_per_minute: u32) -> Self {
+        Self { max_per_minute: max_per_minute.max(1), windows: Mutex::new(HashMap::new()) }
+    }
+
+    /// Counts a request of `key`; `false` once the key is over its limit in
+    /// the current window.
+    pub fn allow(&self, key: &K) -> bool {
+        let now = minute();
+        let mut m = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        if m.len() >= MAX_TRACKED_ADDRESSES && !m.contains_key(key) {
+            m.retain(|_, (w, _)| *w == now);
+        }
+        let e = m.entry(key.clone()).or_insert((now, 0));
+        if e.0 != now {
+            *e = (now, 0);
+        }
+        e.1 = e.1.saturating_add(1);
+        e.1 <= self.max_per_minute
     }
 }
 
@@ -244,6 +278,14 @@ mod tests {
         let open = InflightKey { token_id: "g", tenant: "t5", tenant_max: None, provider: "q", provider_max: None };
         let _g = f.acquire_for(open).unwrap();
         assert_eq!((f.tenant_count("t5"), f.provider_count("q")), (1, 2));
+    }
+
+    #[test]
+    fn requests_per_key_and_minute() {
+        let l = MinuteLimiter::new(2);
+        assert!(l.allow(&"a") && l.allow(&"a"));
+        assert!(!l.allow(&"a"));
+        assert!(l.allow(&"b"), "keys are counted apart");
     }
 
     #[test]

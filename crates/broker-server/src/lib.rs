@@ -1,8 +1,8 @@
 //! HTTP layer of `otter-credential-broker`.
 //!
 //! Three listeners, so network policy can separate who reaches what:
-//! - public (`listen`): `/llm/*` proxy for agent pods and `/v1/worker/*` for
-//!   workers;
+//! - public (`listen`): `/llm/*` proxy for agent pods (and `/llm/_/limits`,
+//!   where they see their limits) and `/v1/worker/*` for workers;
 //! - admin (`admin_listen`): `/v1/admin/*` for the platform core;
 //! - metrics (`metrics_listen`): Prometheus `/metrics`.
 //!
@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+mod caller_limits;
 pub mod config;
 pub mod error;
 mod limit_view;
@@ -148,6 +149,7 @@ pub fn public_router(state: AppState, o: PublicOptions) -> Router {
     // No global timeout here: responses stream for minutes. Upstream timeouts
     // (connect, response, idle, total) are enforced by the proxy itself.
     let llm = Router::new()
+        .route("/llm/_/limits", get(caller_limits::view))
         .route("/llm/p/{*path}", any(proxy::by_id))
         .route("/llm/anthropic/{*path}", any(proxy::anthropic))
         .route("/llm/openai/{*path}", any(proxy::openai))

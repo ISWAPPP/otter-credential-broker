@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use crate::policy;
 
 /// Provider ids kept free for paths of the broker itself under `/llm/`: `p`,
-/// the prefix of the `/llm/p/<id>/...` route, and `limits`, kept for a later
-/// endpoint. No route needs them today; see DECISIONS.md, D-018.
+/// the prefix of the `/llm/p/<id>/...` route, and `limits`, so that no
+/// provider reads like `/llm/_/limits`, where callers see their limits.
+/// Neither route could be shadowed by a provider; see DECISIONS.md, D-018.
 pub const RESERVED_PROVIDER_IDS: &[&str] = &["p", "limits"];
 
 /// Upper bound of `llm.max_reservation_tokens`.
@@ -151,6 +152,9 @@ pub struct LlmConfig {
     /// and provider until it is accounted: its `max_tokens` (or
     /// `max_completion_tokens`) up to this, and this when it sets neither.
     pub max_reservation_tokens: u64,
+    /// Requests per LLM token and minute (per replica) to `GET /llm/_/limits`,
+    /// which reads the database but counts against no rate limit.
+    pub limits_endpoint_per_minute: u32,
     /// Upstream providers by id. `/llm/p/<id>/...` reaches any of them;
     /// the older routes stay: `/llm/anthropic/...` uses the provider with id
     /// `anthropic`, `/llm/openai/<id>/...` OpenAI-compatible ones.
@@ -338,6 +342,7 @@ impl Default for LlmConfig {
             max_concurrent_per_token: 16,
             max_concurrent_total: 1024,
             max_reservation_tokens: 32_000,
+            limits_endpoint_per_minute: 30,
             providers: BTreeMap::new(),
             pricing: Vec::new(),
         }
@@ -542,6 +547,9 @@ impl LlmConfig {
         }
         if self.max_concurrent_per_token == 0 || self.max_concurrent_total == 0 {
             return Err("llm.max_concurrent_per_token and llm.max_concurrent_total must be positive".into());
+        }
+        if self.limits_endpoint_per_minute == 0 {
+            return Err("llm.limits_endpoint_per_minute must be positive".into());
         }
         if !(1..=MAX_RESERVATION_TOKENS).contains(&self.max_reservation_tokens) {
             return Err(format!("llm.max_reservation_tokens must be between 1 and {MAX_RESERVATION_TOKENS}"));

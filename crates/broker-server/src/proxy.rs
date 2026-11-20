@@ -41,6 +41,7 @@ use broker_core::llm::scrub::{StreamRedactor, scrub_error_body};
 use broker_core::llm::usage::{TapReport, Usage, UsageSource, UsageTap};
 use broker_core::llm::{Endpoint, HttpMethod, ProviderKind};
 use broker_core::store::NewUsageRow;
+use broker_core::tokens::TokenDigest;
 use broker_core::{BrokerError, Keeper, Secret};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -56,7 +57,7 @@ use crate::admin::auth_failure;
 use crate::config::{LlmConfig, ProviderHeaders};
 use crate::error::{classify, llm_error, llm_error_response, llm_limit_error};
 use crate::limit_view::LimitView;
-use crate::limits::{Inflight, InflightKey, InflightPermit, seconds_to_next_minute};
+use crate::limits::{Inflight, InflightKey, InflightPermit, MinuteLimiter, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
 use crate::policy::{BodyRefusal, check_body, request_headers, response_headers};
 use crate::registry::{ProviderSnapshot, SnapshotCell, publish};
@@ -108,6 +109,8 @@ pub struct LlmProxy {
     tracker: TaskTracker,
     shutdown: CancellationToken,
     inflight: Arc<Inflight>,
+    /// Requests to `GET /llm/_/limits` per token.
+    limits_views: MinuteLimiter<TokenDigest>,
 }
 
 impl LlmProxy {
@@ -129,6 +132,7 @@ impl LlmProxy {
             tracker: TaskTracker::new(),
             shutdown: CancellationToken::new(),
             inflight: Inflight::new(cfg.max_concurrent_per_token, cfg.max_concurrent_total),
+            limits_views: MinuteLimiter::new(cfg.limits_endpoint_per_minute),
         })
     }
 
@@ -169,6 +173,10 @@ impl LlmProxy {
 
     pub fn inflight(&self) -> &Inflight {
         &self.inflight
+    }
+
+    pub(crate) fn limits_views(&self) -> &MinuteLimiter<TokenDigest> {
+        &self.limits_views
     }
 }
 
@@ -286,7 +294,7 @@ pub(crate) fn peer_ip(req: &Request) -> Option<IpAddr> {
 
 /// The internal token, from `x-api-key` or `Authorization: Bearer`. More than
 /// one value, or two different values, is ambiguous and refused.
-fn caller_token(headers: &HeaderMap) -> Result<String, BrokerError> {
+pub(crate) fn caller_token(headers: &HeaderMap) -> Result<String, BrokerError> {
     let one = |name: &str| -> Result<Option<String>, BrokerError> {
         let mut it = headers.get_all(name).iter();
         let Some(v) = it.next() else { return Ok(None) };

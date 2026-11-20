@@ -477,3 +477,137 @@ async fn every_answer_shows_the_caller_its_limits_and_the_provider_cannot_overri
     }
     env.cleanup().await;
 }
+
+async fn limits_of(env: &Env, token: &str) -> TestResponse {
+    env.llm("GET", "/llm/_/limits", &[("authorization", &format!("Bearer {token}"))], None).await
+}
+
+#[tokio::test]
+async fn the_limits_endpoint_shows_the_callers_own_and_counts_no_request() {
+    let Some(env) = env_with("rpm = 1000, budget_tokens = { day = 1_050 }").await else { return };
+    env.clock.set(DAY0 + 3601);
+    set_limits(
+        &env,
+        "tenant-a",
+        json!({"rpm": 50, "concurrent": 4, "budget_tokens": {"day": 500},
+                                        "budget_usd": {"month": 7.25}}),
+    )
+    .await;
+    set_limits(&env, "tenant-b", json!({"rpm": 7, "budget_tokens": {"day": 777}})).await;
+    let (a, a_id) = env
+        .llm_token("tenant-a", json!({"rate_limit_per_minute": 2, "budget_tokens": 5000, "label": "worker-1"}))
+        .await;
+    let (b, b_id) = env.llm_token("tenant-b", json!({})).await;
+
+    // Asking does not use up the token's rate limit: both requests of the
+    // minute still pass.
+    for _ in 0..10 {
+        let r = limits_of(&env, &a).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.headers.get("cache-control").unwrap(), "no-store");
+    }
+    for _ in 0..2 {
+        assert_eq!(send(&env, &a).await.status, StatusCode::OK);
+    }
+    env.settle().await;
+    let v = limits_of(&env, &a).await.json();
+    let resets_at = DAY0 + 3660;
+    assert_eq!(
+        v["token"],
+        json!({"id": a_id, "label": "worker-1", "expires_at": DAY0 + 3601 + 86_400, "providers": null,
+               "rpm": {"limit": 2, "remaining": 0, "resets_at": resets_at}, "concurrent": 16,
+               "budget_tokens": {"limit": 5000.0, "spent": 500.0, "remaining": 4500.0}, "budget_usd": null})
+    );
+    assert_eq!(
+        v["tenant"],
+        json!({"id": "tenant-a", "rpm": {"limit": 50, "remaining": 48, "resets_at": resets_at}, "concurrent": 4,
+               "budgets": [
+                   {"period": "day", "unit": "tokens", "limit": 500.0, "spent": 500.0, "reserved": 0.0,
+                    "remaining": 0.0, "resets_at": DAY0 + 86_400},
+                   {"period": "month", "unit": "usd", "limit": 7.25, "spent": 0.0027, "reserved": 0.0,
+                    "remaining": 7.2473, "resets_at": 1_901_232_000}]})
+    );
+    // The provider's limits for every tenant: only how near they are.
+    assert_eq!(v["global"], json!([{"provider": "anthropic", "status": "ok", "resets_at": null}]));
+
+    // tenant-b's requests bring the provider near its day budget, then
+    // past it; tenant-a sees that, and nothing else of tenant-b.
+    for _ in 0..2 {
+        assert_eq!(send(&env, &b).await.status, StatusCode::OK);
+        env.settle().await;
+    }
+    let near = limits_of(&env, &a).await;
+    assert_eq!(near.json()["global"], json!([{"provider": "anthropic", "status": "near", "resets_at": DAY0 + 86_400}]));
+    assert_eq!(send(&env, &b).await.status, StatusCode::OK);
+    env.settle().await;
+    let exhausted = limits_of(&env, &a).await;
+    let v = exhausted.json();
+    assert_eq!(v["global"], json!([{"provider": "anthropic", "status": "exhausted", "resets_at": DAY0 + 86_400}]));
+    for text in [near.text(), exhausted.text()] {
+        assert!(!text.contains("tenant-b") && !text.contains(&b_id) && !text.contains("777"), "{text}");
+    }
+    // tenant-b sees its own.
+    let v = limits_of(&env, &b).await.json();
+    assert_eq!((v["token"]["id"].as_str(), v["tenant"]["id"].as_str()), (Some(b_id.as_str()), Some("tenant-b")));
+    assert_eq!(v["tenant"]["budgets"][0]["spent"], 750.0);
+    assert_eq!(v["tenant"]["rpm"]["remaining"], 4);
+
+    // Without a valid token there is nothing to see.
+    for auth in ["Bearer ocb_llm_nope", "Bearer sk-not-a-token", ""] {
+        let h: Vec<(&str, &str)> = if auth.is_empty() { vec![] } else { vec![("authorization", auth)] };
+        let r = env.llm("GET", "/llm/_/limits", &h, None).await;
+        assert_eq!((r.status, r.json()["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("unauthorized")));
+    }
+    let (_, revoke) =
+        env.admin_call("POST", &format!("/v1/admin/tenants/tenant-b/llm-tokens/{b_id}/revoke"), None).await;
+    assert_eq!(revoke, Value::Null);
+    assert_eq!(limits_of(&env, &b).await.status, StatusCode::UNAUTHORIZED);
+    env.cleanup().await;
+}
+
+fn minute() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 60
+}
+
+#[tokio::test]
+async fn the_limits_endpoint_has_a_rate_limit_of_its_own() {
+    let (upstream, addr) = start_upstream().await;
+    let llm = llm_config(&format!("[llm]\nlimits_endpoint_per_minute = 3\n{}", provider(&addr.to_string(), "")));
+    let options = EnvOptions { auth_failures_per_minute: 2, ..EnvOptions::default() };
+    let Some(env) = Env::with_llm(options, llm, (upstream, addr)).await else { return };
+    env.seed_keys().await;
+    let (a, _) = env.llm_token("tenant-a", json!({})).await;
+    let (b, _) = env.llm_token("tenant-a", json!({})).await;
+    let start = minute();
+    let codes: Vec<StatusCode> = join_all((0..4).map(|_| limits_of(&env, &a))).await.iter().map(|r| r.status).collect();
+    let other = limits_of(&env, &b).await;
+    // Per token and minute: unless the test straddles a minute boundary,
+    // the fourth is refused and another token is not affected.
+    if minute() == start {
+        assert_eq!(codes.iter().filter(|c| **c == StatusCode::TOO_MANY_REQUESTS).count(), 1, "{codes:?}");
+        assert_eq!(other.status, StatusCode::OK);
+    }
+    // Failed token checks count against the caller's address, as on the
+    // proxy: after two, even a valid token is refused from there.
+    let public = env.serve_public().await;
+    let client = reqwest::Client::new();
+    let get = |token: String| {
+        let client = client.clone();
+        async move {
+            client
+                .get(format!("http://{public}/llm/_/limits"))
+                .header("x-api-key", token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let start = minute();
+    let bad = format!("ocb_llm_{}", "0".repeat(64));
+    let codes = [get(bad.clone()).await, get(bad).await, get(b.clone()).await];
+    if minute() == start {
+        assert_eq!(codes.map(|c| c.as_u16()), [401, 401, 429]);
+    }
+    env.cleanup().await;
+}
