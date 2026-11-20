@@ -11,6 +11,9 @@
 5. **Internal LLM tokens**: spend a tenant's budget through the proxy.
 6. **Job tokens**: one-time access to a job's secrets.
 7. **Integrity of accounting and audit**: budgets, usage, who decrypted what.
+8. **Provider configuration and its TLS files**: base URLs and CA files
+   decide where keys are sent and which servers are trusted; client
+   certificate keys identify the broker to a provider.
 
 ## Actors and trust
 
@@ -22,6 +25,7 @@
 | LLM providers | trusted for confidentiality of the key they issued; their responses are not trusted to be free of reflected data | outbound HTTPS from the broker |
 | Broker process, its Secrets (KEK, token key, admin tokens) | trusted | |
 | Operators or attackers with database access but without the broker's Secrets | not trusted to read secrets or to mint tokens | PostgreSQL |
+| Whoever can change the config file or the providers' TLS files | trusted like whoever deploys the broker: decides where requests and keys go | ConfigMap and Secrets of the broker |
 
 ## Threats and mitigations
 
@@ -31,6 +35,11 @@
 | Stolen internal LLM token | Works only through the broker (pods have no other route to providers), only for its tenant and allowed providers, within its budget, rate limit and in-flight cap, until its TTL. Revocation is checked on every request (no cache). |
 | Token used against another tenant | The tenant comes from the token row, never from the request, and the row's tenant is covered by its MAC. Provider keys are looked up as `(token tenant, llm.<provider>)`; there is no fallback to another tenant's key. Admin routes for token ids and job tokens filter on the tenant in the path. |
 | SSRF / redirecting the key to an attacker host | Upstream URLs are built from configuration plus allowlisted constant paths; the request's Host, `X-Forwarded-*`, `Forwarded`, absolute-form request targets and paths are never used to pick a host. Redirects are not followed; proxy environment variables are ignored. Base URLs must be https unless `allow_http` is set explicitly. Tests prove a trap host is never contacted. |
+| An admin token used to send tenants' keys elsewhere (changing a provider's base URL or TLS trust) | Providers come only from the config file; the admin API can list them and nothing else. The list shows the host and port of a base URL, not its path, and no keys or file paths. |
+| A token without a provider list reaching a provider meant for a few tokens | With `access = "explicit"` a provider serves only tokens whose `providers` list names it. The list is covered by the token row's MAC and checked on every request. |
+| Impersonating a provider that is reached over a private network (a gateway with its own CA) | A provider with `tls` trusts only its `ca_file`; built-in and platform roots are off, so a certificate from a public CA or from another provider's CA is refused before anything, the key included, is sent. Tested with a server whose certificate comes from another CA. |
+| A client certificate offered to the wrong host | Each provider with `tls` has a client of its own; the client shared by the other providers has no client certificate. Tested: a provider without a client certificate presents none, even to a server that asks. |
+| A bad configuration while the broker runs | A changed config file is validated in full before anything is applied; an invalid one is refused and the running one stays. Changes outside `llm.providers` and `llm.pricing` are not applied until a restart. TLS files that do not fit together (a renewed certificate with the old key) are refused. Requests in flight keep the configuration they started with; a reload resets neither the in-flight limits nor the failed-token limiter, and shutdown still waits for every stream. |
 | Header smuggling (hop-by-hop `Connection`, duplicate auth headers, provider org headers, method override) | The upstream request is built from scratch with an allowlist of caller headers; auth is always set by the broker; ambiguous credentials are refused. CL/TE conflicts are rejected by the HTTP server. |
 | Avoiding accounting by hanging up (before the response head or mid-stream), reading slowly or making the caller time out | The upstream exchange runs in its own task, which owns accounting and reads the upstream response to its end regardless of the caller; usage comes from the provider's report. Tested for each case. |
 | Avoiding accounting with hidden reasoning (billed but not streamed) on aborted responses | Aborted responses are drained (above). Where no report can be had (stalled or failed stream, no response, shutdown cut, compressed body) output is charged at least at the request's `max_tokens` / `max_completion_tokens`. |
@@ -56,6 +65,15 @@
 - **Plaintext inside the cluster.** The listeners speak HTTP; rely on
   NetworkPolicy and a mesh or add TLS on the listeners. PostgreSQL supports
   TLS (`sslmode=verify-full`, `sslrootcert=`).
+- **Write access to the config file or the TLS files** is as powerful as
+  deploying the broker: it decides where keys are sent and which servers
+  are trusted, and a change applies within seconds, without a restart.
+  Protect the ConfigMap and Secrets with RBAC and review changes.
+- **Replicas reload independently.** For up to the kubelet's sync delay
+  plus `reload_interval_secs`, replicas can serve different provider
+  configurations; `ocb_config_version` shows each replica's.
+- **Configuration changes affect new requests only.** Removing a provider
+  or making it explicit does not stop a stream that is already running.
 - **Abandoned generations are paid for.** Because the exchange drains the
   upstream response for accounting, a request the caller cancels still runs
   to completion at the provider (bounded by its `max_tokens`) and is billed.

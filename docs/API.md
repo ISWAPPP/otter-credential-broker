@@ -2,21 +2,39 @@
 
 Errors of the admin API and the worker endpoint:
 `{"error": "<code>", "message": "..."}`. Errors produced by the proxy on
-`/llm/*` use the provider's own error shape so SDKs show the message
-(`{"type":"error","error":{"type","message","code"}}` for Anthropic,
-`{"error":{"message","type","code"}}` for OpenAI-compatible routes).
+`/llm/*` use the error shape of the provider's kind so SDKs show the
+message (`{"type":"error","error":{"type","message","code"}}` for
+Anthropic, `{"error":{"message","type","code"}}` for OpenAI-compatible
+providers). A request for an unknown provider on `/llm/p/` gets the
+OpenAI-compatible shape.
 
 ## Public listener (`listen`, default `:8080`): agent pods and workers
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | GET | `/healthz`, `/readyz` | none | liveness; readiness checks PostgreSQL |
-| POST | `/llm/anthropic/v1/messages` | LLM token | billable, JSON or SSE |
-| POST | `/llm/anthropic/v1/messages/count_tokens` | LLM token | free |
-| GET | `/llm/anthropic/v1/models` | LLM token | free |
-| POST | `/llm/openai/<provider>/chat/completions` | LLM token | billable, JSON or SSE |
-| GET | `/llm/openai/<provider>/models` | LLM token | free |
+| GET, POST | `/llm/p/<provider>/<endpoint>` | LLM token | any configured provider, by id |
+| GET, POST | `/llm/anthropic/<endpoint>` | LLM token | the provider with id `anthropic` |
+| GET, POST | `/llm/openai/<provider>/<endpoint>` | LLM token | providers of kind `openai` |
 | POST | `/v1/worker/secrets` | job token (`Bearer`) | returns the job's secrets once |
+
+`<endpoint>` is one of the endpoints of the provider's kind:
+
+| Kind | Name | Method | Endpoint | |
+|---|---|---|---|---|
+| `anthropic` | `messages` | POST | `v1/messages` | billable, JSON or SSE |
+| `anthropic` | `count_tokens` | POST | `v1/messages/count_tokens` | free |
+| `anthropic` | `models` | GET | `v1/models` | free |
+| `openai` | `chat_completions` | POST | `chat/completions` | billable, JSON or SSE |
+| `openai` | `models` | GET | `models` | free |
+
+So an Anthropic SDK uses `http://<broker>:8080/llm/p/<provider>` (or
+`/llm/anthropic` for the provider `anthropic`) as its base URL, an
+OpenAI-compatible SDK `http://<broker>:8080/llm/p/<provider>` (or
+`/llm/openai/<provider>`). A provider may serve only some endpoints of its
+kind (`endpoints` in its configuration, by name). Provider ids and paths
+are compared exactly as sent, without decoding or normalisation; the ids
+`p`, `_` and `limits` are reserved.
 
 Anything else under `/llm/` is refused (404), as are query keys other than
 `beta`, `limit`, `after_id`, `before_id` (Anthropic) and none (OpenAI).
@@ -24,8 +42,10 @@ Anything else under `/llm/` is refused (404), as are query keys other than
 Proxy status codes: upstream statuses are passed through; the broker's own
 are 400 (invalid request, unpriced model with a USD budget, streaming without
 usage), 401 (missing, unknown, expired or revoked token), 402
-`budget_exceeded`, 403 (provider not allowed for the token, or no key for the
-tenant), 404 (unknown provider or endpoint), 413, 429 `rate_limited` (token
+`budget_exceeded`, 403 (provider not allowed for the token: left out of its
+`providers` list, or a provider with `access = "explicit"` that the list
+does not name; or no key for the tenant), 404 (unknown provider, or an
+endpoint the provider does not serve), 413, 429 `rate_limited` (token
 rate limit, or too many failed token checks from one address) or
 `too_many_in_flight`, both with `Retry-After`, 502 `upstream_unavailable` or
 `upstream_bad_encoding` (compressed response refused), 503 `shutting_down`,
@@ -58,6 +78,29 @@ All routes need `Authorization: Bearer <admin token>`. `{t}` is a tenant id
 | GET | `/v1/admin/tenants/{t}/usage` | `?run_id=&token_id=&limit=` | accounted LLM requests |
 | GET | `/v1/admin/audit` | `?tenant=&limit=` | audit log, newest first |
 | POST | `/v1/admin/kek/rewrap` | `?limit=` | re-wraps DEKs not under the current KEK |
+| GET | `/v1/admin/providers` | | the LLM providers this replica uses (read-only, see below) |
+
+Providers come only from the configuration file; the API cannot add or
+change them (see DECISIONS.md, D-017). `GET /v1/admin/providers` answers
+for the replica that serves the request:
+
+```json
+{
+  "config_version": 81985529216486,
+  "providers": [
+    {"id": "gateway", "kind": "anthropic", "host": "gateway.example.internal:8443",
+     "endpoints": ["messages", "count_tokens"], "access": "explicit",
+     "has_tls": true, "tls_not_after": 1924992000, "pricing_from": "anthropic"}
+  ]
+}
+```
+
+`config_version` identifies the provider configuration (providers, prices
+and the content of TLS files); replicas that serve the same configuration
+report the same number. `host` is the host and port of the base URL, never
+its path or query. `tls_not_after` is the earliest expiry (Unix seconds) of
+the provider's CA and client certificates. No keys and no file paths are
+shown.
 
 Secret names are `[A-Za-z0-9._-]` (1-128 chars); kinds are `[a-z0-9_]`.
 Conventions: a tenant's key for provider `<id>` is the secret `llm.<id>` of

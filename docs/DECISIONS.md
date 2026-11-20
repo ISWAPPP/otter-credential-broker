@@ -79,10 +79,11 @@ Not chosen yet; `LICENSE` is a placeholder until it is.
   redact nor account.
 - Upstream base URLs come only from configuration; endpoints and query keys
   are allowlisted per provider kind (Anthropic Messages, token counting and
-  models; OpenAI-compatible chat completions and models). Batches, files and
-  everything else are refused: they would bypass accounting or expose data
-  unrelated to the agent's job. Redirects are not followed and proxy
-  environment variables are ignored.
+  models; OpenAI-compatible chat completions and models), and a provider
+  can narrow that to some of its kind's endpoints (`endpoints`). Batches,
+  files and everything else are refused: they would bypass accounting or
+  expose data unrelated to the agent's job. Redirects are not followed and
+  proxy environment variables are ignored.
 - Caller headers are allowlisted; the proxy always sets auth itself.
 - The token is accepted as `x-api-key` or `Authorization: Bearer`, so stock
   SDKs work by changing only the base URL and the key.
@@ -113,7 +114,9 @@ Not chosen yet; `LICENSE` is a placeholder until it is.
   Token budgets count all input (including cache reads and writes) plus
   output.
 - Prices are configuration (USD per million tokens, exact model or prefix);
-  nothing is hard-coded because prices change. Requests are billed by the
+  nothing is hard-coded because prices change. A provider can use another
+  provider's prices (`pricing_from`), e.g. a gateway in front of a public
+  API. Requests are billed by the
   model the provider reports as having answered; one without a price is
   billed at the provider's highest configured price. Zero prices need
   `free = true`.
@@ -170,3 +173,62 @@ usage rows use the broker's own trace or the trace given by the platform at
 token issuance (D-014). `http.trust_caller_trace_context = true` makes the
 caller's context the parent, for deployments that trust their agents' trace
 propagation. The admin listener always honours it.
+
+## D-017 Providers come only from configuration (accepted)
+
+The admin API lists providers (`GET /v1/admin/providers`) but cannot create
+or change them. A provider's base URL and TLS trust decide where tenants'
+keys are sent. An API that could change them would let anyone holding an
+admin token point a provider at a host of their choosing and collect every
+tenant's key on the next requests, although the broker otherwise never
+releases provider keys, not even to admins (D-003). Provider changes go
+through the config file instead, which is reviewed and deployed like code
+and reloaded without a restart (D-019). The list shows only the host of a
+base URL, so a path that carries account details stays out of the API.
+
+## D-018 One route for every provider; explicit access (accepted)
+
+`/llm/p/<id>/...` reaches any configured provider, so several providers of
+one kind (a public API and a gateway in front of it, say) need no routes of
+their own; `/llm/anthropic/...` and `/llm/openai/<id>/...` stay as they
+were. The new route has its own prefix, so no provider id can shadow an
+older route; `p`, `_` and `limits` are reserved for paths of the broker
+itself.
+
+A token without a `providers` list may use every provider, as before. That
+is the wrong default for a provider meant for a few tokens only (one
+tenant's gateway, an expensive pool): with `access = "explicit"` a provider
+serves only tokens whose list names it. The check uses the token row's
+provider list, which the row MAC covers.
+
+## D-019 Reloading providers and prices (accepted)
+
+Providers, prices and the clients of providers with TLS settings form one
+immutable snapshot, and a request keeps the snapshot it started with until
+its accounting is done. State that must outlive a reload (exchange tasks,
+the shutdown switch, in-flight limits, the failed-token limiter) is not in
+the snapshot and is never replaced, so a reload can neither reset limits
+nor hide a stream from shutdown.
+
+The config file and the TLS files are polled by content hash
+(`reload_interval_secs`) rather than watched through file-system events:
+polling needs no extra dependency and sees Kubernetes volume updates, which
+swap a `..data` link. A changed file is loaded and validated in full. Only
+`llm.providers`, `llm.pricing` and TLS file contents are applied; any other
+change is reported as needing a restart and nothing is applied, because
+listeners, keys, the database pool and limits are set up once, and half an
+applied file would leave the process in a state no file describes. An
+invalid file is refused. `ocb_config_version` is a fingerprint of the
+configuration rather than a counter, so replicas that serve the same
+configuration report the same value.
+
+## D-020 TLS settings per provider (accepted)
+
+A provider with `tls` gets an HTTP client of its own that trusts only the
+CA certificates in `ca_file` (built-in and platform roots off) and presents
+its client certificate, if one is configured. The other providers share a
+client that never presents one. Trust per provider means a private CA
+cannot vouch for public hosts, a public CA cannot vouch for the private
+endpoint, and a client certificate only goes to the endpoint it was issued
+for. Certificate files are reloaded when they change (D-019); a renewed
+certificate that does not match its key is refused until it does.

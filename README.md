@@ -70,10 +70,15 @@ curl -s localhost:8080/llm/anthropic/v1/messages \
 `model-small` stands for a real model id; with a USD budget the model needs a
 price in `[[llm.pricing]]`.
 
-Clients need only a different base URL and key: the Anthropic SDK uses
-`http://<broker>:8080/llm/anthropic`, OpenAI-compatible SDKs use
-`http://<broker>:8080/llm/openai/<provider-id>`, and the internal token goes
-where the SDK expects its API key. OpenAI-compatible streaming requests must
+Clients need only a different base URL and key: any configured provider is
+reached at `http://<broker>:8080/llm/p/<provider-id>`, whatever its kind;
+the older forms `http://<broker>:8080/llm/anthropic` (the provider
+`anthropic`) and `http://<broker>:8080/llm/openai/<provider-id>` still work.
+The internal token goes where the SDK expects its API key. Several providers
+may share a kind, e.g. a public API and a gateway in front of it; a provider
+can be limited to some endpoints, to tokens that name it
+(`access = "explicit"`), and given its own CA and client certificate
+(`tls`). OpenAI-compatible streaming requests must
 set `stream_options: {"include_usage": true}`, because the broker never
 modifies request bodies and needs the usage chunk for accounting; providers
 that always send usage can turn this off with `require_stream_usage = false`.
@@ -88,6 +93,13 @@ Settings come from defaults, then the TOML file given with `--config` (or
 documents every key. Three key files are required: the KEK (`[kek]`), the
 token key (`token_key_file`; changing it invalidates every issued token) and
 the admin tokens (`admin_tokens_file`).
+
+Providers and prices apply without a restart: the broker checks the config
+file and the providers' TLS files every `reload_interval_secs` and takes
+over changes to `[llm.providers.*]` and `[[llm.pricing]]`. An invalid file,
+or a change to any other key, is logged and left for a restart. Providers
+can only be changed this way; the admin API lists them but cannot edit
+them.
 
 The binary has five commands: `serve`, `migrate`, `check-config`, `keygen`
 (prints a 32-byte hex key for a KEK or the token key) and `gen-token` (prints
@@ -104,8 +116,10 @@ export uses the standard `OTEL_*` variables and is off by default.
   written first.
 - Tokens are stored as keyed digests and token rows carry MACs, so write
   access to the database alone cannot mint or widen a token.
-- Upstream hosts come only from configuration. Endpoints, query keys and
-  caller headers are allowlisted, and redirects are never followed.
+- Upstream hosts come only from configuration, never from the API.
+  Endpoints, query keys and caller headers are allowlisted, and redirects
+  are never followed. A provider with its own TLS settings trusts only its
+  own CA.
 - Budgets and rate limits are enforced in PostgreSQL, so they hold across
   replicas. Usage comes from the provider's own report even when the caller
   hangs up.

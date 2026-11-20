@@ -38,7 +38,8 @@ Crates:
   - `llm`: endpoint allowlists, usage extraction (`UsageTap`), price table,
     scrubbing and streaming redaction.
 - `broker-server`: accept loop, routes, admin handlers, worker endpoint, LLM
-  proxy and its exchange tasks, limits, config validation, spans and metrics.
+  proxy and its exchange tasks, limits, config validation, the provider
+  registry and its reload, TLS of upstream providers, spans and metrics.
 - `otter-credential-broker`: the binary and telemetry setup.
 
 ## Data model
@@ -107,12 +108,12 @@ sequenceDiagram
   participant X as exchange task
   participant DB as PostgreSQL
   participant P as provider
-  A->>H: POST /llm/anthropic/v1/messages (x-api-key: ocb_llm_...)
-  H->>H: provider and endpoint allowlist, query keys, address limiter
+  A->>H: POST /llm/p/<provider>/v1/messages (x-api-key: ocb_llm_...)
+  H->>H: take the provider snapshot; provider, endpoint and query allowlists, address limiter
   H->>DB: UPDATE llm_tokens ... RETURNING (valid? MAC ok? count rate-limit window)
   H->>H: in-flight permit, read body, parse model/stream/max_tokens only
   H->>H: budget pre-check, price lookup
-  H->>DB: audit secret.decrypt, then SELECT sealed llm.anthropic of the token's tenant
+  H->>DB: audit secret.decrypt, then SELECT sealed llm.<provider> of the token's tenant
   H->>X: spawn with request, key, permit
   X->>P: same body, allowlisted headers, x-api-key: <tenant key>, traceparent
   P-->>X: status + JSON or SSE
@@ -122,18 +123,24 @@ sequenceDiagram
   X->>DB: UPDATE spend + INSERT llm_usage (after the upstream body ends)
 ```
 
-- **Routing.** `/llm/anthropic/<path>` uses the provider with id `anthropic`;
-  `/llm/openai/<id>/<path>` an OpenAI-compatible provider. `<path>` must be
-  in the endpoint allowlist of the provider kind, compared on the raw path
-  (no decoding, no normalisation). The upstream URL is
-  `base_url + "/" + allowlisted path (+ allowlisted query)`.
+- **Routing.** `/llm/p/<id>/<path>` reaches any provider by id;
+  `/llm/anthropic/<path>` only the provider with id `anthropic`, and
+  `/llm/openai/<id>/<path>` only providers of kind `openai`. `<path>` must
+  be an endpoint of the provider's kind that the provider serves
+  (`endpoints`), compared on the raw path (no decoding, no normalisation);
+  the ids `p`, `_` and `limits` are reserved. The upstream URL is
+  `base_url + "/" + allowlisted path (+ allowlisted query)`. The provider
+  comes from the snapshot the request took when it started (see "Providers
+  and configuration reload").
 - **Authentication.** The token comes from `x-api-key` or
   `Authorization: Bearer`; several values or two different values are
   refused. Failed checks are counted per client address (see Limits).
 - **Validation and rate limit** are one statement:
   `UPDATE llm_tokens SET rl_count = CASE WHEN rl_window = $w THEN rl_count + 1 ELSE 1 END, rl_window = $w WHERE token_hash = $h AND revoked_at IS NULL AND expires_at > $now RETURNING ...`
   (fixed one-minute windows, atomic across replicas), followed by the row
-  MAC check.
+  MAC check and the provider check: a token with a `providers` list may only
+  use those, and a provider with `access = "explicit"` only serves tokens
+  whose list names it.
 - **Budgets.** Pre-check: refuse when `spent >= budget` (402). A token with a
   USD budget may only use models that have a price (400 otherwise).
   Post-accounting: after the upstream response ends, cost and tokens are
@@ -146,7 +153,8 @@ sequenceDiagram
   OpenAI-compatible), provider auth set by the broker (marked sensitive),
   `accept-encoding: identity`, `traceparent`. The body bytes are forwarded
   unchanged. No redirects are followed and proxy environment variables are
-  ignored.
+  ignored. A provider with `tls` is reached through a client of its own;
+  the others share one (see "TLS to providers").
 - **Exchange task.** The upstream request and its response belong to a task
   of their own, which also does the accounting. The handler waits at most
   `response_timeout_secs` for the response head and then streams what the
@@ -180,7 +188,9 @@ sequenceDiagram
   rounded up, using the price of the model that answered: the requested one
   (or a dated variant of it), another configured model, or, for a model
   without a price, the provider's highest configured price. Anthropic cache
-  writes with 1-hour TTL can have their own price.
+  writes with 1-hour TTL can have their own price. A provider with
+  `pricing_from` is priced with that provider's entries; usage rows and
+  metrics keep its own id.
 - **Timeouts.** Request body read, connect, response head (to the caller;
   the exchange keeps waiting), idle between body chunks, and a total cap
   (`max_duration_secs`) on the upstream exchange.
@@ -199,6 +209,76 @@ sequenceDiagram
 Issuance already checks that every name exists in the tenant and that none
 is of kind `llm_api_key`; redemption checks both again. A failure after the
 token was consumed leaves it consumed (fail closed).
+
+## Providers and configuration reload
+
+Providers and prices are configuration (`[llm.providers.<id>]`,
+`[[llm.pricing]]`); the admin API can only list them (D-017). A provider
+has an id, a kind (the wire protocol: `anthropic` or `openai`) and a base
+URL, and optionally:
+
+| Key | Effect |
+|---|---|
+| `endpoints` | names of the endpoints it serves, a subset of its kind's; all by default |
+| `access` | `implicit` (default): every token of a tenant may use it unless the token's `providers` list leaves it out; `explicit`: only tokens whose list names it |
+| `pricing_from` | price its usage with the entries of another provider of the same kind (e.g. a gateway in front of a public API); no chains, and no entries of its own |
+| `tls` | `ca_file`, optionally `client_cert` and `client_key`: a client of its own that trusts only that CA and presents that certificate |
+
+Several providers may share a kind; `/llm/p/<id>/...` reaches each of them.
+
+### Snapshot
+
+Validated providers, prices and the HTTP clients of providers with `tls`
+form one immutable snapshot. The proxy holds the current one behind a lock
+that is only taken to clone or replace an `Arc`. A request takes the
+snapshot once, when it starts; its exchange task and its accounting keep
+it to the end. A request is therefore routed, sent and priced with the
+configuration it started with, whatever a reload does in the meantime.
+
+What has to outlive a reload is not part of the snapshot and is never
+replaced: the exchange tasks (shutdown waits for them), the shutdown
+switch, the in-flight limits per token and in total, the failed-token
+limiter per address and the client shared by providers without `tls`. A
+reload neither resets limits nor hides a running stream from shutdown.
+
+### Reload
+
+Every `reload_interval_secs` (default 5, 0 turns it off) the broker reads
+the config file and hashes its content. When the hash changed, the file is
+loaded and validated again in full, with the same environment overrides:
+
+- it does not load or validate: the running configuration stays (logged,
+  counted as `invalid`);
+- a key outside `llm.providers` and `llm.pricing` differs: nothing is
+  applied; the keys, never their values, are logged (`restart_required`);
+- otherwise the new snapshot replaces the current one (`applied`), unless
+  it is equal to it (`unchanged`).
+
+The TLS files of providers are watched the same way, by content. When a
+file in use changed (a renewed certificate), the snapshot is rebuilt from
+the running configuration. Files that do not fit together, such as a new
+certificate next to the old key, are refused until they do. Clients whose
+files did not change are carried over, so their connections survive a
+reload.
+
+Reading through the path works with Kubernetes volumes: ConfigMap and
+Secret updates arrive as an atomic swap of a `..data` link, which the path
+follows. A `subPath` mount never receives updates, so mount the directory.
+Replicas pick up a change independently, within the kubelet's sync delay
+plus `reload_interval_secs`. `ocb_config_version`, the first 48 bits of a
+SHA-256 over providers, prices and TLS file contents, shows which
+configuration each replica serves; `GET /v1/admin/providers` shows it too.
+
+### TLS to providers
+
+Providers without `tls` share one client: platform roots, no client
+certificate. A provider with `tls` gets a client of its own with the same
+redirect, proxy and timeout settings, in which built-in and platform roots
+are turned off: only the certificates in `ca_file` are trusted, so neither
+a public CA nor another provider's private CA can stand in for this
+provider's server, and the client certificate is presented to this
+provider only. The earliest expiry of its CA and client certificates is
+exported as `ocb_upstream_tls_cert_expiry_timestamp{provider}`.
 
 ## Limits
 
@@ -239,6 +319,9 @@ are enforced in PostgreSQL.
 - KEK, token key, admin tokens and the database URL come from mounted
   Secrets. Root filesystem read-only, non-root, all capabilities dropped, no
   ServiceAccount token.
+- The config file comes from a ConfigMap, and the TLS files of providers
+  from Secrets, mounted as directories (no `subPath`), so changes to
+  providers, prices and certificates apply without a restart.
 - Shutdown: stop accepting; in-flight requests (streams included) get
   `http.shutdown_grace_secs`; what is left is cut, its usage estimated and
   written; then the process exits. `terminationGracePeriodSeconds` must
