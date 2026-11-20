@@ -101,7 +101,9 @@ Requests per minute are counted in fixed one-minute windows, across
 replicas. Requests in flight are counted per replica. A request is checked
 level by level, token first, and a level only counts a request that the
 levels below it let through: a token over its rate never uses up its
-tenant's window, and a tenant over its own never the provider's. Budgets of
+tenant's window, and a tenant over its own never the provider's; a token
+or a tenant whose budget is used up is refused before either window counts
+the request. Budgets of
 a tenant and a provider count only billable endpoints. A billable request
 reserves its `max_tokens` (or `max_completion_tokens`), at most
 `llm.max_reservation_tokens` (that much when it sets neither), on each of

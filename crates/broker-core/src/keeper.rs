@@ -127,32 +127,44 @@ pub struct LlmGrant {
 }
 
 impl LlmGrant {
-    /// Budget pre-check before forwarding a billable request. Concurrent
-    /// requests may each pass and overshoot by at most their own cost; the
-    /// next request after post-accounting is refused.
-    pub fn check_budget(&self, model: Option<&str>, price: Option<&ModelPrice>) -> Result<(), BrokerError> {
+    /// The refusal of a billable request once what the token spent reaches
+    /// its budget, in tokens or USD. It needs nothing from the request, so
+    /// the proxy checks it before the request counts in any window above
+    /// the token.
+    pub fn budget_used_up(&self) -> Option<BrokerError> {
         if let Some(limit) = self.budget_tokens
             && self.spent_tokens >= limit
         {
-            return Err(BrokerError::BudgetExceeded(format!(
+            return Some(BrokerError::BudgetExceeded(format!(
                 "token budget of this LLM token is used up ({} of {limit} tokens)",
                 self.spent_tokens
             )));
         }
-        if let Some(limit) = self.budget_micro_usd {
-            if price.is_none() {
-                return Err(BrokerError::Invalid(format!(
-                    "model {} has no configured price; tokens with a USD budget can only use priced models",
-                    model.map_or("(none)", |m| m)
-                )));
-            }
-            if self.spent_micro_usd >= limit {
-                return Err(BrokerError::BudgetExceeded(format!(
-                    "USD budget of this LLM token is used up (${:.6} of ${:.6})",
-                    micro_to_usd(self.spent_micro_usd),
-                    micro_to_usd(limit)
-                )));
-            }
+        if let Some(limit) = self.budget_micro_usd
+            && self.spent_micro_usd >= limit
+        {
+            return Some(BrokerError::BudgetExceeded(format!(
+                "USD budget of this LLM token is used up (${:.6} of ${:.6})",
+                micro_to_usd(self.spent_micro_usd),
+                micro_to_usd(limit)
+            )));
+        }
+        None
+    }
+
+    /// Budget pre-check before forwarding a billable request: the budget is
+    /// not used up, and a token with a USD budget only uses priced models.
+    /// Concurrent requests may each pass and overshoot by at most their own
+    /// cost; the next request after post-accounting is refused.
+    pub fn check_budget(&self, model: Option<&str>, price: Option<&ModelPrice>) -> Result<(), BrokerError> {
+        if let Some(e) = self.budget_used_up() {
+            return Err(e);
+        }
+        if self.budget_micro_usd.is_some() && price.is_none() {
+            return Err(BrokerError::Invalid(format!(
+                "model {} has no configured price; tokens with a USD budget can only use priced models",
+                model.map_or("(none)", |m| m)
+            )));
         }
         Ok(())
     }
@@ -193,6 +205,35 @@ impl Authorized {
             return Err(BrokerError::RateLimited { retry_after_secs: retry_after(self.at) });
         }
         Ok(())
+    }
+
+    /// The refusal of a billable request by the first budget of the tenant
+    /// that was used up, spent and reserved, when the request was
+    /// authorized: the test and the refusal of [`Keeper::reserve`], on the
+    /// spend read with the token. It needs nothing from the request, so the
+    /// proxy checks it before the request counts in the windows of its
+    /// tenant and provider; the reservation still decides, since requests
+    /// in flight may use up a budget in between.
+    pub fn tenant_budget_used_up(&self) -> Option<BrokerError> {
+        let limits = &self.tenant_limits;
+        for period in limits.budget_periods() {
+            let spend = self.tenant_spend.get(period).unwrap_or_default();
+            let claim = BudgetClaim {
+                scope: LimitScope::tenant(&self.grant.tenant),
+                period,
+                period_start: period.start(self.at),
+                limit_tokens: limits.tokens(period),
+                limit_micro_usd: limits.micro_usd(period),
+                tokens: 0,
+                micro_usd: 0,
+            };
+            if claim.limit_tokens.is_some_and(|l| spend.used_tokens() >= l)
+                || claim.limit_micro_usd.is_some_and(|l| spend.used_micro_usd() >= l)
+            {
+                return Some(BrokerError::Limit(budget_refusal(&claim, &spend, "")));
+            }
+        }
+        None
     }
 }
 
@@ -1256,9 +1297,60 @@ mod tests {
         assert!(g.check_budget(Some("m"), Some(&price)).is_ok());
         g.spent_micro_usd = 5;
         assert!(matches!(g.check_budget(Some("m"), Some(&price)), Err(BrokerError::BudgetExceeded(_))));
+        // Used up whatever the model: nothing to read from the request.
+        assert!(matches!(g.check_budget(Some("unpriced"), None), Err(BrokerError::BudgetExceeded(_))));
+        assert!(matches!(g.budget_used_up(), Some(BrokerError::BudgetExceeded(_))));
+        g.spent_micro_usd = 4;
+        assert!(g.budget_used_up().is_none());
         assert_eq!(usd_to_micro(1.5).unwrap(), 1_500_000);
         assert!(usd_to_micro(-1.0).is_err());
         assert!(usd_to_micro(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn a_tenant_budget_used_up_when_the_token_was_found() {
+        // 2030-03-17T17:46:40Z.
+        let at = 1_900_000_000;
+        let mut a = Authorized {
+            grant: LlmGrant {
+                token_id: "t".into(),
+                tenant: "tenant-a".into(),
+                run_id: None,
+                budget_micro_usd: None,
+                budget_tokens: None,
+                spent_micro_usd: 0,
+                spent_tokens: 0,
+                trace_parent: None,
+            },
+            at,
+            token_rpm: RateCount { limit: 10, count: 1 },
+            tenant_limits: Limits {
+                budget_tokens: PerPeriod { day: Some(100), month: None },
+                budget_usd: PerPeriod { day: None, month: Some(1.0) },
+                ..Limits::default()
+            },
+            tenant_spend: PerPeriod::default(),
+        };
+        assert!(a.tenant_budget_used_up().is_none(), "nothing spent yet");
+        // What requests in flight reserved counts.
+        a.tenant_spend.day = Some(Spend { spent_tokens: 60, reserved_tokens: 40, ..Spend::default() });
+        let Some(BrokerError::Limit(r)) = a.tenant_budget_used_up() else { panic!("not refused") };
+        assert_eq!((r.level, r.kind), (LimitLevel::Tenant, LimitKind::Budget));
+        assert_eq!(
+            r.message,
+            "daily token budget of the tenant is used up (100 of 100 tokens, requests in flight included); \
+             it renews at 2030-03-18T00:00:00Z"
+        );
+        a.tenant_spend.day = Some(Spend { spent_tokens: 99, ..Spend::default() });
+        a.tenant_spend.month = Some(Spend { spent_micro_usd: 1_000_000, ..Spend::default() });
+        let Some(BrokerError::Limit(r)) = a.tenant_budget_used_up() else { panic!("not refused") };
+        assert_eq!(r.budget.map(|b| (b.period, b.usd)), Some((Period::Month, true)));
+        // A budget of zero lets nothing through, as with a reservation.
+        a.tenant_limits = Limits { budget_tokens: PerPeriod { day: Some(0), month: None }, ..Limits::default() };
+        a.tenant_spend = PerPeriod::default();
+        assert!(a.tenant_budget_used_up().is_some());
+        a.tenant_limits = Limits::default();
+        assert!(a.tenant_budget_used_up().is_none());
     }
 
     #[test]

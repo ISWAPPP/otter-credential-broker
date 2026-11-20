@@ -279,6 +279,17 @@ fn in_flight_refusal(refusal: InflightRefusal, provider: &str) -> BrokerError {
     })
 }
 
+/// Counts a refusal by the token's budget, or of a model without a price
+/// under its USD budget.
+fn token_budget_denied(grant: &LlmGrant, e: &BrokerError) {
+    let what = match (e, grant.budget_tokens) {
+        (BrokerError::BudgetExceeded(_), Some(b)) if grant.spent_tokens >= b => "tokens",
+        (BrokerError::BudgetExceeded(_), _) => "usd",
+        _ => "unpriced_model",
+    };
+    metrics::counter!("ocb_llm_budget_denials_total", "tenant" => grant.tenant.clone(), "kind" => what).increment(1);
+}
+
 /// 400 for a request the provider's body policy refuses. A refused tool is
 /// logged, since it can be an agent trying to reach the network through the
 /// provider; the body never is.
@@ -453,7 +464,10 @@ async fn proxy(
     }
     // Limits, level by level: a level only counts a request the levels
     // below it let through, so a token over its limits never uses up its
-    // tenant's, and a tenant over its limits never the provider's.
+    // tenant's, and a tenant over its limits never the provider's. The
+    // windows are counted before the body is read, so that a request over
+    // them is refused without reading it; a request refused after them, for
+    // its body or by a reservation, has been counted in them.
     let tenant = auth.grant.tenant.clone();
     if let Err(e) = auth.check_token_rate() {
         done!(refused(&mut view, kind, provider_id, &tenant, LimitLevel::Token, &token_rate_refusal(&auth, e)));
@@ -473,6 +487,19 @@ async fn proxy(
             done!(refused(&mut view, kind, label, &tenant, refusal.level(), &e))
         }
     };
+    // A budget that was used up when the token was found refuses before the
+    // windows above it count: the token's, then the tenant's, as read with
+    // the token. The reservation below decides for the tenant, whose budget
+    // requests in flight may use up meanwhile, and for the provider.
+    if endpoint.billable {
+        if let Some(e) = auth.grant.budget_used_up() {
+            token_budget_denied(&auth.grant, &e);
+            done!(refused(&mut view, kind, provider_id, &tenant, LimitLevel::Token, &e));
+        }
+        if let Some(e) = auth.tenant_budget_used_up() {
+            done!(refused(&mut view, kind, provider_id, &tenant, LimitLevel::Tenant, &e));
+        }
+    }
     match st.keeper.count_request(&auth, provider_id, provider.limits.rpm).await {
         Ok(c) => view.counted(&c),
         Err(e) => done!(match &e {
@@ -515,13 +542,7 @@ async fn proxy(
     let request_price = probe.model.as_deref().and_then(|m| snap.prices().lookup(provider.price_source(), m));
     if endpoint.billable {
         if let Err(e) = grant.check_budget(probe.model.as_deref(), request_price) {
-            let what = match (&e, grant.budget_tokens) {
-                (BrokerError::BudgetExceeded(_), Some(b)) if grant.spent_tokens >= b => "tokens",
-                (BrokerError::BudgetExceeded(_), _) => "usd",
-                _ => "unpriced_model",
-            };
-            metrics::counter!("ocb_llm_budget_denials_total", "tenant" => grant.tenant.clone(), "kind" => what)
-                .increment(1);
+            token_budget_denied(&grant, &e);
             done!(match e {
                 BrokerError::BudgetExceeded(_) => refused(&mut view, kind, provider_id, &tenant, LimitLevel::Token, &e),
                 _ => reject(kind, &e),

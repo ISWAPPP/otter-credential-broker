@@ -425,6 +425,69 @@ async fn a_request_that_ends_before_the_provider_gives_its_reservation_back() {
     env.cleanup().await;
 }
 
+type Window = (String, String, String, i32);
+
+/// Every request window: level, tenant, provider and its count.
+async fn windows(env: &Env) -> Vec<Window> {
+    sqlx::query_as("SELECT level, tenant_id, provider, rl_count FROM limit_rpm ORDER BY level, tenant_id, provider")
+        .fetch_all(env.state.keeper.store().pool())
+        .await
+        .unwrap()
+}
+
+fn window(level: &str, tenant: &str, provider: &str, count: i32) -> Window {
+    (level.into(), tenant.into(), provider.into(), count)
+}
+
+#[tokio::test]
+async fn a_budget_used_up_refuses_before_the_windows_above_it_count() {
+    let Some(env) = env_with("rpm = 1000").await else { return };
+    env.clock.set(T0 - T0 % 60 + 1);
+    set_limits(&env, "tenant-a", json!({"rpm": 1000})).await;
+    set_limits(&env, "tenant-b", json!({"rpm": 1000, "budget_tokens": {"day": 100}})).await;
+    // One request of 250 tokens each uses up the budget of tenant-a's
+    // token and tenant-b's day budget.
+    let (a, _) = env.llm_token("tenant-a", json!({"budget_tokens": 100})).await;
+    let (b, _) = env.llm_token("tenant-b", json!({})).await;
+    for token in [&a, &b] {
+        assert_eq!(send(&env, token).await.status, StatusCode::OK);
+    }
+    env.settle().await;
+    for _ in 0..5 {
+        let r = send(&env, &a).await;
+        assert_eq!((r.status, level(&r)), (StatusCode::PAYMENT_REQUIRED, "token".to_owned()));
+        assert_eq!(
+            r.json()["error"]["message"],
+            "budget exceeded: token budget of this LLM token is used up (250 of 100 tokens)"
+        );
+        // As the reservation would refuse it.
+        let r = send(&env, &b).await;
+        assert_eq!((r.status, level(&r)), (StatusCode::PAYMENT_REQUIRED, "tenant".to_owned()));
+        assert_eq!(
+            r.json()["error"]["message"],
+            "daily token budget of the tenant is used up (250 of 100 tokens, requests in flight included); \
+             it renews at 2030-03-18T00:00:00Z"
+        );
+    }
+    // Ten refusals, and only the two requests that passed are counted
+    // above their tokens: retries of a caller whose budget is spent take
+    // nothing from the rate limits of its tenant or of the provider.
+    assert_eq!(
+        windows(&env).await,
+        [
+            window("global", "", "anthropic", 2),
+            window("tenant", "tenant-a", "", 1),
+            window("tenant", "tenant-b", "", 1)
+        ]
+    );
+    assert_eq!(env.upstream.count(), 2);
+    // Endpoints that are not billable still pass, and count.
+    let r = env.llm("POST", "/llm/anthropic/v1/messages/count_tokens", &[("x-api-key", &b)], Some("{}".into())).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(windows(&env).await[0], window("global", "", "anthropic", 3));
+    env.cleanup().await;
+}
+
 #[tokio::test]
 async fn without_limits_nothing_is_counted_beyond_the_token() {
     let Some(env) = Env::new().await else { return };

@@ -137,6 +137,7 @@ sequenceDiagram
   H->>H: take the provider snapshot; provider, endpoint and query allowlists, address limiter
   H->>DB: UPDATE llm_tokens ... RETURNING, with the tenant's limits and spend (valid? MAC ok? token window)
   H->>H: in-flight permits: token, tenant, provider, total
+  H->>H: budgets of the token and the tenant used up, as read with the token?
   H->>DB: count in the windows of the tenant, then of the provider (one statement)
   H->>H: read body, parse model/stream/max_tokens only
   H->>H: body policy (tools, mcp_servers), token budget pre-check, price lookup
@@ -403,8 +404,13 @@ cannot use up a higher level's for everyone else:
 2. Requests in flight, in memory: the token's cap, then the tenant's, then
    the provider's, then the replica's total. A request refused here takes
    no slot at any level and is counted in no window above the token's; a
-   request refused in step 3 gives its slots back.
-3. One statement counts the request in the window of the tenant and then
+   request refused in a later step gives its slots back.
+3. For billable endpoints, budgets that were used up when step 1 read
+   them: the token's (`spent >= budget`), then the tenant's (spent and
+   reserved at or over a limit, the test of the reservation). They need
+   nothing from the request, so a token or a tenant whose budget is used
+   up is refused before it counts in any window above it.
+4. One statement counts the request in the window of the tenant and then
    of the provider, each with
    `INSERT ... ON CONFLICT DO UPDATE ... WHERE rl_count < limit`: the
    provider's window only takes part when the tenant's let the request
@@ -412,9 +418,17 @@ cannot use up a higher level's for everyone else:
    refused. The token's own window is in the statement of step 1, because
    the row MAC has to be checked in the broker before anything above the
    token is touched.
-4. After the body is read, for billable endpoints: the token's budget as
-   before (`spent < budget`), then a reservation on the budgets of the
-   tenant and the provider (below).
+5. After the body is read, for billable endpoints: the token's budget with
+   the price of the model (a USD budget takes priced models only), then a
+   reservation on the budgets of the tenant and the provider (below),
+   which decides.
+
+The windows are counted before the body is read, so that a request over
+them is refused without reading it. What comes after them cannot take a
+request back out: one refused for its body (unreadable, refused by the
+body policy, a model without a price) or by the reservation (the
+provider's budget, or the tenant's, used up by requests in flight since
+step 1) has been counted in the windows of its tenant and provider.
 
 Windows are fixed one-minute windows keyed by the minute, like the
 token's; a replica whose clock is behind counts into the newer window it

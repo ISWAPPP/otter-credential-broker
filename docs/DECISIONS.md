@@ -325,7 +325,11 @@ before, in the statement that finds the token, because its row MAC is
 checked in the broker before anything above the token is touched; the
 tenant's and the provider's windows are one statement of conditional
 updates, which never count past a limit and report the level that refused.
-Requests in flight are checked in the same order, in memory.
+Requests in flight are checked in the same order, in memory. Budgets come
+after the windows, since a reservation needs the body; but a budget of the
+token or the tenant that is already used up when the token is found needs
+nothing from the request, so it refuses before the windows count, and a
+caller retrying against it takes nothing from the rate limits of others.
 
 **Periods.** Budgets of tenants and providers are per UTC day and month, a
 period being a row keyed by its start: a new period starts from zero with
