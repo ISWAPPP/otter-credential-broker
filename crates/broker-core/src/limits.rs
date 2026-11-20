@@ -181,6 +181,13 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// `ts` as an RFC 3339 date and time in UTC, e.g. `2030-03-18T00:00:00Z`.
+pub fn format_utc(ts: Timestamp) -> String {
+    let (y, m, d) = civil_from_days(ts.div_euclid(DAY_SECS));
+    let secs = ts.rem_euclid(DAY_SECS);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs % 3600 / 60, secs % 60)
+}
+
 /// A value per period, `{ day = ..., month = ... }`; either may be left out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -376,6 +383,9 @@ mod tests {
             assert_eq!(days_from_civil(y, m, d), day);
             assert!((1..=12).contains(&m) && (1..=31).contains(&d));
         }
+        assert_eq!(format_utc(1_900_000_000), "2030-03-17T17:46:40Z");
+        assert_eq!(format_utc(1_767_225_599), "2025-12-31T23:59:59Z");
+        assert_eq!(format_utc(-1), "1969-12-31T23:59:59Z");
         assert_eq!(Period::parse("month"), Some(Period::Month));
         assert_eq!(Period::parse("week"), None);
     }

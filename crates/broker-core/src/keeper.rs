@@ -18,14 +18,19 @@ use serde_json::{Value, json};
 use crate::clock::{Clock, Timestamp};
 use crate::crypto::{Envelope, secret_context};
 use crate::error::BrokerError;
+use crate::limits::{
+    LimitKind, LimitLevel, LimitRefusal, Limits, PerPeriod, Period, Reservation, Spend, format_utc, window_of,
+    window_reset,
+};
 use crate::llm::pricing::ModelPrice;
 use crate::llm::{LLM_KEY_KIND, ProviderAccess, provider_key_secret_name};
 use crate::secret::Secret;
 use crate::store::{
-    AuditEntry, AuditEvent, JobTokenInfo, LlmGrantRow, LlmTokenInfo, NewJobTokenRow, NewLlmTokenRow, NewSecretRow,
-    NewUsageRow, RedeemedJobRow, SealedSecret, SecretMeta, Store, UsageEntry, UsageFilter,
+    AuditEntry, AuditEvent, BudgetClaim, JobTokenInfo, LabelledTokenExpiry, LimitScope, LlmTokenInfo, LlmTokenState,
+    NewJobTokenRow, NewLlmTokenRow, NewSecretRow, NewUsageRow, RedeemedJobRow, RpmRow, SealedSecret, SecretMeta,
+    SpendRow, Store, TenantLimitsRow, UsageEntry, UsageFilter,
 };
-use crate::tokens::{self, TokenHasher, TokenKind};
+use crate::tokens::{self, TokenDigest, TokenHasher, TokenKind};
 use crate::validate;
 
 /// Limits and defaults. All durations in seconds.
@@ -151,6 +156,88 @@ impl LlmGrant {
         }
         Ok(())
     }
+}
+
+/// A limit and how much of it is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateCount {
+    pub limit: i64,
+    /// Requests counted in the current window, the request at hand included.
+    pub count: i64,
+}
+
+/// A token that passed authorization for one request (its row was found
+/// and is intact, and it may use the provider), with what the levels above
+/// it allow.
+#[derive(Debug, Clone)]
+pub struct Authorized {
+    pub grant: LlmGrant,
+    /// When the request was authorized: its rate-limit windows and budget
+    /// periods are the ones this falls in, also when it is accounted later.
+    pub at: Timestamp,
+    /// The token's own rate limit and its current window.
+    pub token_rpm: RateCount,
+    /// Limits of the tenant; empty when it has none.
+    pub tenant_limits: Limits,
+    /// The tenant's spend in the current day and month, as read at
+    /// authorization.
+    pub tenant_spend: PerPeriod<Spend>,
+}
+
+impl Authorized {
+    /// The token's own rate limit: refuses the request when the window,
+    /// this request included, is over it.
+    pub fn check_token_rate(&self) -> Result<(), BrokerError> {
+        if self.token_rpm.count > self.token_rpm.limit {
+            metrics::counter!("ocb_llm_rate_limited_total", "tenant" => self.grant.tenant.clone()).increment(1);
+            return Err(BrokerError::RateLimited { retry_after_secs: retry_after(self.at) });
+        }
+        Ok(())
+    }
+}
+
+/// Seconds until the rate-limit window of `at` ends.
+fn retry_after(at: Timestamp) -> u64 {
+    u64::try_from(window_reset(at) - at).unwrap_or(60).max(1)
+}
+
+/// The windows a request was counted in, of the levels that have a rate
+/// limit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Counted {
+    pub tenant: Option<RateCount>,
+    pub global: Option<RateCount>,
+}
+
+/// What a request holds on the budgets of its tenant and provider until it
+/// is accounted, and the rows as they are after it took it.
+#[derive(Debug, Clone, Default)]
+pub struct Reserved {
+    pub reservations: Vec<Reservation>,
+    pub rows: Vec<SpendRow>,
+}
+
+/// Limits of a tenant as set through the admin API.
+#[derive(Debug, Clone, Serialize)]
+pub struct TenantLimits {
+    pub tenant: String,
+    pub limits: Limits,
+    pub updated_at: Timestamp,
+    pub updated_by: String,
+}
+
+impl From<TenantLimitsRow> for TenantLimits {
+    fn from(r: TenantLimitsRow) -> Self {
+        Self { limits: r.limits(), tenant: r.tenant_id, updated_at: r.updated_at, updated_by: r.updated_by }
+    }
+}
+
+/// A valid token read without counting a request, with its tenant's limits.
+#[derive(Debug, Clone)]
+pub struct Inspected {
+    pub token: LlmTokenState,
+    pub at: Timestamp,
+    pub tenant_limits: Limits,
 }
 
 pub struct RedeemedSecret {
@@ -492,21 +579,40 @@ impl Keeper {
     /// list may use only those; a provider with [`ProviderAccess::Explicit`]
     /// only serves tokens whose list names it. No caching: revocation takes
     /// effect on the next request, on every replica.
-    #[tracing::instrument(name = "keeper.llm.authorize", skip_all, fields(provider = %provider))]
     pub async fn authorize_llm(
         &self,
         presented: &str,
         provider: &str,
         access: ProviderAccess,
     ) -> Result<LlmGrant, BrokerError> {
+        let a = self.authorize(presented, provider, access).await?;
+        a.check_token_rate()?;
+        Ok(a.grant)
+    }
+
+    /// Like [`Keeper::authorize_llm`], but leaves the token's rate limit to
+    /// [`Authorized::check_token_rate`], and also returns the limits of the
+    /// token's tenant and its current spend (read in the same statement).
+    #[tracing::instrument(name = "keeper.llm.authorize", skip_all, fields(provider = %provider))]
+    pub async fn authorize(
+        &self,
+        presented: &str,
+        provider: &str,
+        access: ProviderAccess,
+    ) -> Result<Authorized, BrokerError> {
         let digest = self.hasher.parse(TokenKind::Llm, presented).ok_or(BrokerError::Unauthorized)?;
         let now = self.clock.now();
-        let row = self.store.authorize_llm(&digest, now, now.div_euclid(60)).await?.ok_or(BrokerError::Unauthorized)?;
-        if !self.verify_llm_row(&row) {
-            integrity_failure("llm_tokens", &row.id);
+        let row = self
+            .store
+            .authorize_llm(&digest, now, window_of(now), Period::Day.start(now), Period::Month.start(now))
+            .await?
+            .ok_or(BrokerError::Unauthorized)?;
+        let t = &row.token;
+        if !self.verify_llm_mac(&t.id, &t.tenant_id, t.providers.as_deref(), t.expires_at, &t.auth_mac) {
+            integrity_failure("llm_tokens", &t.id);
             return Err(BrokerError::Unauthorized);
         }
-        match (&row.providers, access) {
+        match (&t.providers, access) {
             (Some(allowed), _) if !allowed.iter().any(|p| p == provider) => {
                 return Err(BrokerError::Forbidden(format!("this LLM token may not use provider {provider}")));
             }
@@ -517,22 +623,222 @@ impl Keeper {
             }
             _ => {}
         }
-        if row.rl_count > row.rate_limit_per_minute {
-            metrics::counter!("ocb_llm_rate_limited_total", "tenant" => row.tenant_id.clone()).increment(1);
-            return Err(BrokerError::RateLimited {
-                retry_after_secs: u64::try_from(60 - now.rem_euclid(60)).unwrap_or(60),
-            });
-        }
-        Ok(LlmGrant {
-            token_id: row.id,
-            tenant: row.tenant_id,
-            run_id: row.run_id,
-            budget_micro_usd: row.budget_micro_usd,
-            budget_tokens: row.budget_tokens,
-            spent_micro_usd: row.spent_micro_usd,
-            spent_tokens: row.spent_tokens,
-            trace_parent: row.trace_parent,
+        let tenant_limits = row.tenant_limits();
+        let tenant_spend = PerPeriod { day: row.tenant_spend(Period::Day), month: row.tenant_spend(Period::Month) };
+        let t = row.token;
+        Ok(Authorized {
+            token_rpm: RateCount { limit: i64::from(t.rate_limit_per_minute), count: i64::from(t.rl_count) },
+            grant: LlmGrant {
+                token_id: t.id,
+                tenant: t.tenant_id,
+                run_id: t.run_id,
+                budget_micro_usd: t.budget_micro_usd,
+                budget_tokens: t.budget_tokens,
+                spent_micro_usd: t.spent_micro_usd,
+                spent_tokens: t.spent_tokens,
+                trace_parent: t.trace_parent,
+            },
+            at: now,
+            tenant_limits,
+            tenant_spend,
         })
+    }
+
+    /// Counts an authorized request in the one-minute windows of its tenant
+    /// and then of `provider`, for the levels with a rate limit
+    /// (`global_rpm` is the provider's). The provider's window only counts
+    /// requests the tenant's let through, so a tenant over its limit does
+    /// not use up the provider's for others, as a token over its limit
+    /// never reaches its tenant's. A refusal is [`BrokerError::Limit`].
+    #[tracing::instrument(name = "keeper.llm.count", skip_all, fields(provider = %provider))]
+    pub async fn count_request(
+        &self,
+        a: &Authorized,
+        provider: &str,
+        global_rpm: Option<u32>,
+    ) -> Result<Counted, BrokerError> {
+        let to_i32 = |r: u32| i32::try_from(r).unwrap_or(i32::MAX);
+        let (tenant_rpm, global_rpm) = (a.tenant_limits.rpm.map(to_i32), global_rpm.map(to_i32));
+        if tenant_rpm.is_none() && global_rpm.is_none() {
+            return Ok(Counted::default());
+        }
+        let c = self.store.count_requests(&a.grant.tenant, provider, window_of(a.at), tenant_rpm, global_rpm).await?;
+        let retry_after_secs = retry_after(a.at);
+        if !c.tenant_passed {
+            return Err(BrokerError::Limit(LimitRefusal {
+                level: LimitLevel::Tenant,
+                kind: LimitKind::Rate,
+                message: format!(
+                    "rate limit of the tenant exceeded ({} requests per minute), retry after {retry_after_secs}s",
+                    tenant_rpm.unwrap_or_default()
+                ),
+                retry_after_secs: Some(retry_after_secs),
+            }));
+        }
+        if !c.global_passed {
+            return Err(BrokerError::Limit(LimitRefusal {
+                level: LimitLevel::Global,
+                kind: LimitKind::Rate,
+                message: format!("rate limit of provider {provider} exceeded, retry after {retry_after_secs}s"),
+                retry_after_secs: Some(retry_after_secs),
+            }));
+        }
+        let count = |limit: Option<i32>, n: Option<i32>| {
+            limit.map(|l| RateCount { limit: i64::from(l), count: i64::from(n.unwrap_or(0)) })
+        };
+        Ok(Counted { tenant: count(tenant_rpm, c.tenant_count), global: count(global_rpm, c.global_count) })
+    }
+
+    /// Reserves `tokens` and `micro_usd` on every budget of the request's
+    /// tenant and of `provider` (`global` holds the provider's limits), in
+    /// the periods the request was authorized in. All or nothing: a budget
+    /// that is used up, reservations of requests in flight included,
+    /// refuses the request ([`BrokerError::Limit`], naming the lowest level
+    /// that refused) and nothing stays reserved. A refusal of the global
+    /// level does not show the provider's numbers.
+    #[tracing::instrument(name = "keeper.llm.reserve", skip_all, fields(provider = %provider))]
+    pub async fn reserve(
+        &self,
+        a: &Authorized,
+        provider: &str,
+        global: &Limits,
+        tokens: i64,
+        micro_usd: i64,
+    ) -> Result<Reserved, BrokerError> {
+        let mut claims = Vec::new();
+        for (scope, limits) in
+            [(LimitScope::tenant(&a.grant.tenant), &a.tenant_limits), (LimitScope::global(provider), global)]
+        {
+            for period in limits.budget_periods() {
+                claims.push(BudgetClaim {
+                    scope: scope.clone(),
+                    period,
+                    period_start: period.start(a.at),
+                    limit_tokens: limits.tokens(period),
+                    limit_micro_usd: limits.micro_usd(period),
+                    tokens,
+                    micro_usd,
+                });
+            }
+        }
+        if claims.is_empty() {
+            return Ok(Reserved::default());
+        }
+        match self.store.reserve(&claims).await? {
+            Ok(rows) => {
+                let reservations = claims
+                    .into_iter()
+                    .map(|c| Reservation {
+                        level: c.scope.level,
+                        tenant: c.scope.tenant,
+                        provider: c.scope.provider,
+                        period: c.period,
+                        period_start: c.period_start,
+                        tokens: c.tokens.max(0),
+                        micro_usd: c.micro_usd.max(0),
+                    })
+                    .collect();
+                Ok(Reserved { reservations, rows })
+            }
+            Err(denied) => {
+                let Some(claim) = denied.refused.iter().map(|i| &claims[*i]).min_by_key(|c| (c.scope.level, c.period))
+                else {
+                    return Err(BrokerError::Internal("a refused reservation names no budget".into()));
+                };
+                let spend = denied
+                    .rows
+                    .iter()
+                    .find(|r| r.is(&claim.scope, claim.period) && r.period_start == claim.period_start)
+                    .map(SpendRow::spend)
+                    .unwrap_or_default();
+                Err(BrokerError::Limit(budget_refusal(claim, &spend, provider)))
+            }
+        }
+    }
+
+    /// Gives back what a request reserved when it ends before it reaches
+    /// the provider.
+    pub async fn release(&self, reservations: &[Reservation]) -> Result<(), BrokerError> {
+        self.store.release(reservations).await
+    }
+
+    /// Post-accounting of one proxied request that holds reservations: in
+    /// one transaction, the reservations are given back and the usage is
+    /// added to the token, to the budgets the reservations were taken on
+    /// (in the periods the request was authorized in) and to the usage log.
+    pub async fn record_usage_settling(&self, row: &NewUsageRow, settle: &[Reservation]) -> Result<(), BrokerError> {
+        self.store.record_usage_settling(row, settle).await
+    }
+
+    /// The keyed digest of a presented LLM token; `None` for anything that
+    /// cannot be one.
+    pub fn llm_token_digest(&self, presented: &str) -> Option<TokenDigest> {
+        self.hasher.parse(TokenKind::Llm, presented)
+    }
+
+    /// Reads a valid LLM token by its digest without counting a request,
+    /// with the limits of its tenant.
+    #[tracing::instrument(name = "keeper.llm.inspect", skip_all)]
+    pub async fn inspect_llm_token(&self, digest: &TokenDigest) -> Result<Inspected, BrokerError> {
+        let now = self.clock.now();
+        let t = self.store.find_llm_token(digest, now).await?.ok_or(BrokerError::Unauthorized)?;
+        if !self.verify_llm_mac(&t.id, &t.tenant_id, t.providers.as_deref(), t.expires_at, &t.auth_mac) {
+            integrity_failure("llm_tokens", &t.id);
+            return Err(BrokerError::Unauthorized);
+        }
+        let tenant_limits = self.store.get_tenant_limits(&t.tenant_id).await?.map(|r| r.limits()).unwrap_or_default();
+        Ok(Inspected { token: t, at: now, tenant_limits })
+    }
+
+    // ---------- limits of tenants ----------
+
+    /// Replaces the limits of a tenant (all of them: a limit left out is
+    /// removed; no limits at all removes the tenant's entry). Audited.
+    #[tracing::instrument(name = "keeper.tenant_limits.set", skip_all, fields(tenant = %tenant))]
+    pub async fn set_tenant_limits(
+        &self,
+        ctx: CallContext<'_>,
+        tenant: &str,
+        limits: Limits,
+    ) -> Result<Option<TenantLimits>, BrokerError> {
+        validate::tenant_id(tenant)?;
+        limits.validate().map_err(BrokerError::Invalid)?;
+        let audit = AuditEvent {
+            actor: ctx.actor,
+            action: "tenant_limits.set",
+            tenant: Some(tenant),
+            trace_id: ctx.trace_id,
+            detail: Some(serde_json::to_string(&limits).unwrap_or_default()),
+            ..AuditEvent::default()
+        };
+        let row = self.store.set_tenant_limits(tenant, &limits, self.clock.now(), ctx.actor, &audit).await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn tenant_limits(&self, tenant: &str) -> Result<Option<TenantLimits>, BrokerError> {
+        validate::tenant_id(tenant)?;
+        Ok(self.store.get_tenant_limits(tenant).await?.map(Into::into))
+    }
+
+    /// Every tenant with limits, by id.
+    pub async fn all_tenant_limits(&self) -> Result<Vec<TenantLimits>, BrokerError> {
+        Ok(self.store.list_tenant_limits().await?.into_iter().map(Into::into).collect())
+    }
+
+    /// Request windows and spend of tenants and providers in the day and
+    /// month of `at`.
+    pub async fn limit_usage(
+        &self,
+        scopes: &[LimitScope],
+        at: Timestamp,
+    ) -> Result<(Vec<RpmRow>, Vec<SpendRow>), BrokerError> {
+        self.store.limit_usage(scopes, Period::Day.start(at), Period::Month.start(at)).await
+    }
+
+    /// The latest expiry of the live tokens of each tenant and label, for at
+    /// most `limit` of them.
+    pub async fn labelled_token_expiry(&self, limit: i64) -> Result<Vec<LabelledTokenExpiry>, BrokerError> {
+        self.store.labelled_token_expiry(self.clock.now(), limit).await
     }
 
     /// Resolves and decrypts the tenant's API key for `provider`. Writes the
@@ -748,15 +1054,22 @@ impl Keeper {
         )
     }
 
-    fn verify_llm_row(&self, r: &LlmGrantRow) -> bool {
-        let (scope, list) = match &r.providers {
+    fn verify_llm_mac(
+        &self,
+        id: &str,
+        tenant: &str,
+        providers: Option<&[String]>,
+        expires_at: Timestamp,
+        mac: &[u8],
+    ) -> bool {
+        let (scope, list) = match providers {
             Some(p) => ("list", p.join("\0")),
             None => ("all", String::new()),
         };
         self.hasher.verify_row_mac(
             "llm_tokens",
-            &[r.id.as_bytes(), r.tenant_id.as_bytes(), scope.as_bytes(), list.as_bytes(), &r.expires_at.to_be_bytes()],
-            &r.auth_mac,
+            &[id.as_bytes(), tenant.as_bytes(), scope.as_bytes(), list.as_bytes(), &expires_at.to_be_bytes()],
+            mac,
         )
     }
 
@@ -839,6 +1152,40 @@ fn check_traceparent(tp: Option<&str>) -> Result<(), BrokerError> {
 /// The trace id part of a valid `traceparent`.
 pub fn trace_id_of_traceparent(tp: &str) -> Option<&str> {
     valid_traceparent(tp).then(|| tp.split('-').nth(1)).flatten()
+}
+
+/// The refusal of a budget `claim` whose row stood at `spend`. The tenant
+/// sees its numbers; for a provider only the time the budget renews is
+/// shown, since its numbers come from every tenant.
+fn budget_refusal(claim: &BudgetClaim, spend: &Spend, provider: &str) -> LimitRefusal {
+    let tokens_out = claim.limit_tokens.is_some_and(|l| spend.used_tokens() >= l);
+    let usd_out = claim.limit_micro_usd.is_some_and(|l| spend.used_micro_usd() >= l);
+    let unit = if tokens_out || (!usd_out && claim.limit_tokens.is_some()) { "token" } else { "USD" };
+    let period = match claim.period {
+        Period::Day => "daily",
+        Period::Month => "monthly",
+    };
+    let renews = format_utc(claim.period.end(claim.period_start));
+    let message = match claim.scope.level {
+        LimitLevel::Global => {
+            format!("{period} {unit} budget of provider {provider} is used up; it renews at {renews}")
+        }
+        _ => {
+            let used = if unit == "token" {
+                format!("{} of {} tokens", spend.used_tokens(), claim.limit_tokens.unwrap_or_default())
+            } else {
+                format!(
+                    "${:.6} of ${:.6}",
+                    micro_to_usd(spend.used_micro_usd()),
+                    micro_to_usd(claim.limit_micro_usd.unwrap_or_default())
+                )
+            };
+            format!(
+                "{period} {unit} budget of the tenant is used up ({used}, requests in flight included); it renews at {renews}"
+            )
+        }
+    };
+    LimitRefusal { level: claim.scope.level, kind: LimitKind::Budget, message, retry_after_secs: None }
 }
 
 /// A token row whose MAC does not verify was changed outside the broker.

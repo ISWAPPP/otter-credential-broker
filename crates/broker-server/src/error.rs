@@ -7,6 +7,7 @@ use axum::extract::{FromRequest, Request};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use broker_core::BrokerError;
+use broker_core::limits::LimitKind;
 use broker_core::llm::ProviderKind;
 use serde_json::json;
 
@@ -23,6 +24,11 @@ pub fn classify(e: &BrokerError) -> (StatusCode, &'static str) {
         BrokerError::TooManyInFlight(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight"),
         // 402: not retried by the common SDKs, unlike 429.
         BrokerError::BudgetExceeded(_) => (StatusCode::PAYMENT_REQUIRED, "budget_exceeded"),
+        BrokerError::Limit(r) => match r.kind {
+            LimitKind::Rate => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            LimitKind::InFlight => (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight"),
+            LimitKind::Budget => (StatusCode::PAYMENT_REQUIRED, "budget_exceeded"),
+        },
         BrokerError::Crypto(_) | BrokerError::Storage(_) | BrokerError::Migrate(_) | BrokerError::Internal(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal")
         }
@@ -42,6 +48,11 @@ fn retry_after(e: &BrokerError, resp: &mut Response) {
     let secs = match e {
         BrokerError::RateLimited { retry_after_secs } => *retry_after_secs,
         BrokerError::TooManyInFlight(_) => 1,
+        BrokerError::Limit(r) => match (r.kind, r.retry_after_secs) {
+            (_, Some(secs)) => secs,
+            (LimitKind::InFlight, None) => 1,
+            _ => return,
+        },
         _ => return,
     };
     if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {

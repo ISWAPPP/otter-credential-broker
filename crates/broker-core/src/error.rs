@@ -4,6 +4,7 @@
 //! echo caller input that could carry one.
 
 use crate::crypto::CryptoError;
+use crate::limits::LimitRefusal;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
@@ -27,6 +28,10 @@ pub enum BrokerError {
     TooManyInFlight(String),
     #[error("budget exceeded: {0}")]
     BudgetExceeded(String),
+    /// A limit of the tenant or of a provider (the token's own limits use
+    /// the three variants above).
+    #[error("{0}")]
+    Limit(LimitRefusal),
     #[error("crypto failure")]
     Crypto(#[from] CryptoError),
     #[error("storage failure: {0}")]
