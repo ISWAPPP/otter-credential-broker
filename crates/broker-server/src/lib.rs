@@ -17,6 +17,7 @@ pub mod observe;
 pub mod proxy;
 pub mod registry;
 pub mod reload;
+mod tls;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

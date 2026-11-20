@@ -14,19 +14,24 @@
 //! - otherwise a new provider snapshot replaces the current one (`applied`),
 //!   unless it equals the current one (`unchanged`).
 //!
+//! The TLS files of providers are checked the same way, by content: when
+//! one changed (a renewed certificate, say), the snapshot is rebuilt from the
+//! running configuration (`applied`), or kept if the new files cannot be
+//! used (`invalid`, e.g. a certificate without its matching key).
+//!
 //! Every outcome is counted in `ocb_config_reload_total{result}`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ServerConfig;
 use crate::proxy::LlmProxy;
+use crate::tls::{read_file, sha256};
 
 /// What looking at a changed configuration led to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +72,8 @@ pub struct Reloader {
     /// The first look usually finds the content loaded at start; that is not
     /// worth a log line or a count.
     first: bool,
+    /// TLS files of a change that could not be applied; reported once.
+    failed_tls: Option<BTreeMap<PathBuf, Option<[u8; 32]>>>,
 }
 
 impl Reloader {
@@ -76,12 +83,16 @@ impl Reloader {
         for r in ReloadResult::ALL {
             metrics::counter!("ocb_config_reload_total", "result" => r.as_str()).increment(0);
         }
-        Self { path, proxy, running, seen: None, readable: true, first: true }
+        Self { path, proxy, running, seen: None, readable: true, first: true, failed_tls: None }
     }
 
-    /// Looks at the configuration once and applies what changed. `None` when
-    /// there was nothing new to look at.
+    /// Looks at the config file and the TLS files in use once and applies
+    /// what changed. `None` when there was nothing new to look at.
     pub fn check(&mut self) -> Option<ReloadResult> {
+        self.check_file().or_else(|| self.check_tls())
+    }
+
+    fn check_file(&mut self) -> Option<ReloadResult> {
         let path = self.path.as_ref()?;
         let content = match std::fs::read(path) {
             Ok(c) => {
@@ -96,7 +107,7 @@ impl Reloader {
                 return Some(count(ReloadResult::Invalid));
             }
         };
-        let hash: [u8; 32] = Sha256::digest(&content).into();
+        let hash = sha256(&content);
         if self.seen == Some(hash) {
             return None;
         }
@@ -155,6 +166,43 @@ impl Reloader {
         );
         self.proxy.install(snapshot);
         ReloadResult::Applied
+    }
+
+    /// Rebuilds the snapshot from the running configuration when a TLS file
+    /// in use has changed.
+    fn check_tls(&mut self) -> Option<ReloadResult> {
+        let current = self.proxy.snapshot();
+        if current.tls_files().is_empty() {
+            return None;
+        }
+        let now: BTreeMap<PathBuf, Option<[u8; 32]>> =
+            current.tls_files().keys().map(|p| (p.clone(), read_file(p).ok().map(|c| sha256(c.expose())))).collect();
+        if now.iter().all(|(p, h)| h.as_ref() == current.tls_files().get(p)) {
+            self.failed_tls = None;
+            return None;
+        }
+        if self.failed_tls.as_ref() == Some(&now) {
+            return None;
+        }
+        let result = match self.proxy.prepare(&self.running.llm) {
+            Ok(next) if next.version() == current.version() => ReloadResult::Unchanged,
+            Ok(next) => {
+                tracing::info!(
+                    version = next.version(),
+                    previous = current.version(),
+                    "TLS files of a provider changed; new requests use them"
+                );
+                self.failed_tls = None;
+                self.proxy.install(next);
+                ReloadResult::Applied
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "TLS files of a provider changed but cannot be used; keeping the current ones");
+                self.failed_tls = Some(now);
+                ReloadResult::Invalid
+            }
+        };
+        Some(count(result))
     }
 
     /// Checks every `every` until `stop` is cancelled.

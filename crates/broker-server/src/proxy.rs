@@ -55,6 +55,7 @@ use crate::error::{classify, llm_error, llm_error_response};
 use crate::limits::{Inflight, InflightPermit, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
 use crate::registry::{ProviderSnapshot, SnapshotCell, publish};
+use crate::tls::{ClientSettings, http_client};
 
 /// Response headers passed back to the caller. Everything else (cookies,
 /// provider account and rate-limit details, hop-by-hop headers) is dropped.
@@ -90,13 +91,17 @@ impl Settings {
     }
 }
 
-/// The proxy of one process. Providers and prices sit in a snapshot that a
-/// configuration reload replaces; everything else lives as long as the
-/// process and is never replaced: the exchange tasks (which shutdown waits
-/// for), the shutdown switch, the in-flight limits and the upstream client.
+/// The proxy of one process. Providers, prices and the clients of providers
+/// with their own TLS settings sit in a snapshot that a configuration reload
+/// replaces; everything else lives as long as the process and is never
+/// replaced: the exchange tasks (which shutdown waits for), the shutdown
+/// switch, the in-flight limits and the client shared by providers without
+/// TLS settings.
 pub struct LlmProxy {
     snapshot: SnapshotCell,
+    /// Platform roots, no client certificate.
     http: reqwest::Client,
+    clients: ClientSettings,
     settings: Settings,
     tracker: TaskTracker,
     shutdown: CancellationToken,
@@ -104,26 +109,20 @@ pub struct LlmProxy {
 }
 
 impl LlmProxy {
+    /// Validates `cfg`, reads the TLS files of its providers and sets up
+    /// their clients.
     pub fn new(cfg: &LlmConfig) -> Result<Self, String> {
-        let snapshot = ProviderSnapshot::build(cfg)?;
-        // No read timeout on the client: it would also cut the wait for the
-        // response headers, which for non-streaming requests lasts the whole
-        // generation. The idle timeout is applied between body chunks by the
-        // exchange; the total timeout bounds everything.
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
-            .timeout(Duration::from_secs(cfg.max_duration_secs))
-            // Never follow redirects: the key must only ever go to the configured host.
-            .redirect(reqwest::redirect::Policy::none())
-            // Never route through proxies from the environment either.
-            .no_proxy()
-            .user_agent(concat!("otter-credential-broker/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| format!("HTTP client: {e}"))?;
-        publish(&snapshot);
+        let clients = ClientSettings {
+            connect_timeout: Duration::from_secs(cfg.connect_timeout_secs),
+            total_timeout: Duration::from_secs(cfg.max_duration_secs),
+        };
+        let snapshot = ProviderSnapshot::build(cfg, clients, None)?;
+        let http = http_client(clients, None)?;
+        publish(&snapshot, None);
         Ok(Self {
             snapshot: SnapshotCell::new(snapshot),
             http,
+            clients,
             settings: Settings::from(cfg),
             tracker: TaskTracker::new(),
             shutdown: CancellationToken::new(),
@@ -136,18 +135,19 @@ impl LlmProxy {
         self.snapshot.load()
     }
 
-    /// Builds a snapshot from the providers and prices of `cfg` without
-    /// installing it. Only `llm.providers` and `llm.pricing` are taken from
-    /// `cfg`: the other settings of the proxy keep their values from start.
+    /// Builds a snapshot from the providers and prices of `cfg`, with the
+    /// current content of their TLS files, without installing it. Only
+    /// `llm.providers` and `llm.pricing` are taken from `cfg`: the other
+    /// settings of the proxy keep their values from start.
     pub fn prepare(&self, cfg: &LlmConfig) -> Result<ProviderSnapshot, String> {
-        ProviderSnapshot::build(cfg)
+        ProviderSnapshot::build(cfg, self.clients, Some(&self.snapshot()))
     }
 
     /// Makes `next` the snapshot of new requests. Requests already running
     /// finish with the snapshot they started with.
     pub fn install(&self, next: ProviderSnapshot) {
-        publish(&next);
-        self.snapshot.replace(next);
+        let previous = self.snapshot.replace(next);
+        publish(&self.snapshot(), Some(&previous));
     }
 
     pub fn has_provider(&self, id: &str) -> bool {
@@ -479,7 +479,10 @@ async fn proxy(
         HttpMethod::Get => reqwest::Method::GET,
         HttpMethod::Post => reqwest::Method::POST,
     };
-    let mut request = px.http.request(up_method, &url).headers(headers);
+    // A provider with TLS settings has a client of its own; the others share
+    // one that never presents a client certificate.
+    let http = snap.tls_client(provider_id).map_or(&px.http, |c| &c.http);
+    let mut request = http.request(up_method, &url).headers(headers);
     if method == HttpMethod::Post {
         request = request.body(body.clone());
     }

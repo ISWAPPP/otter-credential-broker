@@ -180,6 +180,28 @@ pub struct ProviderConfig {
     /// The provider then has no entries of its own.
     #[serde(default)]
     pub pricing_from: Option<String>,
+    /// TLS to the provider with a private CA and, optionally, a client
+    /// certificate. The provider gets an HTTP client of its own that trusts
+    /// only `ca_file`; providers without `tls` share one client that trusts
+    /// the usual public roots and never presents a client certificate.
+    #[serde(default)]
+    pub tls: Option<ProviderTls>,
+}
+
+/// TLS files of a provider, all PEM. Their content is checked for changes
+/// like the config file (see `reload_interval_secs`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderTls {
+    /// The CA certificate(s) the provider's server certificate must chain to.
+    pub ca_file: PathBuf,
+    /// Client certificate (chain) presented to the provider; needs
+    /// `client_key`.
+    #[serde(default)]
+    pub client_cert: Option<PathBuf>,
+    /// Private key of `client_cert` (PKCS#8, PKCS#1 or SEC1, unencrypted).
+    #[serde(default)]
+    pub client_key: Option<PathBuf>,
 }
 
 fn yes() -> bool {
@@ -198,6 +220,7 @@ impl ProviderConfig {
             access: ProviderAccess::default(),
             endpoints: None,
             pricing_from: None,
+            tls: None,
         }
     }
 }
@@ -300,6 +323,7 @@ pub struct Provider {
     pub endpoints: Vec<&'static Endpoint>,
     /// Provider whose prices apply to this one.
     pub pricing_from: Option<String>,
+    pub tls: Option<ProviderTls>,
 }
 
 impl Provider {
@@ -365,6 +389,18 @@ impl LlmConfig {
                     "llm.providers.{id}.base_url: must have a host and no credentials, query or fragment"
                 ));
             }
+            if let Some(tls) = &p.tls {
+                if url.scheme() != "https" {
+                    return Err(format!("llm.providers.{id}.tls: needs an https base_url"));
+                }
+                if tls.client_cert.is_some() != tls.client_key.is_some() {
+                    return Err(format!("llm.providers.{id}.tls: client_cert and client_key go together"));
+                }
+                let files = [Some(&tls.ca_file), tls.client_cert.as_ref(), tls.client_key.as_ref()];
+                if files.into_iter().flatten().any(|f| f.as_os_str().is_empty()) {
+                    return Err(format!("llm.providers.{id}.tls: file paths must not be empty"));
+                }
+            }
             out.insert(
                 id.clone(),
                 Provider {
@@ -376,6 +412,7 @@ impl LlmConfig {
                     access: p.access,
                     endpoints: provider_endpoints(id, p)?,
                     pricing_from: p.pricing_from.clone(),
+                    tls: p.tls.clone(),
                 },
             );
         }
@@ -552,6 +589,48 @@ mod tests {
         ] {
             assert!(config(&bad, pricing).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn provider_tls() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example:8443"
+            tls = { ca_file = "/tls/ca.crt", client_cert = "/tls/tls.crt", client_key = "/tls/tls.key" }
+
+            [llm.providers.internal]
+            kind = "openai"
+            base_url = "https://models.example/v1"
+            tls = { ca_file = "/tls/ca.crt" }
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        assert_eq!(p["gateway"].tls.as_ref().unwrap().client_key.as_deref(), Some(Path::new("/tls/tls.key")));
+        assert!(p["internal"].tls.as_ref().unwrap().client_cert.is_none());
+
+        let tls = |ca: &str, cert: Option<&str>, key: Option<&str>| ProviderTls {
+            ca_file: ca.into(),
+            client_cert: cert.map(Into::into),
+            client_key: key.map(Into::into),
+        };
+        for (url, bad) in [
+            ("https://gateway.example", tls("/tls/ca.crt", Some("/tls/tls.crt"), None)),
+            ("https://gateway.example", tls("/tls/ca.crt", None, Some("/tls/tls.key"))),
+            ("https://gateway.example", tls("", None, None)),
+            ("http://gateway.example", tls("/tls/ca.crt", None, None)),
+        ] {
+            let mut c = LlmConfig::default();
+            let mut gw = provider(ProviderKind::Anthropic, url);
+            gw.allow_http = true;
+            gw.tls = Some(bad.clone());
+            c.providers.insert("gateway".into(), gw);
+            assert!(c.validate().is_err(), "{url} {bad:?}");
+        }
+        let unknown = "[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\ntls = { ca_file = \"/a\", verify = false }\n";
+        assert!(ServerConfig::parse(unknown).is_err());
     }
 
     #[test]

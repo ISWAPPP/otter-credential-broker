@@ -260,6 +260,88 @@ pub async fn start_upstream() -> (Upstream, SocketAddr) {
     (up, addr)
 }
 
+/// A test certificate or key (see tests/fixtures/tls/README.md).
+pub fn tls_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls").join(name)
+}
+
+/// The fake upstream behind TLS.
+pub struct TlsUpstream {
+    pub upstream: Upstream,
+    pub addr: SocketAddr,
+    /// Per connection: the leaf certificate (DER) the client presented.
+    pub client_certs: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+}
+
+impl TlsUpstream {
+    pub fn last_client_cert(&self) -> Option<Vec<u8>> {
+        self.client_certs.lock().unwrap().last().cloned().expect("no TLS connection was made")
+    }
+    pub fn connections(&self) -> usize {
+        self.client_certs.lock().unwrap().len()
+    }
+}
+
+/// The first certificate of a PEM fixture, as DER.
+pub fn fixture_cert(name: &str) -> Vec<u8> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    CertificateDer::from_pem_file(tls_fixture(name)).unwrap().as_ref().to_vec()
+}
+
+/// Starts the fake upstream with TLS on 127.0.0.1:0, serving `cert`/`key`.
+/// With `client_ca`, it asks clients for a certificate issued by that CA
+/// (and records it) but also accepts clients without one.
+pub async fn start_tls_upstream(cert: &str, key: &str, client_ca: Option<&str>) -> TlsUpstream {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(tls_fixture(cert)).unwrap().map(Result::unwrap).collect();
+    let key = PrivateKeyDer::from_pem_file(tls_fixture(key)).unwrap();
+    let builder =
+        rustls::ServerConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().unwrap();
+    let builder = match client_ca {
+        Some(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for c in CertificateDer::pem_file_iter(tls_fixture(ca)).unwrap() {
+                roots.add(c.unwrap()).unwrap();
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .allow_unauthenticated()
+                .build()
+                .unwrap();
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let config = builder.with_single_cert(chain, key).unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let upstream = Upstream::default();
+    let app = Router::new().fallback(upstream_handler).with_state(upstream.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client_certs = Arc::new(Mutex::new(Vec::new()));
+    let seen = client_certs.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, app, seen) = (acceptor.clone(), app.clone(), seen.clone());
+            tokio::spawn(async move {
+                // A failed handshake never reaches the handler.
+                let Ok(tls) = acceptor.accept(tcp).await else { return };
+                let peer = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec());
+                seen.lock().unwrap().push(peer);
+                let svc = hyper_util::service::TowerToHyperService::new(app);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
+                    .await;
+            });
+        }
+    });
+    TlsUpstream { upstream, addr, client_certs }
+}
+
 pub fn price(provider: &str, model: &str, input: f64, output: f64, cache_read: Option<f64>) -> ModelPrice {
     ModelPrice {
         provider: provider.into(),
