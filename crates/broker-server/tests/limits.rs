@@ -611,3 +611,28 @@ async fn the_limits_endpoint_has_a_rate_limit_of_its_own() {
     }
     env.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_admin_api_shows_the_providers_limits_with_their_numbers() {
+    let Some(env) = env_with("rpm = 1000, concurrent = 5, budget_tokens = { day = 1_050 }").await else { return };
+    env.clock.set(DAY0 + 3601);
+    let (b, _) = env.llm_token("tenant-b", json!({})).await;
+    for _ in 0..2 {
+        assert_eq!(send(&env, &b).await.status, StatusCode::OK);
+    }
+    env.settle().await;
+    let (s, v) = env.admin_call("GET", "/v1/admin/limits", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["global"],
+        json!([{"provider": "anthropic",
+                "limits": {"rpm": 1000, "concurrent": 5, "budget_tokens": {"day": 1050, "month": null},
+                           "budget_usd": {"day": null, "month": null}},
+                "usage": {"rpm": {"count": 2, "resets_at": DAY0 + 3660}, "in_flight": 0,
+                          "periods": [{"period": "day", "start": DAY0, "resets_at": DAY0 + 86_400,
+                                       "spent_tokens": 500, "spent_usd": 0.0027, "reserved_tokens": 0,
+                                       "reserved_usd": 0.0}]}}])
+    );
+    assert_eq!(v["tenants"], json!([]));
+    env.cleanup().await;
+}
