@@ -429,7 +429,8 @@ async fn a_request_that_ends_before_the_provider_gives_its_reservation_back() {
 async fn without_limits_nothing_is_counted_beyond_the_token() {
     let Some(env) = Env::new().await else { return };
     env.seed_keys().await;
-    let (token, token_id) = env.llm_token("tenant-a", json!({"budget_tokens": 1000})).await;
+    // A budget both requests fit in, whenever the first one is accounted.
+    let (token, token_id) = env.llm_token("tenant-a", json!({"budget_tokens": 10_000})).await;
     for uri in ["/llm/anthropic/v1/messages", "/llm/p/anthropic/v1/messages"] {
         let r = env.llm("POST", uri, &[("x-api-key", &token)], Some(anthropic_body("test-model", true))).await;
         assert_eq!((r.status, r.text().as_str()), (StatusCode::OK, ANTHROPIC_SSE));
