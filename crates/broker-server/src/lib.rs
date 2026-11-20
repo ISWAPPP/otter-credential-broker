@@ -14,6 +14,7 @@ pub mod config;
 pub mod error;
 pub mod limits;
 pub mod observe;
+mod policy;
 pub mod proxy;
 pub mod registry;
 pub mod reload;

@@ -11,15 +11,16 @@
 //! 2. validates the token (tenant, provider allowlist, rate limit, requests
 //!    in flight) and the budget, before anything is sent upstream;
 //! 3. resolves the tenant's provider key (audited decrypt), builds a fresh
-//!    request with an allowlist of caller headers, sets the provider auth
-//!    header itself and forwards the body bytes unchanged;
+//!    request with the caller headers the provider lets through (an
+//!    allowlist per kind, plus the provider's prefixes; see `policy`), sets
+//!    the provider auth header itself and forwards the body bytes unchanged;
 //! 4. hands the upstream exchange to its own task. That task streams the
-//!    response back unchanged (status, allowlisted headers, body bytes) while
-//!    a tap extracts usage and a redactor replaces the provider key should it
-//!    ever appear. It owns accounting: when the caller disconnects, reads too
-//!    slowly, or gives up waiting, the task keeps reading the upstream
-//!    response to its end, so usage comes from the provider's own report and
-//!    cannot be avoided by hanging up;
+//!    response back unchanged (status, the headers the provider lets
+//!    through, body bytes) while a tap extracts usage and a redactor
+//!    replaces the provider key should it ever appear. It owns accounting:
+//!    when the caller disconnects, reads too slowly, or gives up waiting, the
+//!    task keeps reading the upstream response to its end, so usage comes
+//!    from the provider's own report and cannot be avoided by hanging up;
 //! 5. passes upstream error bodies through only after scrubbing anything
 //!    key-like.
 //!
@@ -50,19 +51,13 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::AppState;
 use crate::admin::auth_failure;
-use crate::config::LlmConfig;
+use crate::config::{LlmConfig, ProviderHeaders};
 use crate::error::{classify, llm_error, llm_error_response};
 use crate::limits::{Inflight, InflightPermit, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
+use crate::policy::{request_headers, response_headers};
 use crate::registry::{ProviderSnapshot, SnapshotCell, publish};
 use crate::tls::{ClientSettings, http_client};
-
-/// Response headers passed back to the caller. Everything else (cookies,
-/// provider account and rate-limit details, hop-by-hop headers) is dropped.
-/// `x-should-retry` is how a provider tells SDKs whether an error is worth
-/// retrying; without it they guess from the status.
-const FORWARDED_RESPONSE_HEADERS: &[&str] =
-    &["content-type", "cache-control", "retry-after", "request-id", "x-request-id", "x-should-retry"];
 
 /// Chunks buffered between the exchange task and a caller.
 const CLIENT_BUFFER: usize = 32;
@@ -291,16 +286,6 @@ fn probe(body: &[u8]) -> Result<Probe, BrokerError> {
     Ok(p)
 }
 
-fn forwarded_response_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for name in FORWARDED_RESPONSE_HEADERS {
-        for v in src.get_all(*name) {
-            out.append(HeaderName::from_static(name), v.clone());
-        }
-    }
-    out
-}
-
 /// Proxies one request to `provider_id`. A route that implies a provider
 /// kind (`route_kind`) only reaches providers of that kind.
 async fn proxy(
@@ -454,12 +439,7 @@ async fn proxy(
         url.push('?');
         url.push_str(q);
     }
-    let mut headers = HeaderMap::new();
-    for name in kind.forwarded_request_headers() {
-        for v in parts.headers.get_all(*name) {
-            headers.append(HeaderName::from_static(name), v.clone());
-        }
-    }
+    let mut headers = request_headers(kind, &provider.headers, &parts.headers);
     headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let auth = match kind {
         ProviderKind::Anthropic => {
@@ -510,6 +490,7 @@ async fn proxy(
         request,
         key,
         token,
+        header_policy: provider.headers.clone(),
         fin,
         max_error_body: px.settings.max_error_body_bytes,
         json_cap: px.settings.max_buffered_response_bytes,
@@ -649,6 +630,8 @@ struct Exchange {
     request: reqwest::RequestBuilder,
     key: Secret<String>,
     token: Secret<String>,
+    /// Decides which response headers are passed back.
+    header_policy: ProviderHeaders,
     fin: Finisher,
     max_error_body: usize,
     json_cap: usize,
@@ -661,7 +644,19 @@ struct Exchange {
 
 impl Exchange {
     async fn run(self, head_tx: oneshot::Sender<Head>) {
-        let Exchange { kind, request, key, token, mut fin, max_error_body, json_cap, idle, shutdown, _permit } = self;
+        let Exchange {
+            kind,
+            request,
+            key,
+            token,
+            header_policy,
+            mut fin,
+            max_error_body,
+            json_cap,
+            idle,
+            shutdown,
+            _permit,
+        } = self;
         let provider = fin.provider.clone();
         let sent = tokio::select! {
             r = request.send() => r,
@@ -702,7 +697,7 @@ impl Exchange {
 
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         fin.status = status.as_u16();
-        let headers = forwarded_response_headers(resp.headers());
+        let headers = response_headers(&header_policy, resp.headers());
         if !status.is_success() {
             // Read a little more than the limit so a key straddling the cut is
             // still found whole, scrub, then cut.

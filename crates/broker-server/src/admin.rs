@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::AppState;
+use crate::config::ProviderHeaders;
 use crate::error::{ApiError, JsonBody};
 use crate::observe::current_trace_id;
 
@@ -365,6 +366,8 @@ struct ProviderView<'a> {
     /// Earliest expiry of the provider's CA and client certificates.
     tls_not_after: Option<i64>,
     pricing_from: Option<&'a str>,
+    /// Headers passed through by name prefix, beyond the fixed allowlists.
+    headers: &'a ProviderHeaders,
 }
 
 #[derive(Serialize)]
@@ -390,6 +393,7 @@ pub async fn list_providers(State(st): State<AppState>) -> Response {
             has_tls: p.tls.is_some(),
             tls_not_after: snap.tls_not_after(&p.id),
             pricing_from: p.pricing_from.as_deref(),
+            headers: &p.headers,
         })
         .collect();
     Json(ProvidersView { config_version: snap.version(), providers }).into_response()

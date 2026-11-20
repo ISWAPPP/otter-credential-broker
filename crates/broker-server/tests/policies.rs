@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! Which headers pass between callers and providers, in both directions.
+//! Which headers pass between callers and providers, in both directions:
+//! the fixed allowlists by default, more for a provider with prefixes,
+//! never those that carry credentials, cookies or redirects.
 
 mod common;
 
@@ -111,6 +113,128 @@ async fn by_default_only_the_fixed_allowlists_pass_either_way() {
         assert_eq!(r.headers.get("content-length").unwrap(), r.body.len().to_string().as_str());
         assert_eq!(r.headers.get("x-should-retry").unwrap(), "true");
         assert_eq!(r.headers.get("retry-after").unwrap(), "7");
+    }
+    env.cleanup().await;
+}
+
+/// Providers on one fake upstream: `anthropic` with the defaults,
+/// `gateway`, which passes more headers both ways, and `wide`, with broad
+/// response prefixes. tenant-a has a key for each.
+async fn prefix_env() -> Option<Env> {
+    let (upstream, addr) = start_upstream().await;
+    let llm = llm_config(&format!(
+        r#"
+        [llm.providers.anthropic]
+        kind = "anthropic"
+        base_url = "http://{addr}"
+        allow_http = true
+
+        [llm.providers.gateway]
+        kind = "anthropic"
+        base_url = "http://{addr}"
+        allow_http = true
+        headers = {{ request_forward_prefixes = ["anthropic-", "x-stainless-"], response_forward_prefixes = ["anthropic-ratelimit-"] }}
+
+        [llm.providers.wide]
+        kind = "anthropic"
+        base_url = "http://{addr}"
+        allow_http = true
+        headers = {{ response_forward_prefixes = ["x-", "anthropic-"] }}
+        "#
+    ));
+    let env = Env::with_llm(EnvOptions::default(), llm, (upstream, addr)).await?;
+    for id in ["anthropic", "gateway", "wide"] {
+        env.put_secret("tenant-a", &format!("llm.{id}"), "llm_api_key", KEY_A).await;
+    }
+    Some(env)
+}
+
+#[tokio::test]
+async fn a_provider_passes_more_headers_by_prefix() {
+    let Some(env) = prefix_env().await else { return };
+    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    let mut headers = vec![("x-api-key", token.as_str())];
+    headers.extend_from_slice(CALLER_HEADERS);
+    let gateway_response = set(&[
+        "anthropic-ratelimit-unified-status",
+        "anthropic-ratelimit-unified-5h-utilization",
+        "anthropic-ratelimit-requests-remaining",
+    ]);
+
+    let r = env.llm("POST", "/llm/p/gateway/v1/messages", &headers, Some(anthropic_body("many-headers", false))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let seen = env.upstream.last();
+    let mut want = set(&[
+        "content-type",
+        "accept",
+        "anthropic-version",
+        "anthropic-beta",
+        "anthropic-dangerous-direct-browser-access",
+        "anthropic-organization",
+        "x-stainless-os",
+        "x-api-key",
+    ]);
+    want.extend(set(BROKER_REQUEST_HEADERS));
+    assert_eq!(names(&seen.headers), want, "sent upstream");
+    assert_eq!(seen.headers.get("x-api-key").unwrap(), KEY_A, "the provider key, never the caller's token");
+    assert_eq!(seen.headers.get("anthropic-organization").unwrap(), "org-other");
+    let mut want = set(DEFAULT_RESPONSE_HEADERS);
+    want.extend(gateway_response.clone());
+    assert_eq!(names(&r.headers), want, "passed back");
+    assert_eq!(r.headers.get("anthropic-ratelimit-unified-5h-utilization").unwrap(), "0.25");
+
+    // An upstream error carries them too.
+    let r =
+        env.llm("POST", "/llm/p/gateway/v1/messages", &headers, Some(anthropic_body("many-headers-429", false))).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    let mut want = set(DEFAULT_RESPONSE_HEADERS);
+    want.extend(gateway_response);
+    want.insert("content-length".into());
+    assert_eq!(names(&r.headers), want, "passed back with an error");
+
+    // Another provider of the same kind keeps to the allowlists.
+    let r =
+        env.llm("POST", "/llm/p/anthropic/v1/messages", &headers, Some(anthropic_body("many-headers", false))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(env.upstream.last().headers.get("anthropic-organization").is_none());
+    assert_eq!(names(&r.headers), set(DEFAULT_RESPONSE_HEADERS));
+
+    // The admin view shows each provider's prefixes.
+    let (_, v) = env.admin_call("GET", "/v1/admin/providers", None).await;
+    let view = |id: &str| v["providers"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["headers"].clone();
+    assert_eq!(
+        view("gateway"),
+        json!({"request_forward_prefixes": ["anthropic-", "x-stainless-"],
+               "response_forward_prefixes": ["anthropic-ratelimit-"]})
+    );
+    assert_eq!(view("anthropic"), json!({"request_forward_prefixes": [], "response_forward_prefixes": []}));
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn broad_response_prefixes_never_pass_cookies_challenges_or_redirects() {
+    let Some(env) = prefix_env().await else { return };
+    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    let h = [("x-api-key", token.as_str())];
+    let mut want = set(DEFAULT_RESPONSE_HEADERS);
+    want.extend(set(&[
+        "anthropic-ratelimit-unified-status",
+        "anthropic-ratelimit-unified-5h-utilization",
+        "anthropic-ratelimit-requests-remaining",
+        "anthropic-organization-id",
+        "x-ratelimit-remaining-requests",
+        "x-upstream-debug",
+    ]));
+    for (model, status) in [("many-headers", StatusCode::OK), ("many-headers-429", StatusCode::TOO_MANY_REQUESTS)] {
+        let r = env.llm("POST", "/llm/p/wide/v1/messages", &h, Some(anthropic_body(model, false))).await;
+        assert_eq!(r.status, status, "{}", r.text());
+        let mut got = names(&r.headers);
+        got.remove("content-length");
+        assert_eq!(got, want, "{model}");
+        for never in ["set-cookie", "www-authenticate", "ratelimit", "ratelimit-policy", "ocb-budget-remaining"] {
+            assert!(r.headers.get(never).is_none(), "{model}: {never}");
+        }
+        assert!(r.headers.get("location").is_none() && r.headers.get("alt-svc").is_none(), "{model}");
     }
     env.cleanup().await;
 }

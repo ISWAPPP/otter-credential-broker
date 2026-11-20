@@ -16,6 +16,8 @@ use figment::Figment;
 use figment::providers::{Data, Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
+use crate::policy;
+
 /// Provider ids kept free for paths of the broker itself under `/llm/`: `p`,
 /// the prefix of the `/llm/p/<id>/...` route, and `limits`, kept for a later
 /// endpoint. No route needs them today; see DECISIONS.md, D-018.
@@ -187,6 +189,29 @@ pub struct ProviderConfig {
     /// the usual public roots and never presents a client certificate.
     #[serde(default)]
     pub tls: Option<ProviderTls>,
+    /// Headers passed through by name prefix, beyond the fixed allowlists.
+    /// None by default.
+    #[serde(default)]
+    pub headers: ProviderHeaders,
+}
+
+/// Headers a provider passes through besides the fixed allowlists, chosen
+/// by the start of their (lowercase) names. Headers that carry credentials,
+/// cookies, routing or framing, and headers the broker sets itself, are
+/// never passed, whatever the prefixes say; a prefix that could match one
+/// is refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderHeaders {
+    /// Caller headers that start with one of these are sent upstream too,
+    /// e.g. `["anthropic-"]` for a gateway that needs every header of the
+    /// Anthropic SDK.
+    #[serde(default)]
+    pub request_forward_prefixes: Vec<String>,
+    /// Upstream response headers that start with one of these are passed
+    /// back to the caller too, e.g. `["anthropic-ratelimit-"]`.
+    #[serde(default)]
+    pub response_forward_prefixes: Vec<String>,
 }
 
 /// TLS files of a provider, all PEM. Their content is checked for changes
@@ -229,6 +254,7 @@ impl ProviderConfig {
             endpoints: None,
             pricing_from: None,
             tls: None,
+            headers: ProviderHeaders::default(),
         }
     }
 }
@@ -332,6 +358,7 @@ pub struct Provider {
     /// Provider whose prices apply to this one.
     pub pricing_from: Option<String>,
     pub tls: Option<ProviderTls>,
+    pub headers: ProviderHeaders,
 }
 
 impl Provider {
@@ -408,6 +435,7 @@ impl LlmConfig {
                     return Err(format!("llm.providers.{id}.tls: file paths must not be empty"));
                 }
             }
+            policy::validate_headers(id, &p.headers)?;
             out.insert(
                 id.clone(),
                 Provider {
@@ -420,6 +448,7 @@ impl LlmConfig {
                     endpoints: provider_endpoints(id, p)?,
                     pricing_from: p.pricing_from.clone(),
                     tls: p.tls.clone(),
+                    headers: p.headers.clone(),
                 },
             );
         }
@@ -638,6 +667,48 @@ mod tests {
         }
         let unknown = "[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\ntls = { ca_file = \"/a\", verify = false }\n";
         assert!(ServerConfig::parse(unknown).is_err());
+    }
+
+    #[test]
+    fn provider_headers() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example"
+            headers = { request_forward_prefixes = ["anthropic-"], response_forward_prefixes = ["anthropic-ratelimit-"] }
+
+            [llm.providers.local]
+            kind = "openai"
+            base_url = "https://models.example/v1"
+            headers = { response_forward_prefixes = ["x-ratelimit-"] }
+
+            [llm.providers.deepseek]
+            kind = "openai"
+            base_url = "https://api.deepseek.com"
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        assert_eq!(p["gateway"].headers.request_forward_prefixes, ["anthropic-"]);
+        assert_eq!(p["gateway"].headers.response_forward_prefixes, ["anthropic-ratelimit-"]);
+        assert!(p["local"].headers.request_forward_prefixes.is_empty());
+        assert_eq!(p["deepseek"].headers, ProviderHeaders::default());
+
+        let with = |headers: &str| {
+            format!(
+                "[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\nheaders = {{ {headers} }}\n"
+            )
+        };
+        // Prefixes only; any other key is refused.
+        for unknown in ["forward = [\"x-app\"]", "request_forward_prefixes = \"anthropic-\""] {
+            assert!(ServerConfig::parse(&with(unknown)).is_err(), "{unknown}");
+        }
+        // A prefix that could match a header never forwarded makes the
+        // configuration invalid.
+        let wide = ServerConfig::parse(&with("request_forward_prefixes = [\"x-\"]")).unwrap();
+        let e = wide.llm.validate().unwrap_err();
+        assert!(e.starts_with("llm.providers.x.headers.request_forward_prefixes: "), "{e}");
     }
 
     #[test]
