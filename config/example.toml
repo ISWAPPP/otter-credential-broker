@@ -120,10 +120,13 @@ limits_endpoint_per_minute = 30
 #                          allowlist goes up, and content-type, cache-control,
 #                          retry-after, request-id, x-request-id and
 #                          x-should-retry come back. Credentials, cookies,
-#                          routing, framing and hop-by-hop headers, the
-#                          broker's own, set-cookie, www-authenticate,
-#                          location, alt-svc, ratelimit* and ocb-* never
-#                          pass; a prefix that could match one is refused.
+#                          routing (method overrides and URL rewrites
+#                          included), client address, framing and
+#                          hop-by-hop headers, the broker's own, set-cookie,
+#                          www-authenticate, location, alt-svc, ratelimit*
+#                          and ocb-* never pass; a prefix that could match
+#                          one is refused, and a header whose value holds
+#                          the provider key never comes back.
 #                          Meant for a provider whose headers concern one
 #                          owner, such as a gateway in front of one account
 #   body = { deny_server_tools = true, server_tool_allowlist = [...] }
