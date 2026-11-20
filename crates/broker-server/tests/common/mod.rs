@@ -438,6 +438,7 @@ fn default_llm(o: &EnvOptions, upstream_addr: SocketAddr) -> LlmConfig {
         max_buffered_response_bytes: 1 << 20,
         max_concurrent_per_token: o.max_concurrent_per_token,
         max_concurrent_total: 1024,
+        max_reservation_tokens: 32_000,
         providers,
         pricing: vec![
             // USD per million tokens (test values).

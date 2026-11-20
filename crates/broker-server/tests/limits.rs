@@ -210,3 +210,208 @@ async fn limits_of_a_provider_reload_with_it() {
     assert_eq!(send(&env, &token).await.status, StatusCode::OK);
     env.cleanup().await;
 }
+
+/// 2030-03-17T00:00:00Z, the day of `T0`.
+const DAY0: i64 = T0 - T0 % 86_400;
+
+type SpendRow = (String, String, String, String, i64, i64, i64);
+
+/// Every row of `limit_spend`: level, tenant, provider, period, its start,
+/// spent and reserved tokens.
+async fn spend(env: &Env) -> Vec<SpendRow> {
+    sqlx::query_as(
+        "SELECT level, tenant_id, provider, period_kind, period_start, spent_tokens, reserved_tokens FROM limit_spend
+         ORDER BY level, tenant_id, provider, period_kind, period_start",
+    )
+    .fetch_all(env.state.keeper.store().pool())
+    .await
+    .unwrap()
+}
+
+fn row(level: &str, tenant: &str, provider: &str, start: i64, spent: i64, reserved: i64) -> SpendRow {
+    (level.into(), tenant.into(), provider.into(), "day".into(), start, spent, reserved)
+}
+
+/// A request of `model` in a task of its own.
+fn in_background(env: &Env, token: &str, model: &str, stream: bool) -> tokio::task::JoinHandle<TestResponse> {
+    let (public, token, body) = (env.public.clone(), token.to_owned(), anthropic_body(model, stream));
+    tokio::spawn(async move {
+        raw_call(&public, "POST", "/llm/anthropic/v1/messages", &[("x-api-key", token.as_str())], Some(body)).await
+    })
+}
+
+/// Waits until the requests in flight have reserved `tokens` on the
+/// tenant's row.
+async fn reserved(env: &Env, tenant: &str, tokens: i64) {
+    for _ in 0..200 {
+        if spend(env).await.iter().any(|r| r.1 == tenant && r.6 == tokens) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected {tokens} reserved tokens for {tenant}: {:?}", spend(env).await);
+}
+
+#[tokio::test]
+async fn budgets_count_what_requests_in_flight_reserved_until_they_are_accounted() {
+    let Some(env) = env_with("budget_tokens = { day = 1_000 }").await else { return };
+    set_limits(&env, "tenant-a", json!({"budget_tokens": {"day": 100}})).await;
+    let (a, _) = env.llm_token("tenant-a", json!({})).await;
+    let (b, _) = env.llm_token("tenant-b", json!({})).await;
+
+    // Two requests in flight hold their max_tokens (64) each, before
+    // either has spent anything.
+    let first = in_background(&env, &a, "slow-json", false);
+    let second = in_background(&env, &a, "slow-json", false);
+    reserved(&env, "tenant-a", 128).await;
+    assert_eq!(
+        spend(&env).await,
+        [row("global", "", "anthropic", DAY0, 0, 128), row("tenant", "tenant-a", "", DAY0, 0, 128)]
+    );
+    // So a third is refused: what is reserved counts like what is spent.
+    while env.upstream.count() < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let r = send(&env, &a).await;
+    assert_eq!((r.status, level(&r)), (StatusCode::PAYMENT_REQUIRED, "tenant".to_owned()));
+    assert_eq!(
+        (r.json()["error"]["code"].as_str(), r.json()["error"]["type"].as_str()),
+        (Some("budget_exceeded"), Some("billing_error"))
+    );
+    let message = r.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.starts_with("daily token budget of the tenant is used up (128 of 100 tokens"), "{message}");
+    assert!(message.ends_with("it renews at 2030-03-18T00:00:00Z"), "{message}");
+    assert!(r.headers.get("retry-after").is_none());
+    assert_eq!(env.upstream.count(), 2, "nothing refused reached the provider");
+
+    // Accounting swaps the reservations for what was used: 250 tokens each.
+    assert_eq!((first.await.unwrap().status, second.await.unwrap().status), (StatusCode::OK, StatusCode::OK));
+    env.settle().await;
+    assert_eq!(
+        spend(&env).await,
+        [row("global", "", "anthropic", DAY0, 500, 0), row("tenant", "tenant-a", "", DAY0, 500, 0)]
+    );
+    assert_eq!(send(&env, &a).await.status, StatusCode::PAYMENT_REQUIRED, "spent beyond the budget");
+
+    // tenant-b has no budget of its own: the provider's applies, and its
+    // refusal shows when it renews, not its numbers.
+    for _ in 0..2 {
+        assert_eq!(send(&env, &b).await.status, StatusCode::OK);
+        env.settle().await;
+    }
+    let r = send(&env, &b).await;
+    assert_eq!((r.status, level(&r)), (StatusCode::PAYMENT_REQUIRED, "global".to_owned()));
+    assert_eq!(
+        r.json()["error"]["message"],
+        "daily token budget of provider anthropic is used up; it renews at 2030-03-18T00:00:00Z"
+    );
+    assert_eq!(spend(&env).await[0], row("global", "", "anthropic", DAY0, 1000, 0));
+    // A new day is a new row.
+    env.clock.set(DAY0 + 86_400);
+    assert_eq!(send(&env, &b).await.status, StatusCode::OK);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_stream_across_midnight_counts_in_the_day_it_started() {
+    let Some(env) = env_with("").await else { return };
+    set_limits(&env, "tenant-a", json!({"budget_tokens": {"day": 1_000_000}})).await;
+    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    env.clock.set(DAY0 + 86_400 - 5);
+    // About two seconds of stream; midnight passes while it runs.
+    let stream = in_background(&env, &token, "long-stream", true);
+    reserved(&env, "tenant-a", 64).await;
+    env.clock.advance(60);
+    let r = stream.await.unwrap();
+    assert!(r.status == StatusCode::OK && r.text().contains("message_stop"));
+    env.settle().await;
+    // Accounted after midnight, counted in the day it was authorized in:
+    // 120 input, 1000 cache reads and 5000 output tokens.
+    let (_, usage) = env.admin_call("GET", "/v1/admin/tenants/tenant-a/usage", None).await;
+    assert!(usage[0]["ts"].as_i64().unwrap() >= DAY0 + 86_400, "{usage}");
+    assert_eq!(spend(&env).await, [row("tenant", "tenant-a", "", DAY0, 6120, 0)]);
+    // A request of the new day counts there.
+    assert_eq!(send(&env, &token).await.status, StatusCode::OK);
+    env.settle().await;
+    assert_eq!(
+        spend(&env).await,
+        [row("tenant", "tenant-a", "", DAY0, 6120, 0), row("tenant", "tenant-a", "", DAY0 + 86_400, 250, 0)]
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn usd_budgets_take_only_priced_models() {
+    let Some(env) = env_with("budget_usd = { day = 5.0 }").await else { return };
+    set_limits(&env, "tenant-a", json!({"budget_usd": {"month": 10.0}})).await;
+    let (a, _) = env.llm_token("tenant-a", json!({})).await;
+    let (b, _) = env.llm_token("tenant-b", json!({})).await;
+    let unpriced = Some(anthropic_body("unpriced-model", false));
+    for (token, whose) in [(&a, "the tenant"), (&b, "provider anthropic")] {
+        let r = env.llm("POST", "/llm/anthropic/v1/messages", &[("x-api-key", token)], unpriced.clone()).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+        assert_eq!(
+            r.json()["error"]["message"],
+            format!(
+                "invalid request: model unpriced-model has no configured price; \
+                 the USD budget of {whose} can only be used with priced models"
+            )
+        );
+    }
+    assert_eq!(env.upstream.count(), 0);
+    let usd = || async {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT level || '/' || period_kind, spent_micro_usd, reserved_micro_usd FROM limit_spend ORDER BY 1",
+        )
+        .fetch_all(env.state.keeper.store().pool())
+        .await
+        .unwrap();
+        rows
+    };
+    // A priced model reserves the cost of its most output: 64 tokens at 1.0
+    // per million.
+    let slow = in_background(&env, &a, "slow-json", false);
+    reserved(&env, "tenant-a", 64).await;
+    assert_eq!(usd().await, [("global/day".to_owned(), 0, 64), ("tenant/month".to_owned(), 0, 64)]);
+    assert_eq!(slow.await.unwrap().status, StatusCode::OK);
+    env.settle().await;
+    // 200 input and 50 output tokens at 1.0.
+    assert_eq!(usd().await, [("global/day".to_owned(), 250, 0), ("tenant/month".to_owned(), 250, 0)]);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_request_that_ends_before_the_provider_gives_its_reservation_back() {
+    let Some(env) = env_with("budget_tokens = { day = 1_000 }").await else { return };
+    // tenant-c has no key for the provider: refused after the reservation.
+    let (c, _) = env.llm_token("tenant-c", json!({})).await;
+    let r = send(&env, &c).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    env.settle().await;
+    assert_eq!(spend(&env).await, [row("global", "", "anthropic", DAY0, 0, 0)]);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn without_limits_nothing_is_counted_beyond_the_token() {
+    let Some(env) = Env::new().await else { return };
+    env.seed_keys().await;
+    let (token, token_id) = env.llm_token("tenant-a", json!({"budget_tokens": 1000})).await;
+    for uri in ["/llm/anthropic/v1/messages", "/llm/p/anthropic/v1/messages"] {
+        let r = env.llm("POST", uri, &[("x-api-key", &token)], Some(anthropic_body("test-model", true))).await;
+        assert_eq!((r.status, r.text().as_str()), (StatusCode::OK, ANTHROPIC_SSE));
+    }
+    let r =
+        env.llm("POST", "/llm/anthropic/v1/messages/count_tokens", &[("x-api-key", &token)], Some("{}".into())).await;
+    assert_eq!(r.status, StatusCode::OK);
+    env.settle().await;
+    let pool = env.state.keeper.store().pool();
+    for table in ["tenant_limits", "limit_rpm", "limit_spend"] {
+        let (n,): (i64,) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}"))).fetch_one(pool).await.unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
+    let (_, t) = env.admin_call("GET", &format!("/v1/admin/tenants/tenant-a/llm-tokens/{token_id}"), None).await;
+    assert_eq!((t["spent_tokens"].as_i64(), t["request_count"].as_i64()), (Some(2 * 1150), Some(3)));
+    env.cleanup().await;
+}

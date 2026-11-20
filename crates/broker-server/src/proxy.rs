@@ -36,7 +36,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use broker_core::keeper::{Authorized, LlmGrant};
-use broker_core::limits::{LimitKind, LimitLevel, LimitRefusal};
+use broker_core::limits::{LimitKind, LimitLevel, LimitRefusal, Reservation};
 use broker_core::llm::scrub::{StreamRedactor, scrub_error_body};
 use broker_core::llm::usage::{TapReport, Usage, UsageSource, UsageTap};
 use broker_core::llm::{Endpoint, HttpMethod, ProviderKind};
@@ -75,6 +75,7 @@ struct Settings {
     idle_timeout: Duration,
     max_error_body_bytes: usize,
     max_buffered_response_bytes: usize,
+    max_reservation_tokens: u64,
 }
 
 impl Settings {
@@ -86,6 +87,7 @@ impl Settings {
             idle_timeout: Duration::from_secs(cfg.idle_timeout_secs),
             max_error_body_bytes: cfg.max_error_body_bytes,
             max_buffered_response_bytes: cfg.max_buffered_response_bytes,
+            max_reservation_tokens: cfg.max_reservation_tokens,
         }
     }
 }
@@ -490,6 +492,44 @@ async fn proxy(
             );
         }
     }
+    // Budgets of the tenant and the provider: the request reserves its
+    // most output on each, all or nothing, until it is accounted. The
+    // token's own budget is checked above, as before.
+    let mut held = Held { keeper: st.keeper.clone(), tracker: px.tracker.clone(), reservations: Vec::new() };
+    if endpoint.billable && (auth.tenant_limits.has_budget() || provider.limits.has_budget()) {
+        if request_price.is_none() {
+            let whose = if auth.tenant_limits.has_usd_budget() {
+                Some("the tenant".to_owned())
+            } else {
+                provider.limits.has_usd_budget().then(|| format!("provider {provider_id}"))
+            };
+            if let Some(whose) = whose {
+                metrics::counter!("ocb_llm_budget_denials_total", "tenant" => tenant.clone(), "kind" => "unpriced_model")
+                    .increment(1);
+                return reject(
+                    kind,
+                    &BrokerError::Invalid(format!(
+                        "model {} has no configured price; the USD budget of {whose} can only be used with priced models",
+                        probe.model.as_deref().unwrap_or("(none)")
+                    )),
+                );
+            }
+        }
+        let cap = px.settings.max_reservation_tokens;
+        let tokens = probe.max_output().unwrap_or(cap).min(cap);
+        let micro_usd =
+            request_price.map_or(0, |p| p.cost_micro_usd(&Usage { output_tokens: tokens, ..Usage::default() }));
+        let tokens = i64::try_from(tokens).unwrap_or(i64::MAX);
+        match st.keeper.reserve(&auth, provider_id, &provider.limits, tokens, micro_usd).await {
+            Ok(r) => held.reservations = r.reservations,
+            Err(e) => {
+                return match &e {
+                    BrokerError::Limit(r) => refused(kind, provider_id, &tenant, r.level, &e),
+                    _ => reject(kind, &e),
+                };
+            }
+        }
+    }
 
     let span = tracing::info_span!(
         "llm.request",
@@ -575,6 +615,7 @@ async fn proxy(
         request_bytes: body.len() as u64,
         trace_id,
         status: 0,
+        reservations: held.take(),
     };
     drop(body);
     let exchange = Exchange {
@@ -904,6 +945,50 @@ struct Finisher {
     request_bytes: u64,
     trace_id: Option<String>,
     status: u16,
+    /// What the request holds on the budgets of its tenant and provider,
+    /// settled with its usage.
+    reservations: Vec<Reservation>,
+}
+
+/// Reservations of a request that has not reached its exchange yet. A
+/// request that ends before (no key for the provider, the caller gone)
+/// gives them back when this is dropped; the exchange takes them over
+/// otherwise.
+struct Held {
+    keeper: Arc<Keeper>,
+    tracker: TaskTracker,
+    reservations: Vec<Reservation>,
+}
+
+impl Held {
+    fn take(&mut self) -> Vec<Reservation> {
+        std::mem::take(&mut self.reservations)
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let reservations = self.take();
+        if reservations.is_empty() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let keeper = self.keeper.clone();
+        self.tracker.spawn(async move {
+            for (attempt, wait_ms) in [(1, 200u64), (2, 1000), (3, 0)] {
+                match keeper.release(&reservations).await {
+                    Ok(()) => return,
+                    Err(e) if attempt < 3 => {
+                        tracing::warn!(error = %e, attempt, "giving back a reservation failed; retrying");
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to give back a reservation; it stays until its period ends");
+                        metrics::counter!("ocb_llm_accounting_failures_total").increment(1);
+                    }
+                }
+            }
+        });
+    }
 }
 
 impl Finisher {
@@ -1037,7 +1122,7 @@ impl Finisher {
         };
         // A few retries ride out a briefly unavailable database.
         for (attempt, wait_ms) in [(1, 200u64), (2, 1000), (3, 0)] {
-            match self.keeper.record_usage(&row).await {
+            match self.keeper.record_usage_settling(&row, &self.reservations).await {
                 Ok(()) => return,
                 Err(e) if attempt < 3 => {
                     tracing::warn!(error = %e, attempt, "recording LLM usage failed; retrying");

@@ -24,6 +24,9 @@ use crate::policy;
 /// endpoint. No route needs them today; see DECISIONS.md, D-018.
 pub const RESERVED_PROVIDER_IDS: &[&str] = &["p", "limits"];
 
+/// Upper bound of `llm.max_reservation_tokens`.
+const MAX_RESERVATION_TOKENS: u64 = 10_000_000;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -144,6 +147,10 @@ pub struct LlmConfig {
     pub max_concurrent_per_token: u32,
     /// Requests in flight in total (per replica).
     pub max_concurrent_total: u32,
+    /// Most tokens a billable request reserves on the budgets of its tenant
+    /// and provider until it is accounted: its `max_tokens` (or
+    /// `max_completion_tokens`) up to this, and this when it sets neither.
+    pub max_reservation_tokens: u64,
     /// Upstream providers by id. `/llm/p/<id>/...` reaches any of them;
     /// the older routes stay: `/llm/anthropic/...` uses the provider with id
     /// `anthropic`, `/llm/openai/<id>/...` OpenAI-compatible ones.
@@ -330,6 +337,7 @@ impl Default for LlmConfig {
             max_buffered_response_bytes: 32 * 1024 * 1024,
             max_concurrent_per_token: 16,
             max_concurrent_total: 1024,
+            max_reservation_tokens: 32_000,
             providers: BTreeMap::new(),
             pricing: Vec::new(),
         }
@@ -534,6 +542,9 @@ impl LlmConfig {
         }
         if self.max_concurrent_per_token == 0 || self.max_concurrent_total == 0 {
             return Err("llm.max_concurrent_per_token and llm.max_concurrent_total must be positive".into());
+        }
+        if !(1..=MAX_RESERVATION_TOKENS).contains(&self.max_reservation_tokens) {
+            return Err(format!("llm.max_reservation_tokens must be between 1 and {MAX_RESERVATION_TOKENS}"));
         }
         Ok((out, prices))
     }
@@ -842,6 +853,11 @@ mod tests {
         let e = invalid("budget_usd = { day = 5.0 }");
         assert!(e.starts_with("llm.providers.x.limits.budget_usd: x has no [[llm.pricing]] entries"), "{e}");
         assert!(ServerConfig::parse(&with("budget_tokens = { day = 0 }")).unwrap().llm.validate().is_ok());
+
+        let mut c = LlmConfig::default();
+        assert_eq!(c.max_reservation_tokens, 32_000);
+        c.max_reservation_tokens = 0;
+        assert_eq!(c.validate().unwrap_err(), "llm.max_reservation_tokens must be between 1 and 10000000");
     }
 
     #[test]
