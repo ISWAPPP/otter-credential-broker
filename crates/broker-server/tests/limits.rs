@@ -636,3 +636,52 @@ async fn the_admin_api_shows_the_providers_limits_with_their_numbers() {
     assert_eq!(v["tenants"], json!([]));
     env.cleanup().await;
 }
+
+/// The value of a series in the metrics output; NaN shows as `NaN`.
+fn gauge(series: &str) -> Option<f64> {
+    let text = telemetry().metrics.render();
+    text.lines().find_map(|l| l.strip_prefix(series).and_then(|v| v.trim().parse::<f64>().ok()))
+}
+
+#[tokio::test]
+async fn budgets_and_labelled_tokens_are_exported_as_gauges() {
+    let Some(env) = env_with("budget_tokens = { day = 10_000 }, budget_usd = { month = 50.0 }").await else { return };
+    // A tenant of its own: the metrics recorder is shared by every test.
+    env.put_secret("gauges", "llm.anthropic", "llm_api_key", KEY_A).await;
+    set_limits(&env, "gauges", json!({"budget_tokens": {"day": 1000}})).await;
+    let (token, _) = env.llm_token("gauges", json!({"label": "agent", "ttl_secs": 3600})).await;
+    env.llm_token("gauges", json!({"label": "agent", "ttl_secs": 7200})).await;
+    let (_, probe) = env.llm_token("gauges", json!({"label": "probe", "ttl_secs": 600})).await;
+    env.llm_token("gauges", json!({"ttl_secs": 600})).await;
+    assert_eq!(send(&env, &token).await.status, StatusCode::OK);
+    env.settle().await;
+
+    let mut gauges = broker_server::limit_metrics::LimitGauges::new(env.state.keeper.clone(), env.state.proxy.clone());
+    gauges.refresh().await.unwrap();
+    let tenant = |name: &str, kind: &str| {
+        gauge(&format!("{name}{{level=\"tenant\",tenant=\"gauges\",provider=\"\",kind=\"{kind}\"}}"))
+    };
+    let global = |name: &str, kind: &str| {
+        gauge(&format!("{name}{{level=\"global\",tenant=\"\",provider=\"anthropic\",kind=\"{kind}\"}}"))
+    };
+    // 250 tokens used, at a cost of $0.00135.
+    assert_eq!(
+        (tenant("ocb_limit_quota", "tokens_day"), tenant("ocb_limit_remaining", "tokens_day")),
+        (Some(1000.0), Some(750.0))
+    );
+    assert_eq!(global("ocb_limit_remaining", "tokens_day"), Some(9750.0));
+    assert_eq!(global("ocb_limit_quota", "usd_month"), Some(50.0));
+    assert!((global("ocb_limit_remaining", "usd_month").unwrap() - 49.998_65).abs() < 1e-9);
+    let expiry = |label: &str| gauge(&format!("ocb_llm_token_expiry_timestamp{{tenant=\"gauges\",label=\"{label}\"}}"));
+    assert_eq!(expiry("agent"), Some((T0 + 7200) as f64), "the latest token of a label");
+    assert_eq!(expiry("probe"), Some((T0 + 600) as f64));
+
+    // A revoked token and a removed budget leave no stale values behind.
+    env.admin_call("POST", &format!("/v1/admin/tenants/gauges/llm-tokens/{probe}/revoke"), None).await;
+    set_limits(&env, "gauges", json!({})).await;
+    gauges.refresh().await.unwrap();
+    assert!(expiry("probe").unwrap().is_nan());
+    assert!(tenant("ocb_limit_remaining", "tokens_day").unwrap().is_nan());
+    assert_eq!(expiry("agent"), Some((T0 + 7200) as f64));
+    env.cleanup().await;
+}

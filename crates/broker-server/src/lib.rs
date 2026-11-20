@@ -13,6 +13,7 @@ pub mod admin;
 mod caller_limits;
 pub mod config;
 pub mod error;
+pub mod limit_metrics;
 mod limit_view;
 pub mod limits;
 pub mod observe;
@@ -364,6 +365,8 @@ pub async fn serve(cfg: ServerConfig, config_file: Option<PathBuf>) -> anyhow::R
     };
 
     let stop = CancellationToken::new();
+    let gauges = limit_metrics::LimitGauges::new(state.keeper.clone(), proxy.clone());
+    tokio::spawn(gauges.run(limit_metrics::REFRESH_EVERY, stop.clone()));
     if cfg.reload_interval_secs > 0 {
         let reloader = Reloader::new(config_file, cfg.clone(), proxy.clone());
         tokio::spawn(reloader.run(Duration::from_secs(cfg.reload_interval_secs), stop.clone()));
