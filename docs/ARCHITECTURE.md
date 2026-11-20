@@ -397,8 +397,9 @@ cannot use up a higher level's for everyone else:
    counts the request in the token's window, as before, and reads the
    tenant's limits and its spend in the current day and month.
 2. Requests in flight, in memory: the token's cap, then the tenant's, then
-   the provider's, then the replica's total. A refused request is counted
-   nowhere.
+   the provider's, then the replica's total. A request refused here takes
+   no slot at any level and is counted in no window above the token's; a
+   request refused in step 3 gives its slots back.
 3. One statement counts the request in the window of the tenant and then
    of the provider, each with
    `INSERT ... ON CONFLICT DO UPDATE ... WHERE rl_count < limit`: the
