@@ -51,6 +51,18 @@ const BROKER_REQUEST_HEADERS: &[&str] = &["accept-encoding", "traceparent", "use
 const DEFAULT_RESPONSE_HEADERS: &[&str] =
     &["content-type", "cache-control", "retry-after", "request-id", "x-request-id", "x-should-retry"];
 
+/// Headers the broker puts on every answer to a caller with a token: the
+/// token's requests per minute (see tests/limits.rs). Providers can never
+/// set them.
+const LIMIT_HEADERS: &[&str] = &["ratelimit-policy", "ratelimit"];
+
+/// What a caller gets back from a provider without prefixes.
+fn default_response() -> BTreeSet<String> {
+    let mut s = set(DEFAULT_RESPONSE_HEADERS);
+    s.extend(set(LIMIT_HEADERS));
+    s
+}
+
 /// A route of the older form and what it lets through by default.
 struct Route {
     uri: &'static str,
@@ -104,7 +116,7 @@ async fn by_default_only_the_fixed_allowlists_pass_either_way() {
         assert_eq!(seen.headers.get("accept-encoding").unwrap(), "identity");
         assert!(seen.headers.get("user-agent").unwrap().to_str().unwrap().starts_with("otter-credential-broker/"));
 
-        assert_eq!(names(&r.headers), set(DEFAULT_RESPONSE_HEADERS), "{uri}: passed back");
+        assert_eq!(names(&r.headers), default_response(), "{uri}: passed back");
         assert_eq!(r.headers.get("x-should-retry").unwrap(), "false");
 
         // An upstream error comes back with the same headers, so an SDK
@@ -113,7 +125,7 @@ async fn by_default_only_the_fixed_allowlists_pass_either_way() {
         assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{uri}: {}", r.text());
         // The error body is read before it is passed on, so the broker
         // gives its length itself.
-        let mut want = set(DEFAULT_RESPONSE_HEADERS);
+        let mut want = default_response();
         want.insert("content-length".into());
         assert_eq!(names(&r.headers), want, "{uri}: passed back with an error");
         assert_eq!(r.headers.get("content-length").unwrap(), r.body.len().to_string().as_str());
@@ -184,7 +196,7 @@ async fn a_provider_passes_more_headers_by_prefix() {
     assert_eq!(names(&seen.headers), want, "sent upstream");
     assert_eq!(seen.headers.get("x-api-key").unwrap(), KEY_A, "the provider key, never the caller's token");
     assert_eq!(seen.headers.get("anthropic-organization").unwrap(), "org-other");
-    let mut want = set(DEFAULT_RESPONSE_HEADERS);
+    let mut want = default_response();
     want.extend(gateway_response.clone());
     assert_eq!(names(&r.headers), want, "passed back");
     assert_eq!(r.headers.get("anthropic-ratelimit-unified-5h-utilization").unwrap(), "0.25");
@@ -193,7 +205,7 @@ async fn a_provider_passes_more_headers_by_prefix() {
     let r =
         env.llm("POST", "/llm/p/gateway/v1/messages", &headers, Some(anthropic_body("many-headers-429", false))).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
-    let mut want = set(DEFAULT_RESPONSE_HEADERS);
+    let mut want = default_response();
     want.extend(gateway_response);
     want.insert("content-length".into());
     assert_eq!(names(&r.headers), want, "passed back with an error");
@@ -203,7 +215,7 @@ async fn a_provider_passes_more_headers_by_prefix() {
         env.llm("POST", "/llm/p/anthropic/v1/messages", &headers, Some(anthropic_body("many-headers", false))).await;
     assert_eq!(r.status, StatusCode::OK);
     assert!(env.upstream.last().headers.get("anthropic-organization").is_none());
-    assert_eq!(names(&r.headers), set(DEFAULT_RESPONSE_HEADERS));
+    assert_eq!(names(&r.headers), default_response());
 
     // The admin view shows each provider's prefixes.
     let (_, v) = env.admin_call("GET", "/v1/admin/providers", None).await;
@@ -222,7 +234,7 @@ async fn broad_response_prefixes_never_pass_cookies_challenges_or_redirects() {
     let Some(env) = prefix_env().await else { return };
     let (token, _) = env.llm_token("tenant-a", json!({})).await;
     let h = [("x-api-key", token.as_str())];
-    let mut want = set(DEFAULT_RESPONSE_HEADERS);
+    let mut want = default_response();
     want.extend(set(&[
         "anthropic-ratelimit-unified-status",
         "anthropic-ratelimit-unified-5h-utilization",
@@ -237,9 +249,12 @@ async fn broad_response_prefixes_never_pass_cookies_challenges_or_redirects() {
         let mut got = names(&r.headers);
         got.remove("content-length");
         assert_eq!(got, want, "{model}");
-        for never in ["set-cookie", "www-authenticate", "ratelimit", "ratelimit-policy", "ocb-budget-remaining"] {
+        for never in ["set-cookie", "www-authenticate", "ocb-budget-remaining"] {
             assert!(r.headers.get(never).is_none(), "{model}: {never}");
         }
+        // The rate-limit headers are the broker's, never the provider's.
+        assert_eq!(r.headers.get("ratelimit-policy").unwrap(), "\"token\";q=120;w=60", "{model}");
+        assert!(r.headers.get("ratelimit").unwrap().to_str().unwrap().starts_with("\"token\";r="), "{model}");
         assert!(r.headers.get("location").is_none() && r.headers.get("alt-svc").is_none(), "{model}");
     }
     env.cleanup().await;

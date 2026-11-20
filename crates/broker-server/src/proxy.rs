@@ -55,6 +55,7 @@ use crate::AppState;
 use crate::admin::auth_failure;
 use crate::config::{LlmConfig, ProviderHeaders};
 use crate::error::{classify, llm_error, llm_error_response, llm_limit_error};
+use crate::limit_view::LimitView;
 use crate::limits::{Inflight, InflightKey, InflightPermit, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
 use crate::policy::{BodyRefusal, check_body, request_headers, response_headers};
@@ -204,7 +205,21 @@ fn reject(kind: ProviderKind, e: &BrokerError) -> Response {
 
 /// 402 or 429 for a request refused by a limit of `level`, which the
 /// response names.
-fn refused(kind: ProviderKind, provider: &str, tenant: &str, level: LimitLevel, e: &BrokerError) -> Response {
+fn refused(
+    view: &mut LimitView,
+    kind: ProviderKind,
+    provider: &str,
+    tenant: &str,
+    level: LimitLevel,
+    e: &BrokerError,
+) -> Response {
+    view.refused(
+        level,
+        match e {
+            BrokerError::Limit(r) => Some(r),
+            _ => None,
+        },
+    );
     let (_, code) = classify(e);
     metrics::counter!("ocb_llm_rejected_total", "reason" => code).increment(1);
     let what = match e {
@@ -232,6 +247,7 @@ fn token_rate_refusal(auth: &Authorized, e: BrokerError) -> BrokerError {
             auth.token_rpm.limit
         ),
         retry_after_secs: Some(retry_after_secs),
+        budget: None,
     })
 }
 
@@ -242,7 +258,7 @@ fn in_flight_refusal(level: LimitLevel, provider: &str) -> BrokerError {
         LimitLevel::Tenant => "the tenant has too many requests in flight".to_owned(),
         LimitLevel::Global => format!("too many requests in flight for provider {provider}"),
     };
-    BrokerError::Limit(LimitRefusal { level, kind: LimitKind::InFlight, message, retry_after_secs: None })
+    BrokerError::Limit(LimitRefusal { level, kind: LimitKind::InFlight, message, retry_after_secs: None, budget: None })
 }
 
 /// 400 for a request the provider's body policy refuses. A refused tool is
@@ -408,12 +424,21 @@ async fn proxy(
             return reject(kind, &e);
         }
     };
+    // Every answer from here on shows the caller its limits.
+    let mut view = LimitView::new(&auth);
+    macro_rules! done {
+        ($resp:expr) => {{
+            let mut resp: Response = $resp;
+            view.apply(resp.headers_mut());
+            return resp;
+        }};
+    }
     // Limits, level by level: a level only counts a request the levels
     // below it let through, so a token over its limits never uses up its
     // tenant's, and a tenant over its limits never the provider's.
     let tenant = auth.grant.tenant.clone();
     if let Err(e) = auth.check_token_rate() {
-        return refused(kind, provider_id, &tenant, LimitLevel::Token, &token_rate_refusal(&auth, e));
+        done!(refused(&mut view, kind, provider_id, &tenant, LimitLevel::Token, &token_rate_refusal(&auth, e)));
     }
     let permit = match px.inflight.acquire_for(InflightKey {
         token_id: &auth.grant.token_id,
@@ -423,13 +448,16 @@ async fn proxy(
         provider_max: provider.limits.concurrent,
     }) {
         Ok(p) => p,
-        Err(level) => return refused(kind, provider_id, &tenant, level, &in_flight_refusal(level, provider_id)),
+        Err(level) => {
+            done!(refused(&mut view, kind, provider_id, &tenant, level, &in_flight_refusal(level, provider_id)))
+        }
     };
-    if let Err(e) = st.keeper.count_request(&auth, provider_id, provider.limits.rpm).await {
-        return match &e {
-            BrokerError::Limit(r) => refused(kind, provider_id, &tenant, r.level, &e),
+    match st.keeper.count_request(&auth, provider_id, provider.limits.rpm).await {
+        Ok(c) => view.counted(&c),
+        Err(e) => done!(match &e {
+            BrokerError::Limit(r) => refused(&mut view, kind, provider_id, &tenant, r.level, &e),
             _ => reject(kind, &e),
-        };
+        }),
     }
     let grant = auth.grant.clone();
 
@@ -442,17 +470,17 @@ async fn proxy(
     let body = match read {
         Ok(Ok(b)) => b,
         Ok(Err(_)) => {
-            return reject(
+            done!(reject(
                 kind,
                 &BrokerError::TooLarge(format!("request body exceeds {} bytes", px.settings.max_request_bytes)),
-            );
+            ));
         }
-        Err(_) => return reject(kind, &BrokerError::Invalid("request body was not received in time".into())),
+        Err(_) => done!(reject(kind, &BrokerError::Invalid("request body was not received in time".into()))),
     };
     let probe = if endpoint.billable {
         match probe(&body) {
             Ok(p) => p,
-            Err(e) => return reject(kind, &e),
+            Err(e) => done!(reject(kind, &e)),
         }
     } else {
         Probe::default()
@@ -460,7 +488,7 @@ async fn proxy(
     if method == HttpMethod::Post
         && let Err(refusal) = check_body(&provider.body, &body)
     {
-        return body_refused(kind, provider_id, &grant, &refusal);
+        done!(body_refused(kind, provider_id, &grant, &refusal));
     }
     let streaming = probe.stream.unwrap_or(false);
     let request_price = probe.model.as_deref().and_then(|m| snap.prices().lookup(provider.price_source(), m));
@@ -473,23 +501,23 @@ async fn proxy(
             };
             metrics::counter!("ocb_llm_budget_denials_total", "tenant" => grant.tenant.clone(), "kind" => what)
                 .increment(1);
-            return match e {
-                BrokerError::BudgetExceeded(_) => refused(kind, provider_id, &tenant, LimitLevel::Token, &e),
+            done!(match e {
+                BrokerError::BudgetExceeded(_) => refused(&mut view, kind, provider_id, &tenant, LimitLevel::Token, &e),
                 _ => reject(kind, &e),
-            };
+            });
         }
         if kind == ProviderKind::Openai
             && streaming
             && provider.require_stream_usage
             && !probe.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false)
         {
-            return reject(
+            done!(reject(
                 kind,
                 &BrokerError::Invalid(
                     "streaming requests must set stream_options.include_usage = true (usage is required for accounting)"
                         .into(),
                 ),
-            );
+            ));
         }
     }
     // Budgets of the tenant and the provider: the request reserves its
@@ -506,13 +534,13 @@ async fn proxy(
             if let Some(whose) = whose {
                 metrics::counter!("ocb_llm_budget_denials_total", "tenant" => tenant.clone(), "kind" => "unpriced_model")
                     .increment(1);
-                return reject(
+                done!(reject(
                     kind,
                     &BrokerError::Invalid(format!(
                         "model {} has no configured price; the USD budget of {whose} can only be used with priced models",
                         probe.model.as_deref().unwrap_or("(none)")
                     )),
-                );
+                ));
             }
         }
         let cap = px.settings.max_reservation_tokens;
@@ -521,12 +549,15 @@ async fn proxy(
             request_price.map_or(0, |p| p.cost_micro_usd(&Usage { output_tokens: tokens, ..Usage::default() }));
         let tokens = i64::try_from(tokens).unwrap_or(i64::MAX);
         match st.keeper.reserve(&auth, provider_id, &provider.limits, tokens, micro_usd).await {
-            Ok(r) => held.reservations = r.reservations,
+            Ok(r) => {
+                view.reserved(&auth.tenant_limits, &tenant, &r.rows);
+                held.reservations = r.reservations;
+            }
             Err(e) => {
-                return match &e {
-                    BrokerError::Limit(r) => refused(kind, provider_id, &tenant, r.level, &e),
+                done!(match &e {
+                    BrokerError::Limit(r) => refused(&mut view, kind, provider_id, &tenant, r.level, &e),
                     _ => reject(kind, &e),
-                };
+                });
             }
         }
     }
@@ -562,7 +593,7 @@ async fn proxy(
         Ok(k) => k,
         Err(e) => {
             let _e = span.enter();
-            return reject(kind, &e);
+            done!(reject(kind, &e));
         }
     };
 
@@ -573,7 +604,7 @@ async fn proxy(
     }
     let mut headers = request_headers(kind, &provider.headers, &parts.headers);
     headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    let auth = match kind {
+    let provider_auth = match kind {
         ProviderKind::Anthropic => {
             HeaderValue::from_str(key.expose()).map(|v| (HeaderName::from_static("x-api-key"), v))
         }
@@ -581,8 +612,8 @@ async fn proxy(
             HeaderValue::from_str(&format!("Bearer {}", key.expose())).map(|v| (header::AUTHORIZATION, v))
         }
     };
-    let Ok((auth_name, mut auth_value)) = auth else {
-        return reject(kind, &BrokerError::Internal("stored provider key is not a valid header value".into()));
+    let Ok((auth_name, mut auth_value)) = provider_auth else {
+        done!(reject(kind, &BrokerError::Internal("stored provider key is not a valid header value".into())));
     };
     auth_value.set_sensitive(true);
     headers.insert(auth_name, auth_value);
@@ -637,7 +668,7 @@ async fn proxy(
 
     // Wait for the response head. If this times out, or the caller goes away
     // (this future is dropped), the exchange carries on and accounts by itself.
-    match tokio::time::timeout(px.settings.response_timeout, head_rx).await {
+    let mut resp = match tokio::time::timeout(px.settings.response_timeout, head_rx).await {
         Ok(Ok(Head::Stream { status, headers, rx, abort })) => {
             let mut r = Response::new(client_body(rx, abort));
             *r.status_mut() = status;
@@ -664,7 +695,9 @@ async fn proxy(
                 &BrokerError::Internal(String::new()),
             )
         }
-    }
+    };
+    view.apply(resp.headers_mut());
+    resp
 }
 
 /// What the exchange task tells the waiting handler.

@@ -80,6 +80,20 @@ pub struct LimitRefusal {
     pub message: String,
     /// For rate limits: seconds until the window that refused ends.
     pub retry_after_secs: Option<u64>,
+    /// For budgets: the one that refused, as it stood.
+    pub budget: Option<RefusedBudget>,
+}
+
+/// A budget that refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefusedBudget {
+    pub period: Period,
+    /// In micro-USD rather than tokens.
+    pub usd: bool,
+    pub limit: i64,
+    /// Spent and reserved.
+    pub used: i64,
+    pub renews_at: Timestamp,
 }
 
 impl fmt::Display for LimitRefusal {

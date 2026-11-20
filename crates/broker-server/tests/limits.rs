@@ -415,3 +415,65 @@ async fn without_limits_nothing_is_counted_beyond_the_token() {
     assert_eq!((t["spent_tokens"].as_i64(), t["request_count"].as_i64()), (Some(2 * 1150), Some(3)));
     env.cleanup().await;
 }
+
+fn header(r: &TestResponse, name: &str) -> Option<String> {
+    r.headers.get(name).map(|v| v.to_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn every_answer_shows_the_caller_its_limits_and_the_provider_cannot_override_them() {
+    let Some(env) = env_with("rpm = 1000, budget_tokens = { day = 1_000_000 }").await else { return };
+    env.clock.set(DAY0 + 86_400 - 3600 - 20);
+    set_limits(&env, "tenant-a", json!({"rpm": 50, "budget_tokens": {"day": 1000}})).await;
+    let (token, _) = env.llm_token("tenant-a", json!({"budget_tokens": 10_000})).await;
+    let h = [("x-api-key", token.as_str())];
+
+    // The provider sends RateLimit and ocb-budget-* headers of its own; the
+    // caller only ever sees the broker's. The tenant's day budget, with
+    // this request's 64 tokens reserved, is nearer to running out than the
+    // token's budget; the provider's own limits are not shown.
+    let r = env.llm("POST", "/llm/anthropic/v1/messages", &h, Some(anthropic_body("many-headers", false))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let want = [
+        ("ratelimit-policy", "\"token\";q=120;w=60, \"tenant\";q=50;w=60"),
+        ("ratelimit", "\"token\";r=119;t=20, \"tenant\";r=49;t=20"),
+        ("ocb-budget-limit", "1000"),
+        ("ocb-budget-remaining", "936"),
+        ("ocb-budget-unit", "tokens"),
+        ("ocb-budget-reset", "3620"),
+        ("ocb-limit-level", "tenant"),
+    ];
+    for (name, value) in want {
+        assert_eq!(header(&r, name).as_deref(), Some(value), "{name}");
+    }
+    env.settle().await;
+
+    // An upstream error and a stream carry them too, with the spend so far.
+    let r = env.llm("POST", "/llm/anthropic/v1/messages", &h, Some(anthropic_body("many-headers-429", false))).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(header(&r, "ocb-budget-remaining").as_deref(), Some("686"), "250 spent, 64 reserved");
+    assert_eq!(header(&r, "ratelimit").as_deref(), Some("\"token\";r=118;t=20, \"tenant\";r=48;t=20"));
+    let r = env.llm("POST", "/llm/anthropic/v1/messages", &h, Some(anthropic_body("test-model", true))).await;
+    assert!(r.headers.get("content-type").unwrap().to_str().unwrap().starts_with("text/event-stream"));
+    assert_eq!(header(&r, "ocb-limit-level").as_deref(), Some("tenant"));
+    env.settle().await;
+
+    // So do refusals of the broker, which name the level that refused.
+    set_limits(&env, "tenant-a", json!({"rpm": 50, "budget_tokens": {"day": 300}})).await;
+    let r = send(&env, &token).await;
+    assert_eq!((r.status, level(&r)), (StatusCode::PAYMENT_REQUIRED, "tenant".to_owned()));
+    assert_eq!(header(&r, "ocb-budget-remaining").as_deref(), Some("0"));
+    let r = env.llm("POST", "/llm/anthropic/v1/messages/count_tokens", &h, Some("{}".into())).await;
+    assert_eq!(r.status, StatusCode::OK, "free endpoints still pass");
+    assert_eq!(header(&r, "ocb-budget-remaining").as_deref(), Some("0"));
+
+    // Without a known token there is nothing to show.
+    for r in [
+        env.llm("POST", "/llm/anthropic/v1/messages", &[("x-api-key", "ocb_llm_x")], Some("{}".into())).await,
+        env.llm("POST", "/llm/p/nowhere/v1/messages", &h, Some("{}".into())).await,
+    ] {
+        assert!(r.status.is_client_error());
+        assert!(r.headers.get("ratelimit").is_none() && r.headers.get("ocb-limit-level").is_none());
+    }
+    env.cleanup().await;
+}

@@ -12,6 +12,7 @@
 pub mod admin;
 pub mod config;
 pub mod error;
+mod limit_view;
 pub mod limits;
 pub mod observe;
 mod policy;

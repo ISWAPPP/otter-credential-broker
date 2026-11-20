@@ -19,8 +19,8 @@ use crate::clock::{Clock, Timestamp};
 use crate::crypto::{Envelope, secret_context};
 use crate::error::BrokerError;
 use crate::limits::{
-    LimitKind, LimitLevel, LimitRefusal, Limits, PerPeriod, Period, Reservation, Spend, format_utc, window_of,
-    window_reset,
+    LimitKind, LimitLevel, LimitRefusal, Limits, PerPeriod, Period, RefusedBudget, Reservation, Spend, format_utc,
+    window_of, window_reset,
 };
 use crate::llm::pricing::ModelPrice;
 use crate::llm::{LLM_KEY_KIND, ProviderAccess, provider_key_secret_name};
@@ -673,6 +673,7 @@ impl Keeper {
                     tenant_rpm.unwrap_or_default()
                 ),
                 retry_after_secs: Some(retry_after_secs),
+                budget: None,
             }));
         }
         if !c.global_passed {
@@ -681,6 +682,7 @@ impl Keeper {
                 kind: LimitKind::Rate,
                 message: format!("rate limit of provider {provider} exceeded, retry after {retry_after_secs}s"),
                 retry_after_secs: Some(retry_after_secs),
+                budget: None,
             }));
         }
         let count = |limit: Option<i32>, n: Option<i32>| {
@@ -1165,7 +1167,8 @@ fn budget_refusal(claim: &BudgetClaim, spend: &Spend, provider: &str) -> LimitRe
         Period::Day => "daily",
         Period::Month => "monthly",
     };
-    let renews = format_utc(claim.period.end(claim.period_start));
+    let renews_at = claim.period.end(claim.period_start);
+    let renews = format_utc(renews_at);
     let message = match claim.scope.level {
         LimitLevel::Global => {
             format!("{period} {unit} budget of provider {provider} is used up; it renews at {renews}")
@@ -1185,7 +1188,18 @@ fn budget_refusal(claim: &BudgetClaim, spend: &Spend, provider: &str) -> LimitRe
             )
         }
     };
-    LimitRefusal { level: claim.scope.level, kind: LimitKind::Budget, message, retry_after_secs: None }
+    let (usd, limit, used) = if unit == "token" {
+        (false, claim.limit_tokens.unwrap_or_default(), spend.used_tokens())
+    } else {
+        (true, claim.limit_micro_usd.unwrap_or_default(), spend.used_micro_usd())
+    };
+    LimitRefusal {
+        level: claim.scope.level,
+        kind: LimitKind::Budget,
+        message,
+        retry_after_secs: None,
+        budget: Some(RefusedBudget { period: claim.period, usd, limit, used, renews_at }),
+    }
 }
 
 /// A token row whose MAC does not verify was changed outside the broker.
