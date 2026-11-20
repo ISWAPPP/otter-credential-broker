@@ -38,6 +38,27 @@ pub struct InflightKey<'a> {
     pub provider_max: Option<u32>,
 }
 
+/// Why [`Inflight::acquire_for`] refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InflightRefusal {
+    /// The cap of the token, of its tenant or of its provider.
+    Level(LimitLevel),
+    /// The replica's total (`llm.max_concurrent_total`), which belongs to no
+    /// tenant or provider.
+    Replica,
+}
+
+impl InflightRefusal {
+    /// The level the refusal is reported at. Callers know three levels; the
+    /// replica's total is reported as global.
+    pub fn level(self) -> LimitLevel {
+        match self {
+            Self::Level(level) => level,
+            Self::Replica => LimitLevel::Global,
+        }
+    }
+}
+
 /// Held for the whole life of a proxied request, including accounting.
 pub struct InflightPermit {
     inflight: Arc<Inflight>,
@@ -94,21 +115,21 @@ impl Inflight {
 
     /// A permit for a request, checked level by level: the token, then its
     /// tenant, then its provider, then the replica's total. A refusal names
-    /// the first level at its cap (the replica's total counts as global),
-    /// and nothing is counted for a refused request.
-    pub fn acquire_for(self: &Arc<Self>, k: InflightKey<'_>) -> Result<InflightPermit, LimitLevel> {
+    /// the first level at its cap, or the replica when only its total is
+    /// full, and nothing is counted for a refused request.
+    pub fn acquire_for(self: &Arc<Self>, k: InflightKey<'_>) -> Result<InflightPermit, InflightRefusal> {
         let mut c = self.counts();
         let at_cap = |map: &HashMap<String, u32>, key: &str, max: u32| map.get(key).copied().unwrap_or(0) >= max;
         if at_cap(&c.tokens, k.token_id, self.max_per_token) {
-            return Err(LimitLevel::Token);
+            return Err(InflightRefusal::Level(LimitLevel::Token));
         }
         if k.tenant_max.is_some_and(|m| at_cap(&c.tenants, k.tenant, m)) {
-            return Err(LimitLevel::Tenant);
+            return Err(InflightRefusal::Level(LimitLevel::Tenant));
         }
         if k.provider_max.is_some_and(|m| at_cap(&c.providers, k.provider, m)) {
-            return Err(LimitLevel::Global);
+            return Err(InflightRefusal::Level(LimitLevel::Global));
         }
-        let total = self.total.clone().try_acquire_owned().map_err(|_| LimitLevel::Global)?;
+        let total = self.total.clone().try_acquire_owned().map_err(|_| InflightRefusal::Replica)?;
         add(&mut c.tokens, k.token_id);
         add(&mut c.tenants, k.tenant);
         add(&mut c.providers, k.provider);
@@ -263,14 +284,15 @@ mod tests {
             provider,
             provider_max: Some(3),
         };
+        let level = |l| Some(InflightRefusal::Level(l));
         let a1 = f.acquire_for(key("a", "t1", "p")).unwrap();
         let _a2 = f.acquire_for(key("a", "t1", "p")).unwrap();
-        assert_eq!(f.acquire_for(key("a", "t1", "p")).err(), Some(LimitLevel::Token));
-        assert_eq!(f.acquire_for(key("b", "t1", "p")).err(), Some(LimitLevel::Tenant), "t1 holds two");
+        assert_eq!(f.acquire_for(key("a", "t1", "p")).err(), level(LimitLevel::Token));
+        assert_eq!(f.acquire_for(key("b", "t1", "p")).err(), level(LimitLevel::Tenant), "t1 holds two");
         let _c1 = f.acquire_for(key("c", "t2", "p")).unwrap();
-        assert_eq!(f.acquire_for(key("d", "t3", "p")).err(), Some(LimitLevel::Global), "p holds three");
+        assert_eq!(f.acquire_for(key("d", "t3", "p")).err(), level(LimitLevel::Global), "p holds three");
         let _e1 = f.acquire_for(key("e", "t3", "q")).unwrap();
-        assert_eq!(f.acquire_for(key("f", "t4", "r")).err(), Some(LimitLevel::Global), "the replica holds four");
+        assert_eq!(f.acquire_for(key("f", "t4", "r")).err(), Some(InflightRefusal::Replica), "the replica holds four");
         assert_eq!((f.tenant_count("t1"), f.provider_count("p"), f.count("b")), (2, 3, 0), "refusals count nothing");
         drop(a1);
         assert_eq!((f.count("a"), f.tenant_count("t1"), f.provider_count("p")), (1, 1, 2));
@@ -278,6 +300,19 @@ mod tests {
         let open = InflightKey { token_id: "g", tenant: "t5", tenant_max: None, provider: "q", provider_max: None };
         let _g = f.acquire_for(open).unwrap();
         assert_eq!((f.tenant_count("t5"), f.provider_count("q")), (1, 2));
+    }
+
+    #[test]
+    fn a_full_replica_is_not_a_cap_of_the_provider() {
+        let f = Inflight::new(4, 1);
+        let open =
+            |token_id, provider| InflightKey { token_id, tenant: "t", tenant_max: None, provider, provider_max: None };
+        let _a = f.acquire_for(open("a", "p")).unwrap();
+        // Provider q has no cap and holds nothing: the replica's total refuses.
+        let refusal = f.acquire_for(open("b", "q")).err();
+        assert_eq!(refusal, Some(InflightRefusal::Replica));
+        assert_eq!(refusal.map(InflightRefusal::level), Some(LimitLevel::Global));
+        assert_eq!((f.provider_count("q"), f.tenant_count("t")), (0, 1));
     }
 
     #[test]

@@ -185,6 +185,28 @@ async fn requests_in_flight_are_capped_per_tenant_and_provider() {
     env.cleanup().await;
 }
 
+#[tokio::test]
+async fn a_full_replica_blames_no_provider() {
+    let (upstream, addr) = start_upstream().await;
+    let llm = llm_config(&format!("[llm]\nmax_concurrent_total = 1\n{}", provider(&addr.to_string(), "")));
+    let Some(env) = Env::with_llm(EnvOptions::default(), llm, (upstream, addr)).await else { return };
+    env.seed_keys().await;
+    let (a, _) = env.llm_token("tenant-a", json!({})).await;
+    let (b, _) = env.llm_token("tenant-b", json!({})).await;
+    let denials = "ocb_limit_denials_total{level=\"global\",kind=\"concurrent\",provider=\"\",tenant=\"tenant-b\"}";
+    let before = counter(denials);
+    let first = in_background(&env, &a, "slow-json", false);
+    in_flight(&env, "tenant-a", 1, 1).await;
+    // The provider has no cap of its own: the replica's total refuses, at
+    // the global level, and names no provider.
+    let r = send(&env, &b).await;
+    assert_eq!((r.status, level(&r)), (StatusCode::TOO_MANY_REQUESTS, "global".to_owned()));
+    assert_eq!(r.json()["error"]["message"], "the broker has too many requests in flight");
+    assert_eq!(counter(denials), before + 1);
+    assert_eq!(first.await.unwrap().status, StatusCode::OK);
+    env.cleanup().await;
+}
+
 /// Replaces the file the way a ConfigMap update does: all at once.
 fn write(path: &Path, content: &str) {
     let tmp = path.with_extension("tmp");

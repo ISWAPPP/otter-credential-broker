@@ -484,7 +484,7 @@ that are summed when read.
 | Requests in flight per LLM token | `llm.max_concurrent_per_token` | 429 `too_many_in_flight`, level `token`, `Retry-After: 1` |
 | Requests in flight per tenant | `concurrent` of the tenant | same, level `tenant` |
 | Requests in flight per provider | `concurrent` of the provider | same, level `global` |
-| Requests in flight in total | `llm.max_concurrent_total` | same, level `global` |
+| Requests in flight in total | `llm.max_concurrent_total` | same, level `global`, naming no provider: "the broker has too many requests in flight" |
 | Requests to `/llm/_/limits` per token and minute | `llm.limits_endpoint_per_minute` | 429 |
 | Failed token checks per client address and minute | `http.auth_failures_per_minute` | 429 without a database lookup (proxy, `/llm/_/limits` and worker endpoint) |
 | Open connections per listener | `http.max_connections` | further clients wait in the listen backlog |

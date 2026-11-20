@@ -98,7 +98,7 @@ Served on the metrics listener (`metrics_listen`, default `:9090`) at
 | `ocb_llm_tokens_total` | counter | tenant, provider, model, type = input, output, cache_read, cache_write |
 | `ocb_llm_cost_microdollars_total` | counter | tenant, provider, model |
 | `ocb_llm_budget_denials_total` | counter | tenant, kind = tokens, usd, unpriced_model (refusals by the token's budget, and of unpriced models under a USD budget of any level) |
-| `ocb_limit_denials_total` | counter | level = token, tenant, global; kind = rpm, concurrent, budget; provider; tenant (the tenant of the refused request, whatever the level) |
+| `ocb_limit_denials_total` | counter | level = token, tenant, global; kind = rpm, concurrent, budget; provider (empty when the replica's total of requests in flight refused); tenant (the tenant of the refused request, whatever the level) |
 | `ocb_limit_quota` | gauge | level = tenant, global; tenant (empty for global); provider (empty for tenant); kind = tokens_day, tokens_month, usd_day, usd_month (the budget, USD in dollars) |
 | `ocb_limit_remaining` | gauge | same as `ocb_limit_quota`: what is left of the budget in the current period, reservations of requests in flight counted as used; NaN once the budget is removed |
 | `ocb_llm_token_expiry_timestamp` | gauge | tenant, label (live tokens with a label: the latest expiry per tenant and label, Unix seconds; NaN once none is left) |

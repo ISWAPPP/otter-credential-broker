@@ -58,7 +58,7 @@ use crate::admin::auth_failure;
 use crate::config::{LlmConfig, ProviderHeaders};
 use crate::error::{classify, llm_error, llm_error_response, llm_limit_error};
 use crate::limit_view::LimitView;
-use crate::limits::{Inflight, InflightKey, InflightPermit, MinuteLimiter, seconds_to_next_minute};
+use crate::limits::{Inflight, InflightKey, InflightPermit, InflightRefusal, MinuteLimiter, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
 use crate::policy::{BodyRefusal, check_body, request_headers, response_headers};
 use crate::registry::{ProviderSnapshot, SnapshotCell, publish};
@@ -213,7 +213,7 @@ fn reject(kind: ProviderKind, e: &BrokerError) -> Response {
 }
 
 /// 402 or 429 for a request refused by a limit of `level`, which the
-/// response names.
+/// response names. `provider` labels the denial in the metrics.
 fn refused(
     view: &mut LimitView,
     kind: ProviderKind,
@@ -260,14 +260,23 @@ fn token_rate_refusal(auth: &Authorized, e: BrokerError) -> BrokerError {
     })
 }
 
-/// A request over a cap on requests in flight of `level`, on this replica.
-fn in_flight_refusal(level: LimitLevel, provider: &str) -> BrokerError {
-    let message = match level {
-        LimitLevel::Token => "this LLM token has too many requests in flight".to_owned(),
-        LimitLevel::Tenant => "the tenant has too many requests in flight".to_owned(),
-        LimitLevel::Global => format!("too many requests in flight for provider {provider}"),
+/// A request over a cap on requests in flight, on this replica. The
+/// replica's total is reported at the global level, without naming the
+/// provider, whose own cap it is not.
+fn in_flight_refusal(refusal: InflightRefusal, provider: &str) -> BrokerError {
+    let message = match refusal {
+        InflightRefusal::Level(LimitLevel::Token) => "this LLM token has too many requests in flight".to_owned(),
+        InflightRefusal::Level(LimitLevel::Tenant) => "the tenant has too many requests in flight".to_owned(),
+        InflightRefusal::Level(LimitLevel::Global) => format!("too many requests in flight for provider {provider}"),
+        InflightRefusal::Replica => "the broker has too many requests in flight".to_owned(),
     };
-    BrokerError::Limit(LimitRefusal { level, kind: LimitKind::InFlight, message, retry_after_secs: None, budget: None })
+    BrokerError::Limit(LimitRefusal {
+        level: refusal.level(),
+        kind: LimitKind::InFlight,
+        message,
+        retry_after_secs: None,
+        budget: None,
+    })
 }
 
 /// 400 for a request the provider's body policy refuses. A refused tool is
@@ -457,8 +466,11 @@ async fn proxy(
         provider_max: provider.limits.concurrent,
     }) {
         Ok(p) => p,
-        Err(level) => {
-            done!(refused(&mut view, kind, provider_id, &tenant, level, &in_flight_refusal(level, provider_id)))
+        Err(refusal) => {
+            let e = in_flight_refusal(refusal, provider_id);
+            // Denials of the replica's total are counted for no provider.
+            let label = if refusal == InflightRefusal::Replica { "" } else { provider_id };
+            done!(refused(&mut view, kind, label, &tenant, refusal.level(), &e))
         }
     };
     match st.keeper.count_request(&auth, provider_id, provider.limits.rpm).await {
