@@ -145,23 +145,20 @@ async fn rotated_certificates_are_used_by_new_requests() {
     replace(&cert, &tls_fixture("client-a.pem"));
     replace(&key, &tls_fixture("client-a.key"));
     let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"
-            [llm.providers.rotating]
-            kind = "anthropic"
-            base_url = "https://127.0.0.1:{}"
-            access = "explicit"
-            tls = {{ ca_file = {}, client_cert = {}, client_key = {} }}
-            "#,
-            server.addr.port(),
-            lit(&ca),
-            lit(&cert),
-            lit(&key)
-        ),
-    )
-    .unwrap();
+    let config = format!(
+        r#"
+        [llm.providers.rotating]
+        kind = "anthropic"
+        base_url = "https://127.0.0.1:{}"
+        access = "explicit"
+        tls = {{ ca_file = {}, client_cert = {}, client_key = {} }}
+        "#,
+        server.addr.port(),
+        lit(&ca),
+        lit(&cert),
+        lit(&key)
+    );
+    std::fs::write(&config_path, &config).unwrap();
     let cfg = ServerConfig::load(Some(&config_path)).unwrap();
     let Some(env) = Env::with_llm(EnvOptions::default(), cfg.llm.clone(), (plain, plain_addr)).await else {
         return;
@@ -176,6 +173,17 @@ async fn rotated_certificates_are_used_by_new_requests() {
     assert_eq!(call(&env, &token, "rotating").await.status, StatusCode::OK);
     assert_eq!(server.last_client_cert(), Some(fixture_cert("client-a.pem")));
     assert_eq!(expiry(), Some(4_904_409_600.0));
+
+    // A reload that leaves the TLS files alone keeps the provider's client,
+    // and with it the open connection.
+    env.settle().await;
+    let (connections, version) = (server.connections(), proxy.snapshot().version());
+    let other = "[llm.providers.other]\nkind = \"openai\"\nbase_url = \"https://other.example/v1\"\n";
+    std::fs::write(&config_path, format!("{config}\n{other}")).unwrap();
+    assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert_ne!(proxy.snapshot().version(), version);
+    assert_eq!(call(&env, &token, "rotating").await.status, StatusCode::OK);
+    assert_eq!(server.connections(), connections, "unchanged TLS material keeps its client and connection");
     let version = proxy.snapshot().version();
 
     // Half a rotation: the new certificate does not match the old key.
@@ -201,8 +209,7 @@ async fn rotated_certificates_are_used_by_new_requests() {
     assert_eq!(proxy.snapshot().tls_not_after("rotating"), Some(4_912_358_400));
 
     // A provider removed by a reload leaves no expiry behind.
-    std::fs::write(&config_path, "[llm.providers.other]\nkind = \"openai\"\nbase_url = \"https://other.example/v1\"\n")
-        .unwrap();
+    std::fs::write(&config_path, other).unwrap();
     assert_eq!(reloader.check(), Some(ReloadResult::Applied));
     assert!(proxy.snapshot().tls_files().is_empty());
     assert!(expiry().unwrap().is_nan());
