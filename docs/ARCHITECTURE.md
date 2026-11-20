@@ -165,7 +165,8 @@ sequenceDiagram
   avoided by hanging up. The cost of this choice: a generation the caller
   abandons runs to completion at the provider and is billed.
 - **Response.** Status passed through. Headers: `content-type`,
-  `cache-control`, `retry-after`, `request-id`, `x-request-id`. Success
+  `cache-control`, `retry-after`, `request-id`, `x-request-id` and
+  `x-should-retry` (the provider telling SDKs whether to retry). Success
   bodies are streamed chunk by chunk; any occurrence of the provider key is
   replaced by `[REDACTED]` (a tail that could be the start of the key is held
   back until the next chunk). Compressed success bodies are refused (502):

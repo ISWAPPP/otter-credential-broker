@@ -12,7 +12,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use broker_core::auth::StaticTokenAuthenticator;
 use broker_core::clock::ManualClock;
@@ -98,6 +98,39 @@ fn json_resp(status: StatusCode, body: String) -> Response {
     (status, [(header::CONTENT_TYPE, "application/json"), (header::SET_COOKIE, "upstream=1")], body).into_response()
 }
 
+/// Headers a provider may send with a response, besides `content-type`,
+/// `set-cookie` and `x-should-retry`: some every caller gets, some only
+/// through a provider's response prefixes, some never.
+pub const PROVIDER_RESPONSE_HEADERS: &[(&str, &str)] = &[
+    ("cache-control", "no-cache"),
+    ("retry-after", "7"),
+    ("request-id", "req_0123"),
+    ("x-request-id", "xreq_0123"),
+    ("anthropic-ratelimit-unified-status", "allowed"),
+    ("anthropic-ratelimit-unified-5h-utilization", "0.25"),
+    ("anthropic-ratelimit-requests-remaining", "99"),
+    ("anthropic-organization-id", "org-0123"),
+    ("x-ratelimit-remaining-requests", "59"),
+    ("x-upstream-debug", "1"),
+    ("www-authenticate", "Bearer realm=\"provider\""),
+    ("ratelimit-policy", "\"default\";q=100;w=60"),
+    ("ratelimit", "\"default\";r=50;t=30"),
+    ("ocb-budget-remaining", "999"),
+    ("location", "http://elsewhere.example/"),
+    ("alt-svc", "h3=\":443\""),
+];
+
+/// `resp` with every header of [`PROVIDER_RESPONSE_HEADERS`] and
+/// `x-should-retry: <should_retry>`.
+fn with_provider_headers(mut resp: Response, should_retry: &'static str) -> Response {
+    let h = resp.headers_mut();
+    for (name, value) in PROVIDER_RESPONSE_HEADERS {
+        h.append(HeaderName::from_static(name), HeaderValue::from_static(value));
+    }
+    h.insert("x-should-retry", HeaderValue::from_static(should_retry));
+    resp
+}
+
 /// Chunks with delays, to exercise streaming, idle timeouts and disconnects.
 fn slow_sse(parts: Vec<(Duration, String)>) -> Response {
     let s = stream::unfold(parts.into_iter(), |mut it| async move {
@@ -140,6 +173,14 @@ async fn upstream_handler(State(up): State<Upstream>, req: Request) -> Response 
             "error-529" => json_resp(
                 StatusCode::from_u16(529).unwrap(),
                 json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}).to_string(),
+            ),
+            "many-headers" => with_provider_headers(json_resp(StatusCode::OK, ANTHROPIC_JSON.into()), "false"),
+            "many-headers-429" => with_provider_headers(
+                json_resp(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    json!({"type":"error","error":{"type":"rate_limit_error","message":"Error"}}).to_string(),
+                ),
+                "true",
             ),
             "echo-key" if stream => slow_sse(vec![
                 (Duration::ZERO, ANTHROPIC_SSE.split("event: content_block_delta").next().unwrap().to_owned()),
@@ -238,13 +279,19 @@ async fn upstream_handler(State(up): State<Upstream>, req: Request) -> Response 
         },
         ("POST", "/v1/messages/count_tokens") => json_resp(StatusCode::OK, r#"{"input_tokens":42}"#.into()),
         ("GET", "/v1/models") => json_resp(StatusCode::OK, r#"{"data":[{"id":"test-model"}]}"#.into()),
-        ("POST", "/v1/chat/completions") => {
-            if stream {
-                sse(OPENAI_SSE_WITH_USAGE)
-            } else {
-                json_resp(StatusCode::OK, OPENAI_JSON.into())
-            }
-        }
+        ("POST", "/v1/chat/completions") => match model {
+            "many-headers" => with_provider_headers(json_resp(StatusCode::OK, OPENAI_JSON.into()), "false"),
+            "many-headers-429" => with_provider_headers(
+                json_resp(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    json!({"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}})
+                        .to_string(),
+                ),
+                "true",
+            ),
+            _ if stream => sse(OPENAI_SSE_WITH_USAGE),
+            _ => json_resp(StatusCode::OK, OPENAI_JSON.into()),
+        },
         ("GET", "/v1/models/") | ("GET", "/v1/models/x") => json_resp(StatusCode::OK, "{}".into()),
         _ => (StatusCode::IM_A_TEAPOT, "unexpected upstream path").into_response(),
     }

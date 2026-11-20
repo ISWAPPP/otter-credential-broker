@@ -59,8 +59,10 @@ use crate::tls::{ClientSettings, http_client};
 
 /// Response headers passed back to the caller. Everything else (cookies,
 /// provider account and rate-limit details, hop-by-hop headers) is dropped.
+/// `x-should-retry` is how a provider tells SDKs whether an error is worth
+/// retrying; without it they guess from the status.
 const FORWARDED_RESPONSE_HEADERS: &[&str] =
-    &["content-type", "cache-control", "retry-after", "request-id", "x-request-id"];
+    &["content-type", "cache-control", "retry-after", "request-id", "x-request-id", "x-should-retry"];
 
 /// Chunks buffered between the exchange task and a caller.
 const CLIENT_BUFFER: usize = 32;
