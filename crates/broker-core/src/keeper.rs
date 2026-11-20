@@ -19,7 +19,7 @@ use crate::clock::{Clock, Timestamp};
 use crate::crypto::{Envelope, secret_context};
 use crate::error::BrokerError;
 use crate::llm::pricing::ModelPrice;
-use crate::llm::{LLM_KEY_KIND, provider_key_secret_name};
+use crate::llm::{LLM_KEY_KIND, ProviderAccess, provider_key_secret_name};
 use crate::secret::Secret;
 use crate::store::{
     AuditEntry, AuditEvent, JobTokenInfo, LlmGrantRow, LlmTokenInfo, NewJobTokenRow, NewLlmTokenRow, NewSecretRow,
@@ -487,11 +487,18 @@ impl Keeper {
         }
     }
 
-    /// Validates an LLM token for one proxied request and counts it against
-    /// the token's rate limit. No caching: revocation takes effect on the next
-    /// request, on every replica.
+    /// Validates an LLM token for one proxied request to `provider` and
+    /// counts it against the token's rate limit. A token with a `providers`
+    /// list may use only those; a provider with [`ProviderAccess::Explicit`]
+    /// only serves tokens whose list names it. No caching: revocation takes
+    /// effect on the next request, on every replica.
     #[tracing::instrument(name = "keeper.llm.authorize", skip_all, fields(provider = %provider))]
-    pub async fn authorize_llm(&self, presented: &str, provider: &str) -> Result<LlmGrant, BrokerError> {
+    pub async fn authorize_llm(
+        &self,
+        presented: &str,
+        provider: &str,
+        access: ProviderAccess,
+    ) -> Result<LlmGrant, BrokerError> {
         let digest = self.hasher.parse(TokenKind::Llm, presented).ok_or(BrokerError::Unauthorized)?;
         let now = self.clock.now();
         let row = self.store.authorize_llm(&digest, now, now.div_euclid(60)).await?.ok_or(BrokerError::Unauthorized)?;
@@ -499,10 +506,16 @@ impl Keeper {
             integrity_failure("llm_tokens", &row.id);
             return Err(BrokerError::Unauthorized);
         }
-        if let Some(allowed) = &row.providers
-            && !allowed.iter().any(|p| p == provider)
-        {
-            return Err(BrokerError::Forbidden(format!("this LLM token may not use provider {provider}")));
+        match (&row.providers, access) {
+            (Some(allowed), _) if !allowed.iter().any(|p| p == provider) => {
+                return Err(BrokerError::Forbidden(format!("this LLM token may not use provider {provider}")));
+            }
+            (None, ProviderAccess::Explicit) => {
+                return Err(BrokerError::Forbidden(format!(
+                    "provider {provider} only serves LLM tokens that name it in providers"
+                )));
+            }
+            _ => {}
         }
         if row.rl_count > row.rate_limit_per_minute {
             metrics::counter!("ocb_llm_rate_limited_total", "tenant" => row.tenant_id.clone()).increment(1);

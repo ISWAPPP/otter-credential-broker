@@ -18,8 +18,9 @@ struct Routes {
     gateway: Upstream,
 }
 
-/// Providers `anthropic` and `gateway` (both of the Anthropic kind) and
-/// `openai`; tenant-a has a key for each.
+/// Providers `anthropic` and `gateway` (both of the Anthropic kind; the
+/// gateway only serves tokens that name it) and `openai`; tenant-a has a key
+/// for each.
 async fn routes() -> Option<Routes> {
     let (anthropic, a) = start_upstream().await;
     let (openai, o) = start_upstream().await;
@@ -40,6 +41,7 @@ async fn routes() -> Option<Routes> {
         kind = "anthropic"
         base_url = "http://{g}"
         allow_http = true
+        access = "explicit"
 
         [[llm.pricing]]
         provider = "anthropic"
@@ -72,7 +74,7 @@ async fn usage(env: &Env) -> Vec<Value> {
 async fn each_route_reaches_exactly_its_provider() {
     let Some(r) = routes().await else { return };
     let env = &r.env;
-    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    let (token, _) = env.llm_token("tenant-a", json!({"providers": ["anthropic", "gateway", "openai"]})).await;
     let anthropic = || Some(anthropic_body("test-model", false));
     let openai = || Some(openai_body("gpt-test", false, false));
     // (method, path, body, index of the upstream that must see it, key it must carry)
@@ -106,7 +108,7 @@ async fn each_route_reaches_exactly_its_provider() {
 async fn other_paths_reach_no_provider() {
     let Some(r) = routes().await else { return };
     let env = &r.env;
-    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    let (token, _) = env.llm_token("tenant-a", json!({"providers": ["anthropic", "gateway", "openai"]})).await;
     for uri in [
         // A route that implies a kind only reaches providers of that kind.
         "/llm/openai/gateway/v1/messages",
@@ -142,5 +144,31 @@ async fn other_paths_reach_no_provider() {
     assert_eq!((resp.status, resp.json()["type"].as_str()), (StatusCode::NOT_FOUND, Some("error")));
     let resp = env.llm("POST", "/llm/p/unknown/v1/messages", &[("x-api-key", &token)], None).await;
     assert_eq!(resp.json()["error"]["code"], "not_found");
+    r.env.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_explicit_provider_serves_only_tokens_that_name_it() {
+    let Some(r) = routes().await else { return };
+    let env = &r.env;
+    let (unlisted, _) = env.llm_token("tenant-a", json!({})).await;
+    let (named, _) = env.llm_token("tenant-a", json!({"providers": ["gateway"]})).await;
+    let (other, _) = env.llm_token("tenant-a", json!({"providers": ["anthropic"]})).await;
+    let call = |token: String, uri: &'static str| async move {
+        env.llm("POST", uri, &[("x-api-key", &token)], Some(anthropic_body("test-model", false))).await
+    };
+    // A token without a provider list keeps reaching implicit providers...
+    assert_eq!(call(unlisted.clone(), "/llm/p/anthropic/v1/messages").await.status, StatusCode::OK);
+    // ...but not the explicit one, and neither does a list without it.
+    for token in [unlisted, other] {
+        let resp = call(token, "/llm/p/gateway/v1/messages").await;
+        assert_eq!(resp.status, StatusCode::FORBIDDEN, "{}", resp.text());
+        assert_eq!(resp.json()["error"]["type"], "permission_error");
+    }
+    assert_eq!(r.gateway.count(), 0);
+    let resp = call(named.clone(), "/llm/p/gateway/v1/messages").await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
+    assert_eq!(r.gateway.last().headers.get("x-api-key").unwrap(), GATEWAY_KEY);
+    assert_eq!(call(named, "/llm/p/anthropic/v1/messages").await.status, StatusCode::FORBIDDEN);
     r.env.cleanup().await;
 }

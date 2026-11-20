@@ -59,6 +59,26 @@ impl ProviderKind {
     }
 }
 
+/// Which LLM tokens of a tenant may use a provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAccess {
+    /// Every token, unless its `providers` list leaves the provider out.
+    #[default]
+    Implicit,
+    /// Only tokens whose `providers` list names the provider.
+    Explicit,
+}
+
+impl ProviderAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Implicit => "implicit",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
     Get,

@@ -278,11 +278,9 @@ pub fn price(provider: &str, model: &str, input: f64, output: f64, cache_read: O
 fn default_llm(o: &EnvOptions, upstream_addr: SocketAddr) -> LlmConfig {
     let mut providers = BTreeMap::new();
     let mk = |kind, base_url: String| ProviderConfig {
-        kind,
-        base_url,
         allow_http: true,
-        propagate_trace_context: true,
         require_stream_usage: o.require_stream_usage,
+        ..ProviderConfig::new(kind, base_url)
     };
     providers.insert("anthropic".into(), mk(ProviderKind::Anthropic, format!("http://{upstream_addr}")));
     providers.insert("deepseek".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1")));

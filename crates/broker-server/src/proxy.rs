@@ -301,7 +301,7 @@ async fn proxy(
             return reject(kind, &e);
         }
     };
-    let grant = match st.keeper.authorize_llm(token.expose(), provider_id).await {
+    let grant = match st.keeper.authorize_llm(token.expose(), provider_id, provider.access).await {
         Ok(g) => g,
         Err(e) => {
             if matches!(e, BrokerError::Unauthorized) {

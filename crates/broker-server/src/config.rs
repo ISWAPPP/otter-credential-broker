@@ -9,8 +9,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use broker_core::KeeperSettings;
-use broker_core::llm::ProviderKind;
 use broker_core::llm::pricing::{ModelPrice, PriceTable};
+use broker_core::llm::{ProviderAccess, ProviderKind};
 use broker_core::validate;
 use figment::Figment;
 use figment::providers::{Data, Env, Format, Serialized, Toml};
@@ -161,10 +161,29 @@ pub struct ProviderConfig {
     /// modified and usage would otherwise be missing.
     #[serde(default = "yes")]
     pub require_stream_usage: bool,
+    /// `implicit`: every LLM token of a tenant may use the provider unless
+    /// its `providers` list leaves it out. `explicit`: only tokens whose
+    /// `providers` list names it.
+    #[serde(default)]
+    pub access: ProviderAccess,
 }
 
 fn yes() -> bool {
     true
+}
+
+impl ProviderConfig {
+    /// A provider with every optional setting at its default.
+    pub fn new(kind: ProviderKind, base_url: impl Into<String>) -> Self {
+        Self {
+            kind,
+            base_url: base_url.into(),
+            allow_http: false,
+            propagate_trace_context: true,
+            require_stream_usage: true,
+            access: ProviderAccess::default(),
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -258,6 +277,7 @@ pub struct Provider {
     pub base_url: String,
     pub propagate_trace_context: bool,
     pub require_stream_usage: bool,
+    pub access: ProviderAccess,
 }
 
 impl LlmConfig {
@@ -294,6 +314,7 @@ impl LlmConfig {
                     base_url: url.as_str().trim_end_matches('/').to_owned(),
                     propagate_trace_context: p.propagate_trace_context,
                     require_stream_usage: p.require_stream_usage,
+                    access: p.access,
                 },
             );
         }
@@ -325,13 +346,7 @@ mod tests {
     use super::*;
 
     fn provider(kind: ProviderKind, base_url: &str) -> ProviderConfig {
-        ProviderConfig {
-            kind,
-            base_url: base_url.into(),
-            allow_http: false,
-            propagate_trace_context: true,
-            require_stream_usage: true,
-        }
+        ProviderConfig::new(kind, base_url)
     }
 
     #[test]
@@ -371,6 +386,28 @@ mod tests {
         let (p, _) = c.validate().unwrap();
         assert_eq!(p["gateway"].kind, ProviderKind::Anthropic);
         assert_eq!(p["gateway"].base_url, "https://gateway.example:8443");
+    }
+
+    #[test]
+    fn provider_access() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.anthropic]
+            kind = "anthropic"
+            base_url = "https://api.anthropic.com"
+
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example"
+            access = "explicit"
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        assert_eq!(p["anthropic"].access, ProviderAccess::Implicit);
+        assert_eq!(p["gateway"].access, ProviderAccess::Explicit);
+        let bad = "[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\naccess = \"open\"\n";
+        assert!(ServerConfig::parse(bad).is_err());
     }
 
     #[test]
