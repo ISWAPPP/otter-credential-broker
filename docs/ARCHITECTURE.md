@@ -495,7 +495,8 @@ that are summed when read.
   `/llm/_/limits` says only `ok`, `near` or `exhausted`, and when that
   changes. The exact numbers are in the admin API and in the metrics.
 - `GET /llm/_/limits` checks the token with a read and its MAC, counts no
-  request, and has a limit of its own per token and replica.
+  request, and has a limit of its own per token and replica, counted for
+  tokens that are found.
 - `ocb_limit_quota`, `ocb_limit_remaining` and
   `ocb_llm_token_expiry_timestamp` are read from the database every 30
   seconds on each replica (OBSERVABILITY.md).
@@ -508,7 +509,7 @@ that are summed when read.
 | Requests in flight per tenant | `concurrent` of the tenant | same, level `tenant` |
 | Requests in flight per provider | `concurrent` of the provider | same, level `global` |
 | Requests in flight in total | `llm.max_concurrent_total` | same, level `global`, naming no provider: "the broker has too many requests in flight" |
-| Requests to `/llm/_/limits` per token and minute | `llm.limits_endpoint_per_minute` | 429 |
+| Requests to `/llm/_/limits` per token and minute | `llm.limits_endpoint_per_minute` | 429; counted for tokens that are found, at most 10 000 of them per minute |
 | Failed token checks per client address and minute | `http.auth_failures_per_minute` | 429 without a database lookup (proxy, `/llm/_/limits` and worker endpoint) |
 | Open connections per listener | `http.max_connections` | further clients wait in the listen backlog |
 | Time to receive complete request headers | `http.header_read_timeout_secs` | connection closed |

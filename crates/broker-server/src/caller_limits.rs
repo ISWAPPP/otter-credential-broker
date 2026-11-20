@@ -3,8 +3,9 @@
 //! The token is checked without counting a request (a read and the row's
 //! MAC), so asking does not use up the token's rate limit; instead the
 //! endpoint has a small limit of its own per token and replica
-//! (`llm.limits_endpoint_per_minute`), and failed token checks count
-//! against the caller's address as on the proxy. The answer holds the
+//! (`llm.limits_endpoint_per_minute`), counted for tokens that are found
+//! and checked before the lookup, and failed token checks count against
+//! the caller's address as on the proxy. The answer holds the
 //! caller's token and tenant, with their numbers, and for each provider the
 //! token may use, only how near its limits for every tenant are (`ok`,
 //! `near` or `exhausted`) and when that changes: their numbers come from
@@ -137,14 +138,22 @@ pub async fn view(State(st): State<AppState>, req: Request) -> Response {
     let Some(digest) = caller_token(req.headers()).ok().and_then(|t| st.keeper.llm_token_digest(&t)) else {
         return failed();
     };
-    if !st.proxy.limits_views().allow(&digest) {
-        return refuse(BrokerError::RateLimited { retry_after_secs: seconds_to_next_minute() });
+    // Only tokens that are found are counted, so that made-up ones cannot
+    // fill the limiter; one that used up its limit is refused before the
+    // lookup.
+    let views = st.proxy.limits_views();
+    let over = || refuse(BrokerError::RateLimited { retry_after_secs: seconds_to_next_minute() });
+    if views.exceeded(&digest) {
+        return over();
     }
     let seen = match st.keeper.inspect_llm_token(&digest).await {
         Ok(s) => s,
         Err(BrokerError::Unauthorized) => return failed(),
         Err(e) => return refuse(e),
     };
+    if !views.allow(&digest) {
+        return over();
+    }
     let (t, at, tenant_limits) = (&seen.token, seen.at, &seen.tenant_limits);
     let snap = st.proxy.snapshot();
     // The providers this token may use, in id order.

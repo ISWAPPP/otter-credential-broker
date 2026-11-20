@@ -110,7 +110,7 @@ pub struct LlmProxy {
     tracker: TaskTracker,
     shutdown: CancellationToken,
     inflight: Arc<Inflight>,
-    /// Requests to `GET /llm/_/limits` per token.
+    /// Requests to `GET /llm/_/limits` per valid token.
     limits_views: MinuteLimiter<TokenDigest>,
 }
 
@@ -176,7 +176,8 @@ impl LlmProxy {
         &self.inflight
     }
 
-    pub(crate) fn limits_views(&self) -> &MinuteLimiter<TokenDigest> {
+    /// Requests to `GET /llm/_/limits`, per valid token.
+    pub fn limits_views(&self) -> &MinuteLimiter<TokenDigest> {
         &self.limits_views
     }
 }

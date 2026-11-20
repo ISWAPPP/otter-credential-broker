@@ -177,7 +177,9 @@ impl Drop for InflightPermit {
 }
 
 /// Fixed one-minute windows of requests per key, for endpoints that are
-/// cheap to call in a loop and should not be.
+/// cheap to call in a loop and should not be. At most [`MAX_TRACKED_KEYS`]
+/// keys are kept: while that many have requests in the current window, a
+/// new key is refused.
 pub struct MinuteLimiter<K> {
     max_per_minute: u32,
     windows: Mutex<HashMap<K, (u64, u32)>>,
@@ -188,13 +190,33 @@ impl<K: Eq + std::hash::Hash + Clone> MinuteLimiter<K> {
         Self { max_per_minute: max_per_minute.max(1), windows: Mutex::new(HashMap::new()) }
     }
 
+    fn windows(&self) -> MutexGuard<'_, HashMap<K, (u64, u32)>> {
+        self.windows.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `key` has used up its limit in the current window. Counts
+    /// nothing, so it can be asked before the key is known to be valid.
+    pub fn exceeded(&self, key: &K) -> bool {
+        self.exceeded_at(key, minute())
+    }
+
+    fn exceeded_at(&self, key: &K, now: u64) -> bool {
+        self.windows().get(key).is_some_and(|(w, n)| *w == now && *n >= self.max_per_minute)
+    }
+
     /// Counts a request of `key`; `false` once the key is over its limit in
-    /// the current window.
+    /// the current window, or when it is new and the limiter is full.
     pub fn allow(&self, key: &K) -> bool {
-        let now = minute();
-        let mut m = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
-        if m.len() >= MAX_TRACKED_ADDRESSES && !m.contains_key(key) {
+        self.allow_at(key, minute())
+    }
+
+    fn allow_at(&self, key: &K, now: u64) -> bool {
+        let mut m = self.windows();
+        if m.len() >= MAX_TRACKED_KEYS && !m.contains_key(key) {
             m.retain(|_, (w, _)| *w == now);
+            if m.len() >= MAX_TRACKED_KEYS {
+                return false;
+            }
         }
         let e = m.entry(key.clone()).or_insert((now, 0));
         if e.0 != now {
@@ -202,6 +224,11 @@ impl<K: Eq + std::hash::Hash + Clone> MinuteLimiter<K> {
         }
         e.1 = e.1.saturating_add(1);
         e.1 <= self.max_per_minute
+    }
+
+    /// Keys kept now (for tests and diagnostics).
+    pub fn tracked(&self) -> usize {
+        self.windows().len()
     }
 }
 
@@ -211,7 +238,9 @@ pub struct AuthFailureLimiter {
     windows: Mutex<HashMap<IpAddr, (u64, u32)>>,
 }
 
-const MAX_TRACKED_ADDRESSES: usize = 10_000;
+/// Keys (client addresses, tokens) a limiter keeps before it drops those of
+/// earlier minutes; a [`MinuteLimiter`] never keeps more.
+const MAX_TRACKED_KEYS: usize = 10_000;
 
 fn minute() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() / 60).unwrap_or(0)
@@ -244,7 +273,7 @@ impl AuthFailureLimiter {
         let Some(addr) = addr else { return };
         let now = minute();
         if let Ok(mut m) = self.windows.lock() {
-            if m.len() >= MAX_TRACKED_ADDRESSES {
+            if m.len() >= MAX_TRACKED_KEYS {
                 m.retain(|_, (w, _)| *w == now);
             }
             let e = m.entry(addr).or_insert((now, 0));
@@ -318,9 +347,28 @@ mod tests {
     #[test]
     fn requests_per_key_and_minute() {
         let l = MinuteLimiter::new(2);
+        assert!(!l.exceeded(&"a"));
         assert!(l.allow(&"a") && l.allow(&"a"));
+        assert!(l.exceeded(&"a"), "used up, without counting another");
         assert!(!l.allow(&"a"));
         assert!(l.allow(&"b"), "keys are counted apart");
+        assert!(!l.exceeded(&"c") && l.tracked() == 2, "asking keeps nothing");
+    }
+
+    #[test]
+    fn a_minute_limiter_keeps_no_more_keys_than_its_cap() {
+        let l = MinuteLimiter::new(2);
+        for k in 0..MAX_TRACKED_KEYS {
+            assert!(l.allow_at(&k, 7));
+        }
+        assert!(!l.allow_at(&MAX_TRACKED_KEYS, 7), "a new key while full");
+        assert_eq!(l.tracked(), MAX_TRACKED_KEYS);
+        assert!(l.allow_at(&0, 7), "a key it keeps is still counted");
+        assert!(!l.allow_at(&0, 7) && l.exceeded_at(&0, 7));
+        // The next minute makes room: the old windows go.
+        assert!(l.allow_at(&MAX_TRACKED_KEYS, 8));
+        assert_eq!(l.tracked(), 1);
+        assert!(!l.exceeded_at(&0, 8));
     }
 
     #[test]

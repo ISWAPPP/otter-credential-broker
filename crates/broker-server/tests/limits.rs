@@ -694,6 +694,12 @@ async fn the_limits_endpoint_has_a_rate_limit_of_its_own() {
     env.seed_keys().await;
     let (a, _) = env.llm_token("tenant-a", json!({})).await;
     let (b, _) = env.llm_token("tenant-a", json!({})).await;
+    // Made-up tokens are refused and kept nowhere: the limit counts tokens
+    // that are found.
+    for i in 0..5 {
+        assert_eq!(limits_of(&env, &format!("ocb_llm_{i:064}")).await.status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(env.state.proxy.limits_views().tracked(), 0);
     let start = minute();
     let codes: Vec<StatusCode> = join_all((0..4).map(|_| limits_of(&env, &a))).await.iter().map(|r| r.status).collect();
     let other = limits_of(&env, &b).await;
@@ -703,6 +709,7 @@ async fn the_limits_endpoint_has_a_rate_limit_of_its_own() {
         assert_eq!(codes.iter().filter(|c| **c == StatusCode::TOO_MANY_REQUESTS).count(), 1, "{codes:?}");
         assert_eq!(other.status, StatusCode::OK);
     }
+    assert_eq!(env.state.proxy.limits_views().tracked(), 2);
     // Failed token checks count against the caller's address, as on the
     // proxy: after two, even a valid token is refused from there.
     let public = env.serve_public().await;

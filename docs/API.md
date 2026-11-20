@@ -141,9 +141,9 @@ these names:
 `GET /llm/_/limits` shows a caller its limits, with its LLM token
 (`x-api-key` or `Authorization: Bearer`). It reads the token without counting
 a request, so asking does not use up the token's rate limit; instead it
-allows `llm.limits_endpoint_per_minute` requests per token and minute on
-each replica, and failed token checks count against the caller's address as
-on the proxy. Errors use the shape of the admin API. The answer holds the
+allows `llm.limits_endpoint_per_minute` requests per valid token and minute
+on each replica, and failed token checks count against the caller's address
+as on the proxy. Errors use the shape of the admin API. The answer holds the
 caller's token and tenant, and for every provider the token may use only how
 near the provider's limits are: `ok`, `near` (less than a tenth left of a
 limit) or `exhausted`, and when that gets better.
