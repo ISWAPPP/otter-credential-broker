@@ -177,9 +177,9 @@ impl Drop for InflightPermit {
 }
 
 /// Fixed one-minute windows of requests per key, for endpoints that are
-/// cheap to call in a loop and should not be. At most [`MAX_TRACKED_KEYS`]
-/// keys are kept: while that many have requests in the current window, a
-/// new key is refused.
+/// cheap to call in a loop and should not be. At most `MAX_TRACKED_KEYS`
+/// (10 000) keys are kept: while that many have requests in the current
+/// window, a new key is refused.
 pub struct MinuteLimiter<K> {
     max_per_minute: u32,
     windows: Mutex<HashMap<K, (u64, u32)>>,
