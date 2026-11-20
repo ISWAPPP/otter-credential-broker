@@ -1092,18 +1092,21 @@ impl Store {
     /// fails without an answer, the connection lost, may still have taken
     /// effect, and a caller that repeats the write would then add usage and
     /// give back reservations twice. So its outcome is asked of PostgreSQL,
-    /// which keeps the status of recent transactions (`pg_xact_status`),
-    /// waiting a little while it is still running: `Ok` once it took effect,
-    /// the commit's error once it did not, and
-    /// [`BrokerError::CommitUnknown`] when that cannot be told.
+    /// which keeps the status of recent transactions (`pg_xact_status`), a
+    /// few times within a few seconds, while it is still running or the
+    /// database does not answer: `Ok` once it took effect, the commit's
+    /// error once it did not, and [`BrokerError::CommitUnknown`] when that
+    /// cannot be told.
     async fn commit_accounting(&self, tx: Transaction<'_, Postgres>, xid: &str) -> Result<(), BrokerError> {
         let Err(e) = tx.commit().await else { return Ok(()) };
         for wait_ms in [0, 50, 200, 500] {
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-            match self.transaction_committed(xid).await {
-                Ok(Some(true)) => return Ok(()),
-                Ok(Some(false)) => return Err(e.into()),
-                Ok(None) | Err(_) => {}
+            // Bounded: waiting for a connection could take the pool's whole
+            // acquire timeout each time.
+            match tokio::time::timeout(Duration::from_secs(2), self.transaction_committed(xid)).await {
+                Ok(Ok(Some(true))) => return Ok(()),
+                Ok(Ok(Some(false))) => return Err(e.into()),
+                _ => {}
             }
         }
         Err(BrokerError::CommitUnknown(e.to_string()))
