@@ -25,7 +25,6 @@
 //!
 //! Request and response bodies, keys and tokens are never logged.
 
-use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,7 +34,6 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use broker_core::keeper::LlmGrant;
-use broker_core::llm::pricing::PriceTable;
 use broker_core::llm::scrub::{StreamRedactor, scrub_error_body};
 use broker_core::llm::usage::{TapReport, Usage, UsageSource, UsageTap};
 use broker_core::llm::{Endpoint, HttpMethod, ProviderKind};
@@ -52,10 +50,11 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::AppState;
 use crate::admin::auth_failure;
-use crate::config::{LlmConfig, Provider};
+use crate::config::LlmConfig;
 use crate::error::{classify, llm_error, llm_error_response};
 use crate::limits::{Inflight, InflightPermit, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
+use crate::registry::{ProviderSnapshot, SnapshotCell, publish};
 
 /// Response headers passed back to the caller. Everything else (cookies,
 /// provider account and rate-limit details, hop-by-hop headers) is dropped.
@@ -67,13 +66,38 @@ const CLIENT_BUFFER: usize = 32;
 /// Upper bound for a request's `max_tokens` used in conservative estimates.
 const MAX_TOKENS_CAP: u64 = 10_000_000;
 
-/// Shared proxy state: validated providers, prices, the upstream client and
-/// the exchange tasks.
+/// Proxy settings that only change with a restart.
+#[derive(Debug, Clone, Copy)]
+struct Settings {
+    max_request_bytes: usize,
+    request_read_timeout: Duration,
+    response_timeout: Duration,
+    idle_timeout: Duration,
+    max_error_body_bytes: usize,
+    max_buffered_response_bytes: usize,
+}
+
+impl Settings {
+    fn from(cfg: &LlmConfig) -> Self {
+        Self {
+            max_request_bytes: cfg.max_request_bytes,
+            request_read_timeout: Duration::from_secs(cfg.request_read_timeout_secs),
+            response_timeout: Duration::from_secs(cfg.response_timeout_secs),
+            idle_timeout: Duration::from_secs(cfg.idle_timeout_secs),
+            max_error_body_bytes: cfg.max_error_body_bytes,
+            max_buffered_response_bytes: cfg.max_buffered_response_bytes,
+        }
+    }
+}
+
+/// The proxy of one process. Providers and prices sit in a snapshot that a
+/// configuration reload replaces; everything else lives as long as the
+/// process and is never replaced: the exchange tasks (which shutdown waits
+/// for), the shutdown switch, the in-flight limits and the upstream client.
 pub struct LlmProxy {
-    providers: BTreeMap<String, Provider>,
-    prices: PriceTable,
+    snapshot: SnapshotCell,
     http: reqwest::Client,
-    cfg: LlmConfig,
+    settings: Settings,
     tracker: TaskTracker,
     shutdown: CancellationToken,
     inflight: Arc<Inflight>,
@@ -81,7 +105,7 @@ pub struct LlmProxy {
 
 impl LlmProxy {
     pub fn new(cfg: &LlmConfig) -> Result<Self, String> {
-        let (providers, prices) = cfg.validate()?;
+        let snapshot = ProviderSnapshot::build(cfg)?;
         // No read timeout on the client: it would also cut the wait for the
         // response headers, which for non-streaming requests lasts the whole
         // generation. The idle timeout is applied between body chunks by the
@@ -96,19 +120,38 @@ impl LlmProxy {
             .user_agent(concat!("otter-credential-broker/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
+        publish(&snapshot);
         Ok(Self {
-            providers,
-            prices,
+            snapshot: SnapshotCell::new(snapshot),
             http,
-            cfg: cfg.clone(),
+            settings: Settings::from(cfg),
             tracker: TaskTracker::new(),
             shutdown: CancellationToken::new(),
             inflight: Inflight::new(cfg.max_concurrent_per_token, cfg.max_concurrent_total),
         })
     }
 
+    /// The providers and prices new requests use.
+    pub fn snapshot(&self) -> Arc<ProviderSnapshot> {
+        self.snapshot.load()
+    }
+
+    /// Builds a snapshot from the providers and prices of `cfg` without
+    /// installing it. Only `llm.providers` and `llm.pricing` are taken from
+    /// `cfg`: the other settings of the proxy keep their values from start.
+    pub fn prepare(&self, cfg: &LlmConfig) -> Result<ProviderSnapshot, String> {
+        ProviderSnapshot::build(cfg)
+    }
+
+    /// Makes `next` the snapshot of new requests. Requests already running
+    /// finish with the snapshot they started with.
+    pub fn install(&self, next: ProviderSnapshot) {
+        publish(&next);
+        self.snapshot.replace(next);
+    }
+
     pub fn has_provider(&self, id: &str) -> bool {
-        self.providers.contains_key(id)
+        self.snapshot().provider(id).is_some()
     }
 
     /// Exchange tasks still running (each finishes with its accounting).
@@ -267,8 +310,10 @@ async fn proxy(
 ) -> Response {
     let started = Instant::now();
     let px = st.proxy.clone();
-    let found = px.providers.get(provider_id).filter(|p| route_kind.is_none_or(|k| p.kind == k)).cloned();
-    let Some(provider) = found else {
+    // Taken once: the request keeps these providers and prices to the end of
+    // its accounting, whatever a reload does in the meantime.
+    let snap = px.snapshot();
+    let Some(provider) = snap.provider(provider_id).filter(|p| route_kind.is_none_or(|k| p.kind == k)) else {
         // Without a provider there is no error shape to copy; the generic
         // route answers in the OpenAI-compatible one.
         return reject(
@@ -317,8 +362,8 @@ async fn proxy(
 
     let (parts, body) = req.into_parts();
     let read = tokio::time::timeout(
-        Duration::from_secs(px.cfg.request_read_timeout_secs),
-        axum::body::to_bytes(body, px.cfg.max_request_bytes),
+        px.settings.request_read_timeout,
+        axum::body::to_bytes(body, px.settings.max_request_bytes),
     )
     .await;
     let body = match read {
@@ -326,7 +371,7 @@ async fn proxy(
         Ok(Err(_)) => {
             return reject(
                 kind,
-                &BrokerError::TooLarge(format!("request body exceeds {} bytes", px.cfg.max_request_bytes)),
+                &BrokerError::TooLarge(format!("request body exceeds {} bytes", px.settings.max_request_bytes)),
             );
         }
         Err(_) => return reject(kind, &BrokerError::Invalid("request body was not received in time".into())),
@@ -340,7 +385,7 @@ async fn proxy(
         Probe::default()
     };
     let streaming = probe.stream.unwrap_or(false);
-    let request_price = probe.model.as_deref().and_then(|m| px.prices.lookup(provider.price_source(), m));
+    let request_price = probe.model.as_deref().and_then(|m| snap.prices().lookup(provider.price_source(), m));
     if endpoint.billable {
         if let Err(e) = grant.check_budget(probe.model.as_deref(), request_price) {
             let what = match (&e, grant.budget_tokens) {
@@ -441,7 +486,7 @@ async fn proxy(
 
     let fin = Finisher {
         keeper: st.keeper.clone(),
-        prices: px.clone(),
+        snapshot: snap.clone(),
         span: span.clone(),
         grant,
         provider: provider_id.to_owned(),
@@ -461,9 +506,9 @@ async fn proxy(
         key,
         token,
         fin,
-        max_error_body: px.cfg.max_error_body_bytes,
-        json_cap: px.cfg.max_buffered_response_bytes,
-        idle: Duration::from_secs(px.cfg.idle_timeout_secs),
+        max_error_body: px.settings.max_error_body_bytes,
+        json_cap: px.settings.max_buffered_response_bytes,
+        idle: px.settings.idle_timeout,
         shutdown: px.shutdown.clone(),
         _permit: permit,
     };
@@ -473,7 +518,7 @@ async fn proxy(
 
     // Wait for the response head. If this times out, or the caller goes away
     // (this future is dropped), the exchange carries on and accounts by itself.
-    match tokio::time::timeout(Duration::from_secs(px.cfg.response_timeout_secs), head_rx).await {
+    match tokio::time::timeout(px.settings.response_timeout, head_rx).await {
         Ok(Ok(Head::Stream { status, headers, rx, abort })) => {
             let mut r = Response::new(client_body(rx, abort));
             *r.status_mut() = status;
@@ -753,7 +798,8 @@ impl Exchange {
 /// Everything needed to account for a request once its exchange is over.
 struct Finisher {
     keeper: Arc<Keeper>,
-    prices: Arc<LlmProxy>,
+    /// The snapshot the request started with: its prices apply.
+    snapshot: Arc<ProviderSnapshot>,
     span: Span,
     grant: LlmGrant,
     provider: String,
@@ -805,7 +851,7 @@ impl Finisher {
         let duration = self.started.elapsed();
         let u = report.usage;
         let (price, fallback) =
-            self.prices.prices.billing_price(&self.price_source, self.model.as_deref(), report.model.as_deref());
+            self.snapshot.prices().billing_price(&self.price_source, self.model.as_deref(), report.model.as_deref());
         if fallback {
             tracing::warn!("provider reported a model without a configured price; billed at the highest known price");
             metrics::counter!("ocb_llm_unpriced_response_model_total", "provider" => self.provider.clone())

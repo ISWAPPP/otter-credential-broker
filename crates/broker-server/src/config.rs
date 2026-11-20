@@ -38,6 +38,10 @@ pub struct ServerConfig {
     /// File with the token key (64 hex chars): keys the digests of issued
     /// tokens and the MACs of token rows. Changing it invalidates all tokens.
     pub token_key_file: PathBuf,
+    /// How often the config file is checked for changes. Changes to
+    /// `llm.providers` and `llm.pricing` apply without a restart; other
+    /// changes are reported as needing one. 0 turns checking off.
+    pub reload_interval_secs: u64,
     pub http: HttpSettings,
     pub keeper: KeeperSettings,
     pub llm: LlmConfig,
@@ -218,6 +222,7 @@ impl Default for ServerConfig {
             },
             admin_tokens_file: PathBuf::from("/etc/otter-credential-broker/admin/tokens"),
             token_key_file: PathBuf::from("/etc/otter-credential-broker/kek/token-key"),
+            reload_interval_secs: 5,
             http: HttpSettings::default(),
             keeper: KeeperSettings::default(),
             llm: LlmConfig::default(),
@@ -252,6 +257,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "kek",
     "admin_tokens_file",
     "token_key_file",
+    "reload_interval_secs",
     "http",
     "keeper",
     "llm",

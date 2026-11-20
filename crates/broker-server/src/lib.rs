@@ -15,8 +15,11 @@ pub mod error;
 pub mod limits;
 pub mod observe;
 pub mod proxy;
+pub mod registry;
+pub mod reload;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +52,7 @@ use tower_http::trace::TraceLayer;
 pub use config::ServerConfig;
 use limits::AuthFailureLimiter;
 pub use proxy::LlmProxy;
+use reload::Reloader;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -288,8 +292,30 @@ async fn drain(servers: &mut tokio::task::JoinSet<()>, proxy: &LlmProxy) {
     proxy.tracker().wait().await;
 }
 
+/// Staged shutdown: cancels `stop` so the listeners in `servers` stop
+/// accepting, lets in-flight requests (LLM streams included) finish within
+/// `grace`, then cuts what is left and waits for its accounting.
+pub async fn shutdown(
+    stop: &CancellationToken,
+    servers: &mut tokio::task::JoinSet<()>,
+    proxy: &LlmProxy,
+    grace: Duration,
+) {
+    stop.cancel();
+    if tokio::time::timeout(grace, drain(servers, proxy)).await.is_err() {
+        tracing::warn!("shutdown grace period over; cutting in-flight LLM requests");
+        proxy.abort_all();
+        // Cut exchanges are accounted conservatively before the process exits.
+        if tokio::time::timeout(Duration::from_secs(15), drain(servers, proxy)).await.is_err() {
+            tracing::error!("timed out waiting for usage accounting to finish");
+        }
+    }
+}
+
 /// Builds all components from config and serves until a shutdown signal.
-pub async fn serve(cfg: ServerConfig) -> anyhow::Result<()> {
+/// `config_file` is where `cfg` came from; it is checked for changes every
+/// `reload_interval_secs` (see [`reload`]).
+pub async fn serve(cfg: ServerConfig, config_file: Option<PathBuf>) -> anyhow::Result<()> {
     let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets(observe::LATENCY_BUCKETS)
         .context("metrics buckets")?
@@ -330,6 +356,10 @@ pub async fn serve(cfg: ServerConfig) -> anyhow::Result<()> {
     };
 
     let stop = CancellationToken::new();
+    if cfg.reload_interval_secs > 0 {
+        let reloader = Reloader::new(config_file, cfg.clone(), proxy.clone());
+        tokio::spawn(reloader.run(Duration::from_secs(cfg.reload_interval_secs), stop.clone()));
+    }
     let mut servers = tokio::task::JoinSet::new();
     for (name, addr, app) in [
         ("public", cfg.listen, public),
@@ -344,18 +374,7 @@ pub async fn serve(cfg: ServerConfig) -> anyhow::Result<()> {
         () = shutdown_signal() => tracing::info!("shutdown requested"),
         Some(res) = servers.join_next() => tracing::error!(?res, "a listener stopped unexpectedly"),
     }
-    // Stop accepting; let in-flight requests (including LLM streams) finish
-    // within the grace period, then cut what is left. Cut exchanges are
-    // accounted conservatively before the process exits.
-    stop.cancel();
-    let grace = Duration::from_secs(cfg.http.shutdown_grace_secs);
-    if tokio::time::timeout(grace, drain(&mut servers, &proxy)).await.is_err() {
-        tracing::warn!("shutdown grace period over; cutting in-flight LLM requests");
-        proxy.abort_all();
-        if tokio::time::timeout(Duration::from_secs(15), drain(&mut servers, &proxy)).await.is_err() {
-            tracing::error!("timed out waiting for usage accounting to finish");
-        }
-    }
+    shutdown(&stop, &mut servers, &proxy, Duration::from_secs(cfg.http.shutdown_grace_secs)).await;
     tracing::info!("shutdown complete");
     Ok(())
 }

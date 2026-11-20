@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve { config } => {
             let _guard = telemetry::init("otter-credential-broker")?;
-            broker_server::serve(load(config.as_deref())?).await
+            broker_server::serve(load(config.as_deref())?, config).await
         }
         Cmd::Migrate { config } => {
             let _guard = telemetry::init("otter-credential-broker")?;
