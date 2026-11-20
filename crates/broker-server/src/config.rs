@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use broker_core::KeeperSettings;
 use broker_core::llm::pricing::{ModelPrice, PriceTable};
-use broker_core::llm::{ProviderAccess, ProviderKind};
+use broker_core::llm::{Endpoint, HttpMethod, ProviderAccess, ProviderKind};
 use broker_core::validate;
 use figment::Figment;
 use figment::providers::{Data, Env, Format, Serialized, Toml};
@@ -166,6 +166,11 @@ pub struct ProviderConfig {
     /// `providers` list names it.
     #[serde(default)]
     pub access: ProviderAccess,
+    /// Endpoints served, by name: a subset of the kind's endpoints
+    /// (`messages`, `count_tokens`, `models` for `anthropic`;
+    /// `chat_completions`, `models` for `openai`). All of them when left out.
+    #[serde(default)]
+    pub endpoints: Option<Vec<String>>,
 }
 
 fn yes() -> bool {
@@ -182,6 +187,7 @@ impl ProviderConfig {
             propagate_trace_context: true,
             require_stream_usage: true,
             access: ProviderAccess::default(),
+            endpoints: None,
         }
     }
 }
@@ -278,6 +284,40 @@ pub struct Provider {
     pub propagate_trace_context: bool,
     pub require_stream_usage: bool,
     pub access: ProviderAccess,
+    /// The endpoints this provider serves (a subset of its kind's).
+    pub endpoints: Vec<&'static Endpoint>,
+}
+
+impl Provider {
+    /// The endpoint at `path` for `method`, if this provider serves it.
+    pub fn endpoint(&self, method: HttpMethod, path: &str) -> Option<&'static Endpoint> {
+        self.endpoints.iter().copied().find(|e| e.method == method && e.path == path)
+    }
+}
+
+/// The endpoints named in a provider's configuration; all of its kind's
+/// when none are named.
+fn provider_endpoints(id: &str, p: &ProviderConfig) -> Result<Vec<&'static Endpoint>, String> {
+    let Some(names) = &p.endpoints else { return Ok(p.kind.endpoints().iter().collect()) };
+    if names.is_empty() {
+        return Err(format!("llm.providers.{id}.endpoints: must not be empty (leave it out to allow all)"));
+    }
+    let mut out: Vec<&'static Endpoint> = Vec::new();
+    for name in names {
+        let Some(e) = p.kind.endpoint_named(name) else {
+            let known: Vec<&str> = p.kind.endpoints().iter().map(|e| e.name).collect();
+            return Err(format!(
+                "llm.providers.{id}.endpoints: {name:?} is not an endpoint of kind {}; known: {}",
+                p.kind.as_str(),
+                known.join(", ")
+            ));
+        };
+        if out.contains(&e) {
+            return Err(format!("llm.providers.{id}.endpoints: {name:?} is listed twice"));
+        }
+        out.push(e);
+    }
+    Ok(out)
 }
 
 impl LlmConfig {
@@ -315,6 +355,7 @@ impl LlmConfig {
                     propagate_trace_context: p.propagate_trace_context,
                     require_stream_usage: p.require_stream_usage,
                     access: p.access,
+                    endpoints: provider_endpoints(id, p)?,
                 },
             );
         }
@@ -408,6 +449,29 @@ mod tests {
         assert_eq!(p["gateway"].access, ProviderAccess::Explicit);
         let bad = "[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\naccess = \"open\"\n";
         assert!(ServerConfig::parse(bad).is_err());
+    }
+
+    #[test]
+    fn provider_endpoints() {
+        let mut c = LlmConfig::default();
+        let mut gw = provider(ProviderKind::Anthropic, "https://gateway.example");
+        gw.endpoints = Some(vec!["messages".into(), "count_tokens".into()]);
+        c.providers.insert("gateway".into(), gw);
+        c.providers.insert("deepseek".into(), provider(ProviderKind::Openai, "https://api.deepseek.com"));
+        let (p, _) = c.validate().unwrap();
+        let names = |id: &str| p[id].endpoints.iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names("gateway"), ["messages", "count_tokens"]);
+        assert_eq!(names("deepseek"), ["chat_completions", "models"]);
+        assert!(p["gateway"].endpoint(HttpMethod::Post, "v1/messages").is_some());
+        assert!(p["gateway"].endpoint(HttpMethod::Get, "v1/models").is_none());
+
+        for bad in [vec![], vec!["chat_completions"], vec!["v1/messages"], vec!["messages", "messages"]] {
+            let mut c = LlmConfig::default();
+            let mut gw = provider(ProviderKind::Anthropic, "https://gateway.example");
+            gw.endpoints = Some(bad.iter().map(|s| s.to_string()).collect());
+            c.providers.insert("gateway".into(), gw);
+            assert!(c.validate().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

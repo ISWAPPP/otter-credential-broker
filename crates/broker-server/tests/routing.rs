@@ -19,8 +19,8 @@ struct Routes {
 }
 
 /// Providers `anthropic` and `gateway` (both of the Anthropic kind; the
-/// gateway only serves tokens that name it) and `openai`; tenant-a has a key
-/// for each.
+/// gateway serves two endpoints, only to tokens that name it) and `openai`;
+/// tenant-a has a key for each.
 async fn routes() -> Option<Routes> {
     let (anthropic, a) = start_upstream().await;
     let (openai, o) = start_upstream().await;
@@ -42,6 +42,7 @@ async fn routes() -> Option<Routes> {
         base_url = "http://{g}"
         allow_http = true
         access = "explicit"
+        endpoints = ["messages", "count_tokens"]
 
         [[llm.pricing]]
         provider = "anthropic"
@@ -83,7 +84,6 @@ async fn each_route_reaches_exactly_its_provider() {
         ("POST", "/llm/p/anthropic/v1/messages", anthropic(), 0, KEY_A),
         ("POST", "/llm/p/gateway/v1/messages", anthropic(), 2, GATEWAY_KEY),
         ("POST", "/llm/p/gateway/v1/messages/count_tokens", anthropic(), 2, GATEWAY_KEY),
-        ("GET", "/llm/p/gateway/v1/models", None, 2, GATEWAY_KEY),
         ("POST", "/llm/openai/openai/chat/completions", openai(), 1, OPENAI_KEY),
         ("POST", "/llm/p/openai/chat/completions", openai(), 1, OPENAI_KEY),
         ("GET", "/llm/p/openai/models", None, 1, OPENAI_KEY),
@@ -100,7 +100,7 @@ async fn each_route_reaches_exactly_its_provider() {
     }
     let rows = usage(env).await;
     let by = |p: &str| rows.iter().filter(|u| u["provider"] == p).count();
-    assert_eq!((by("anthropic"), by("openai"), by("gateway")), (2, 3, 3), "{rows:?}");
+    assert_eq!((by("anthropic"), by("openai"), by("gateway")), (2, 3, 2), "{rows:?}");
     r.env.cleanup().await;
 }
 
@@ -136,7 +136,14 @@ async fn other_paths_reach_no_provider() {
         let resp = env.llm("POST", uri, &[("x-api-key", &token)], Some(anthropic_body("test-model", false))).await;
         assert!(matches!(resp.status.as_u16(), 400 | 404 | 405), "{uri} -> {} {}", resp.status, resp.text());
     }
-    assert_eq!(r.counts(), [0, 0, 0], "nothing may reach an upstream");
+    // An endpoint of the kind that the provider does not serve.
+    let resp = env.llm("GET", "/llm/p/gateway/v1/models", &[("x-api-key", &token)], None).await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        env.llm("GET", "/llm/p/anthropic/v1/models", &[("x-api-key", &token)], None).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(r.counts(), [1, 0, 0], "nothing else may reach an upstream");
 
     // Errors take the shape of the provider's kind; without a provider, the
     // generic route uses the OpenAI-compatible one.

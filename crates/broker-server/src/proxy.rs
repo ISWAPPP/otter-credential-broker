@@ -282,7 +282,7 @@ async fn proxy(
         Method::POST => HttpMethod::Post,
         _ => return reject(kind, &BrokerError::NotFound("unsupported endpoint".into())),
     };
-    let Some(endpoint) = kind.find_endpoint(method, rest) else {
+    let Some(endpoint) = provider.endpoint(method, rest) else {
         return reject(kind, &BrokerError::NotFound("unsupported endpoint".into()));
     };
     let query = match check_query(kind, req.uri().query()) {
