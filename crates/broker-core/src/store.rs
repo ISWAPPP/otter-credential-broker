@@ -396,8 +396,22 @@ pub struct LabelledTokenExpiry {
     pub expires_at: Timestamp,
 }
 
-/// Column arrays of reservations, in the order of the primary key of
-/// `limit_spend` (so that rows are always locked in one order).
+/// The order in which rows of `limit_spend` are locked wherever they
+/// change, so that two transactions never wait for each other: a tenant's
+/// rows before a provider's (every tenant shares those, so they are taken
+/// last and held for the shortest time), then by key. Matches the
+/// `ORDER BY` of [`Store::settle_tx`].
+fn lock_order<'a>(
+    level: LimitLevel,
+    tenant: &'a str,
+    provider: &'a str,
+    period: Period,
+    start: Timestamp,
+) -> (bool, &'a [u8], &'a [u8], &'static str, Timestamp) {
+    (level != LimitLevel::Tenant, tenant.as_bytes(), provider.as_bytes(), period.as_str(), start)
+}
+
+/// Column arrays of reservations, in lock order.
 struct ReservationArrays {
     level: Vec<&'static str>,
     tenant: Vec<String>,
@@ -412,11 +426,11 @@ impl ReservationArrays {
     fn new(reservations: &[Reservation]) -> Self {
         let mut sorted: Vec<&Reservation> = reservations.iter().collect();
         sorted.sort_by(|a, b| {
-            (a.level.as_str(), &a.tenant, &a.provider, a.period.as_str(), a.period_start).cmp(&(
-                b.level.as_str(),
+            lock_order(a.level, &a.tenant, &a.provider, a.period, a.period_start).cmp(&lock_order(
+                b.level,
                 &b.tenant,
                 &b.provider,
-                b.period.as_str(),
+                b.period,
                 b.period_start,
             ))
         });
@@ -1022,9 +1036,6 @@ impl Store {
     #[tracing::instrument(name = "db.record_usage", level = "debug", skip_all)]
     pub async fn record_usage_settling(&self, u: &NewUsageRow, settle: &[Reservation]) -> Result<(), BrokerError> {
         let mut tx = self.pool.begin().await?;
-        if !settle.is_empty() {
-            Self::settle_tx(&mut tx, settle, u.billable_tokens, u.cost_micro_usd).await?;
-        }
         sqlx::query(
             "UPDATE llm_tokens SET
                 spent_micro_usd = LEAST(spent_micro_usd::numeric + $2, 9223372036854775807)::bigint,
@@ -1065,6 +1076,11 @@ impl Store {
         .bind(u.response_model.as_deref())
         .execute(&mut *tx)
         .await?;
+        // Last, so the budget rows, a provider's shared by every tenant, are
+        // held until the commit only.
+        if !settle.is_empty() {
+            Self::settle_tx(&mut tx, settle, u.billable_tokens, u.cost_micro_usd).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1302,14 +1318,14 @@ impl Store {
     /// rows as they were.
     #[tracing::instrument(name = "db.reserve", level = "debug", skip_all)]
     pub async fn reserve(&self, claims: &[BudgetClaim]) -> Result<Result<Vec<SpendRow>, ReserveDenied>, BrokerError> {
-        // Rows are locked in the order of the primary key, everywhere.
+        // The statement takes the rows in the order of its input.
         let mut sorted: Vec<&BudgetClaim> = claims.iter().collect();
         sorted.sort_by(|a, b| {
-            (a.scope.level.as_str(), &a.scope.tenant, &a.scope.provider, a.period.as_str(), a.period_start).cmp(&(
-                b.scope.level.as_str(),
+            lock_order(a.scope.level, &a.scope.tenant, &a.scope.provider, a.period, a.period_start).cmp(&lock_order(
+                b.scope.level,
                 &b.scope.tenant,
                 &b.scope.provider,
-                b.period.as_str(),
+                b.period,
                 b.period_start,
             ))
         });
@@ -1410,8 +1426,8 @@ impl Store {
     }
 
     /// Releases `reservations` and adds `tokens` and `micro_usd` to the
-    /// spend of each of their periods. The rows are locked in the order of
-    /// their key first, as everywhere else.
+    /// spend of each of their periods. The rows are locked first, in lock
+    /// order (see [`lock_order`]).
     async fn settle_tx(
         tx: &mut Transaction<'_, Postgres>,
         reservations: &[Reservation],
@@ -1425,7 +1441,8 @@ impl Store {
                   AS k(level, tenant_id, provider, period_kind, period_start)
                ON s.level = k.level AND s.tenant_id = k.tenant_id AND s.provider = k.provider
               AND s.period_kind = k.period_kind AND s.period_start = k.period_start
-             ORDER BY s.level, s.tenant_id, s.provider, s.period_kind, s.period_start
+             ORDER BY s.level <> 'tenant', s.tenant_id COLLATE \"C\", s.provider COLLATE \"C\",
+                      s.period_kind COLLATE \"C\", s.period_start
              FOR UPDATE OF s",
         )
         .bind(&a.level)
