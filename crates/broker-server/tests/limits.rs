@@ -129,6 +129,21 @@ async fn a_token_far_over_its_rate_takes_nothing_from_its_neighbours() {
     env.cleanup().await;
 }
 
+/// Waits until this replica counts `tenant_n` requests in flight for
+/// `tenant` and `provider_n` for the provider `anthropic`. A request is
+/// counted before anything else is done for it, so the slot is then held.
+async fn in_flight(env: &Env, tenant: &str, tenant_n: u32, provider_n: u32) {
+    let inflight = env.state.proxy.inflight();
+    let counts = || (inflight.tenant_count(tenant), inflight.provider_count("anthropic"));
+    for _ in 0..200 {
+        if counts() == (tenant_n, provider_n) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected {:?} requests in flight for {tenant} and anthropic: {:?}", (tenant_n, provider_n), counts());
+}
+
 #[tokio::test]
 async fn requests_in_flight_are_capped_per_tenant_and_provider() {
     let Some(env) = env_with("concurrent = 2").await else { return };
@@ -148,7 +163,7 @@ async fn requests_in_flight_are_capped_per_tenant_and_provider() {
     };
     // a1 holds tenant-a's only slot for 1.5 s.
     let first = slow(&a1);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    in_flight(&env, "tenant-a", 1, 1).await;
     let r = send(&env, &a2).await;
     assert_eq!((r.status, level(&r)), (StatusCode::TOO_MANY_REQUESTS, "tenant".to_owned()));
     assert_eq!(
@@ -157,11 +172,7 @@ async fn requests_in_flight_are_capped_per_tenant_and_provider() {
     );
     // tenant-b takes the provider's second slot; then the provider is full.
     let second = slow(&b1);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        (env.state.proxy.inflight().tenant_count("tenant-a"), env.state.proxy.inflight().provider_count("anthropic")),
-        (1, 2)
-    );
+    in_flight(&env, "tenant-b", 1, 2).await;
     let r = send(&env, &b2).await;
     assert_eq!((r.status, level(&r)), (StatusCode::TOO_MANY_REQUESTS, "global".to_owned()));
     assert_eq!(r.json()["error"]["message"], "too many requests in flight for provider anthropic");
