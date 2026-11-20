@@ -218,7 +218,11 @@ swap a `..data` link. A changed file is loaded and validated in full. Only
 change is reported as needing a restart and nothing is applied, because
 listeners, keys, the database pool and limits are set up once, and half an
 applied file would leave the process in a state no file describes. An
-invalid file is refused. `ocb_config_version` is a fingerprint of the
+invalid file is refused. A file refused only because the TLS files it
+names cannot be used yet is looked at again whenever one of them changes:
+ConfigMap and Secret volumes are updated independently, and without the
+retry such a change would only apply after the next edit of the file or a
+restart. `ocb_config_version` is a fingerprint of the
 configuration rather than a counter, so replicas that serve the same
 configuration report the same value.
 

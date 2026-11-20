@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Configuration reload: providers and prices change for new requests while
 //! requests in flight, in-flight limits and shutdown are unaffected; invalid
-//! configurations and changes that need a restart are refused.
+//! configurations and changes that need a restart are refused, and a change
+//! refused for TLS files that are not in place yet applies once they are.
 
 mod common;
 
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use broker_core::llm::ProviderAccess;
 use broker_server::reload::{ReloadResult, Reloader};
 use broker_server::{LlmProxy, ServeOptions, ServerConfig, serve_listener, shutdown};
 use common::*;
@@ -26,17 +28,19 @@ struct Cfg {
     /// price is what gets billed.
     price_factor: f64,
     max_concurrent_total: u32,
+    /// `access` of the Anthropic provider.
+    access: &'static str,
     /// Appended at the end (more providers or prices).
     extra: String,
 }
 
 impl Cfg {
     fn new(upstream: SocketAddr) -> Self {
-        Self { upstream, price_factor: 1.0, max_concurrent_total: 1024, extra: String::new() }
+        Self { upstream, price_factor: 1.0, max_concurrent_total: 1024, access: "implicit", extra: String::new() }
     }
 
     fn toml(&self) -> String {
-        let Self { upstream, price_factor, max_concurrent_total, extra } = self;
+        let Self { upstream, price_factor, max_concurrent_total, access, extra } = self;
         let (input, output) = (3.0 * price_factor, 15.0 * price_factor);
         format!(
             r#"
@@ -50,6 +54,7 @@ impl Cfg {
             kind = "anthropic"
             base_url = "http://{upstream}"
             allow_http = true
+            access = "{access}"
 
             [[llm.pricing]]
             provider = "anthropic"
@@ -258,6 +263,93 @@ async fn changes_outside_providers_and_pricing_need_a_restart() {
     assert_eq!(reloader.check(), Some(ReloadResult::Applied));
     assert_eq!(price(&proxy), 15.0);
     assert!(telemetry().metrics.render().contains("ocb_config_version "));
+}
+
+/// A provider with its own TLS settings; nothing connects to it here.
+fn gateway(tls: &str) -> String {
+    format!("[llm.providers.gateway]\nkind = \"anthropic\"\nbase_url = \"https://127.0.0.1:9\"\ntls = {{ {tls} }}\n")
+}
+
+#[tokio::test]
+async fn a_change_refused_for_missing_tls_files_applies_once_they_arrive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut cfg = Cfg::new("127.0.0.1:9".parse().unwrap());
+    write(&path, &cfg.toml());
+    let (proxy, mut reloader) = proxy_and_reloader(&path);
+    let version = proxy.snapshot().version();
+
+    // A change that is invalid as written is not looked at again when a TLS
+    // file it names appears: the file would not make it valid.
+    let other_ca = dir.path().join("other-ca.crt");
+    cfg.extra = format!(
+        "{}[[llm.pricing]]\nprovider = \"nowhere\"\nmodel = \"m\"\ninput = 1.0\noutput = 1.0\n",
+        gateway(&format!("ca_file = {}", lit(&other_ca)))
+    );
+    write(&path, &cfg.toml());
+    assert_eq!(reloader.check(), Some(ReloadResult::Invalid));
+    replace(&other_ca, &tls_fixture("ca.pem"));
+    assert_eq!(reloader.check(), None, "invalid as written");
+
+    // A new provider whose CA file is not there yet (its Secret is updated
+    // after the config file), and explicit access for the existing one.
+    let ca = dir.path().join("ca.crt");
+    cfg.access = "explicit";
+    cfg.extra = gateway(&format!("ca_file = {}", lit(&ca)));
+    write(&path, &cfg.toml());
+    assert_eq!(reloader.check(), Some(ReloadResult::Invalid));
+    assert_eq!(reloader.check(), None, "refused once while the file is missing");
+    assert_eq!(proxy.snapshot().version(), version);
+
+    // A file that cannot be used: looked at again and refused again, once.
+    write(&ca, "not a certificate");
+    assert_eq!(reloader.check(), Some(ReloadResult::Invalid));
+    assert_eq!(reloader.check(), None);
+    assert!(!proxy.has_provider("gateway"));
+    assert_eq!(proxy.snapshot().provider("anthropic").unwrap().access, ProviderAccess::Implicit);
+
+    // The CA arrives: the whole change applies.
+    replace(&ca, &tls_fixture("ca.pem"));
+    assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert!(proxy.has_provider("gateway"));
+    assert_eq!(proxy.snapshot().provider("anthropic").unwrap().access, ProviderAccess::Explicit);
+    assert_eq!(reloader.check(), None);
+}
+
+#[tokio::test]
+async fn a_price_change_made_during_a_certificate_rotation_applies_with_the_new_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ca, cert, key) = (dir.path().join("ca.crt"), dir.path().join("tls.crt"), dir.path().join("tls.key"));
+    replace(&ca, &tls_fixture("ca.pem"));
+    replace(&cert, &tls_fixture("client-a.pem"));
+    replace(&key, &tls_fixture("client-a.key"));
+    let path = dir.path().join("config.toml");
+    let mut cfg = Cfg::new("127.0.0.1:9".parse().unwrap());
+    cfg.extra = gateway(&format!("ca_file = {}, client_cert = {}, client_key = {}", lit(&ca), lit(&cert), lit(&key)));
+    write(&path, &cfg.toml());
+    let (proxy, mut reloader) = proxy_and_reloader(&path);
+    assert_eq!(reloader.check(), None);
+    let price = |p: &LlmProxy| p.snapshot().prices().lookup("anthropic", "test-model").unwrap().input;
+
+    // The certificate is renewed before its key, and the prices change
+    // meanwhile. The new configuration and the renewed files of the running
+    // one are each refused once.
+    replace(&cert, &tls_fixture("client-b.pem"));
+    cfg.price_factor = 2.0;
+    write(&path, &cfg.toml());
+    assert_eq!(reloader.check(), Some(ReloadResult::Invalid), "the new configuration");
+    assert_eq!(reloader.check(), Some(ReloadResult::Invalid), "the renewed files of the running configuration");
+    assert_eq!(reloader.check(), None);
+    assert_eq!(price(&proxy), 3.0);
+    assert_eq!(proxy.snapshot().tls_not_after("gateway"), Some(4_904_409_600));
+
+    // With the new key in place, the new prices apply together with the new
+    // certificate.
+    replace(&key, &tls_fixture("client-b.key"));
+    assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert_eq!(price(&proxy), 6.0);
+    assert_eq!(proxy.snapshot().tls_not_after("gateway"), Some(4_912_358_400));
+    assert_eq!(reloader.check(), None);
 }
 
 #[tokio::test]

@@ -6,28 +6,14 @@
 
 mod common;
 
-use std::path::Path;
-
 use axum::http::StatusCode;
 use broker_server::ServerConfig;
 use broker_server::reload::{ReloadResult, Reloader};
 use common::*;
 use serde_json::json;
 
-/// A fixture path as a TOML literal string.
-fn lit(p: &Path) -> String {
-    format!("'{}'", p.display())
-}
-
 fn gauge(series: &str) -> Option<f64> {
     telemetry().metrics.render().lines().find_map(|l| l.strip_prefix(series).and_then(|v| v.trim().parse().ok()))
-}
-
-/// Replaces a file all at once, as a Secret volume update does.
-fn replace(dst: &Path, src: &Path) {
-    let tmp = dst.with_extension("new");
-    std::fs::copy(src, &tmp).unwrap();
-    std::fs::rename(&tmp, dst).unwrap();
 }
 
 async fn call(env: &Env, token: &str, provider: &str) -> TestResponse {

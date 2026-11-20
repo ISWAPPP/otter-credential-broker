@@ -265,6 +265,19 @@ pub fn tls_fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls").join(name)
 }
 
+/// A path as a TOML literal string.
+pub fn lit(p: &std::path::Path) -> String {
+    format!("'{}'", p.display())
+}
+
+/// Replaces `dst` with a copy of `src` all at once, as a Secret volume
+/// update does.
+pub fn replace(dst: &std::path::Path, src: &std::path::Path) {
+    let tmp = dst.with_extension("new");
+    std::fs::copy(src, &tmp).unwrap();
+    std::fs::rename(&tmp, dst).unwrap();
+}
+
 /// The fake upstream behind TLS.
 pub struct TlsUpstream {
     pub upstream: Upstream,

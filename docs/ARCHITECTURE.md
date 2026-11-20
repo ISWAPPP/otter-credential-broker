@@ -254,6 +254,13 @@ loaded and validated again in full, with the same environment overrides:
 - otherwise the new snapshot replaces the current one (`applied`), unless
   it is equal to it (`unchanged`).
 
+A change that is valid but names TLS files that cannot be used yet
+(missing, or a new certificate next to the old key) is refused as
+`invalid` and looked at again whenever one of those files changes.
+ConfigMap and Secret volumes are updated independently, so the files of a
+new provider can arrive after the configuration that names them; the
+change then applies as a whole once they are in place.
+
 The TLS files of providers are watched the same way, by content. When a
 file in use changed (a renewed certificate), the snapshot is rebuilt from
 the running configuration. Files that do not fit together, such as a new

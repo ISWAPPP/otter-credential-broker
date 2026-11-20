@@ -204,6 +204,13 @@ pub struct ProviderTls {
     pub client_key: Option<PathBuf>,
 }
 
+impl ProviderTls {
+    /// The files named: `ca_file`, then `client_cert` and `client_key` if set.
+    pub fn files(&self) -> impl Iterator<Item = &PathBuf> {
+        [Some(&self.ca_file), self.client_cert.as_ref(), self.client_key.as_ref()].into_iter().flatten()
+    }
+}
+
 fn yes() -> bool {
     true
 }
@@ -396,8 +403,7 @@ impl LlmConfig {
                 if tls.client_cert.is_some() != tls.client_key.is_some() {
                     return Err(format!("llm.providers.{id}.tls: client_cert and client_key go together"));
                 }
-                let files = [Some(&tls.ca_file), tls.client_cert.as_ref(), tls.client_key.as_ref()];
-                if files.into_iter().flatten().any(|f| f.as_os_str().is_empty()) {
+                if tls.files().any(|f| f.as_os_str().is_empty()) {
                     return Err(format!("llm.providers.{id}.tls: file paths must not be empty"));
                 }
             }

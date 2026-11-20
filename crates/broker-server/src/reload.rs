@@ -7,7 +7,10 @@
 //! updated by the kubelet and is not supported. When the content changed,
 //! the whole configuration is loaded and validated again, as at start:
 //! - it does not load or validate: the running configuration stays
-//!   (`invalid`);
+//!   (`invalid`). When only the TLS files it names were the problem (not
+//!   there yet, or a certificate without its key), the same content is tried
+//!   again as soon as one of those files changes, since a Secret volume can
+//!   be updated after the ConfigMap that refers to it;
 //! - a key outside `llm.providers` and `llm.pricing` differs from the
 //!   running value: nothing is applied and the keys are logged
 //!   (`restart_required`);
@@ -29,9 +32,13 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::ServerConfig;
+use crate::config::{ProviderTls, ServerConfig};
 use crate::proxy::LlmProxy;
 use crate::tls::{read_file, sha256};
+
+/// SHA-256 of the content of each file; `None` for a file that cannot be
+/// read.
+type FileHashes = BTreeMap<PathBuf, Option<[u8; 32]>>;
 
 /// What looking at a changed configuration led to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,13 +74,17 @@ pub struct Reloader {
     running: ServerConfig,
     /// Hash of the content looked at last, whether it was applied or not.
     seen: Option<[u8; 32]>,
+    /// The content looked at last was refused only because the TLS files it
+    /// names could not be used: those files, as they were then. It is looked
+    /// at again once one of them changes.
+    pending_tls: Option<FileHashes>,
     /// Whether the file could be read last time; a failure is reported once.
     readable: bool,
     /// The first look usually finds the content loaded at start; that is not
     /// worth a log line or a count.
     first: bool,
     /// TLS files of a change that could not be applied; reported once.
-    failed_tls: Option<BTreeMap<PathBuf, Option<[u8; 32]>>>,
+    failed_tls: Option<FileHashes>,
 }
 
 impl Reloader {
@@ -83,7 +94,7 @@ impl Reloader {
         for r in ReloadResult::ALL {
             metrics::counter!("ocb_config_reload_total", "result" => r.as_str()).increment(0);
         }
-        Self { path, proxy, running, seen: None, readable: true, first: true, failed_tls: None }
+        Self { path, proxy, running, seen: None, pending_tls: None, readable: true, first: true, failed_tls: None }
     }
 
     /// Looks at the config file and the TLS files in use once and applies
@@ -108,7 +119,9 @@ impl Reloader {
             }
         };
         let hash = sha256(&content);
-        if self.seen == Some(hash) {
+        // Content looked at before is looked at again only when it was
+        // refused for TLS files that have changed since.
+        if self.seen == Some(hash) && !self.pending_tls_changed() {
             return None;
         }
         self.seen = Some(hash);
@@ -119,7 +132,12 @@ impl Reloader {
         Some(count(result))
     }
 
+    fn pending_tls_changed(&self) -> bool {
+        self.pending_tls.as_ref().is_some_and(|files| file_hashes(files.keys()) != *files)
+    }
+
     fn reload(&mut self, content: &[u8]) -> ReloadResult {
+        self.pending_tls = None;
         let file = self.path.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
         let parsed = std::str::from_utf8(content)
             .map_err(|_| "the file is not UTF-8".to_owned())
@@ -131,10 +149,24 @@ impl Reloader {
                 return ReloadResult::Invalid;
             }
         };
+        if let Err(e) = next.llm.validate() {
+            tracing::warn!(error = %e, %file, "the changed configuration is invalid; keeping the current one");
+            return ReloadResult::Invalid;
+        }
+        // Valid as written, so what can still fail are the TLS files it
+        // names. They are hashed before they are read for the snapshot: a
+        // file that changes in between leads to one more attempt rather than
+        // to none.
+        let tls = file_hashes(next.llm.providers.values().filter_map(|p| p.tls.as_ref()).flat_map(ProviderTls::files));
         let snapshot = match self.proxy.prepare(&next.llm) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(error = %e, %file, "the changed configuration is invalid; keeping the current one");
+                tracing::warn!(
+                    error = %e,
+                    %file,
+                    "TLS files of the changed configuration cannot be used; keeping the current one until they change"
+                );
+                self.pending_tls = Some(tls);
                 return ReloadResult::Invalid;
             }
         };
@@ -175,8 +207,7 @@ impl Reloader {
         if current.tls_files().is_empty() {
             return None;
         }
-        let now: BTreeMap<PathBuf, Option<[u8; 32]>> =
-            current.tls_files().keys().map(|p| (p.clone(), read_file(p).ok().map(|c| sha256(c.expose())))).collect();
+        let now = file_hashes(current.tls_files().keys());
         if now.iter().all(|(p, h)| h.as_ref() == current.tls_files().get(p)) {
             self.failed_tls = None;
             return None;
@@ -234,6 +265,10 @@ impl Reloader {
 fn count(r: ReloadResult) -> ReloadResult {
     metrics::counter!("ocb_config_reload_total", "result" => r.as_str()).increment(1);
     r
+}
+
+fn file_hashes<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> FileHashes {
+    paths.into_iter().map(|p| (p.clone(), read_file(p).ok().map(|c| sha256(c.expose())))).collect()
 }
 
 /// Keys outside `llm.providers` and `llm.pricing` whose values differ
