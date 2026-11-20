@@ -3,13 +3,17 @@
 //! callers and providers, in both directions: the fixed allowlists by
 //! default, more for a provider with prefixes, never those that carry
 //! credentials, cookies or redirects. Which requests a provider refuses:
-//! those that would have it run tools or contact MCP servers itself.
+//! those that would have it run tools or contact MCP servers itself. Both
+//! change with a reload, for new requests.
 
 mod common;
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use axum::http::{HeaderMap, StatusCode};
+use broker_server::ServerConfig;
+use broker_server::reload::{ReloadResult, Reloader};
 use common::*;
 use serde_json::{Value, json};
 
@@ -378,5 +382,82 @@ async fn tools_the_provider_would_run_itself_are_refused_before_anything_is_sent
     let body = |id: &str| v["providers"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["body"].clone();
     assert_eq!(body("gateway"), json!({"deny_server_tools": true, "server_tool_allowlist": ["web_search_20250305"]}));
     assert_eq!(body("anthropic"), json!({"deny_server_tools": false, "server_tool_allowlist": []}));
+    env.cleanup().await;
+}
+
+/// Replaces the file the way a ConfigMap update does: all at once.
+fn write(path: &Path, content: &str) {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// A request to `anthropic` with a header only a prefix lets through.
+async fn send(env: &Env, token: &str, body: &str) -> TestResponse {
+    let h = [("x-api-key", token), ("anthropic-foo", "1")];
+    env.llm("POST", "/llm/anthropic/v1/messages", &h, Some(body.to_owned())).await
+}
+
+#[tokio::test]
+async fn a_reload_changes_both_policies_for_new_requests() {
+    let (upstream, addr) = start_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let config = |policies: &str| {
+        format!(
+            "[llm.providers.anthropic]\nkind = \"anthropic\"\nbase_url = \"http://{addr}\"\nallow_http = true\n{policies}\n"
+        )
+    };
+    write(&path, &config(""));
+    let cfg = ServerConfig::load(Some(&path)).unwrap();
+    let Some(env) = Env::with_llm(EnvOptions::default(), cfg.llm.clone(), (upstream, addr)).await else { return };
+    let mut reloader = Reloader::new(Some(path.clone()), cfg, env.state.proxy.clone());
+    assert_eq!(reloader.check(), None, "the file is the one loaded at start");
+    env.seed_keys().await;
+    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    let fetch = request_with(json!({"model": "many-headers", "tools": [{"type": "web_fetch_20260209", "name": "f"}]}));
+    let plain = anthropic_body("many-headers", false);
+
+    // No policies at start.
+    let r = send(&env, &token, &fetch).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(env.upstream.last().headers.get("anthropic-foo").is_none());
+    assert!(r.headers.get("anthropic-ratelimit-requests-remaining").is_none());
+
+    // Both arrive with a reload and apply from the next request on.
+    let version = env.state.proxy.snapshot().version();
+    write(
+        &path,
+        &config(concat!(
+            "headers = { request_forward_prefixes = [\"anthropic-\"], ",
+            "response_forward_prefixes = [\"anthropic-ratelimit-\"] }\n",
+            "body = { deny_server_tools = true }",
+        )),
+    );
+    assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert_ne!(env.state.proxy.snapshot().version(), version);
+    let r = send(&env, &token, &fetch).await;
+    assert_eq!((r.status, r.json()["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("server_tool_denied")));
+    let r = send(&env, &token, &plain).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(env.upstream.last().headers.get("anthropic-foo").unwrap(), "1");
+    assert_eq!(r.headers.get("anthropic-ratelimit-requests-remaining").unwrap(), "99");
+    let (_, v) = env.admin_call("GET", "/v1/admin/providers", None).await;
+    assert_eq!(v["config_version"].as_u64(), Some(env.state.proxy.snapshot().version()));
+    assert_eq!(v["providers"][0]["body"]["deny_server_tools"], true);
+    assert_eq!(v["providers"][0]["headers"]["request_forward_prefixes"], json!(["anthropic-"]));
+
+    // A prefix that could pass the caller's token is refused, and the
+    // policies in use stay.
+    write(&path, &config("headers = { request_forward_prefixes = [\"x-\"] }"));
+    assert_eq!(reloader.check(), Some(ReloadResult::Invalid));
+    assert_eq!(send(&env, &token, &fetch).await.status, StatusCode::BAD_REQUEST);
+
+    // Without them again, requests pass as at start.
+    write(&path, &config(""));
+    assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert_eq!(env.state.proxy.snapshot().version(), version);
+    assert_eq!(send(&env, &token, &fetch).await.status, StatusCode::OK);
+    assert!(env.upstream.last().headers.get("anthropic-foo").is_none());
     env.cleanup().await;
 }
