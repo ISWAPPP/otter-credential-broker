@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use broker_core::KeeperSettings;
+use broker_core::limits::Limits;
 use broker_core::llm::pricing::{ModelPrice, PriceTable};
 use broker_core::llm::{Endpoint, HttpMethod, ProviderAccess, ProviderKind};
 use broker_core::validate;
@@ -196,6 +197,11 @@ pub struct ProviderConfig {
     /// Checks of the request body. None by default.
     #[serde(default)]
     pub body: ProviderBody,
+    /// Limits of the provider for every tenant together (the global level):
+    /// requests per minute, requests in flight per replica, and budgets in
+    /// tokens or USD per UTC day or month. None by default.
+    #[serde(default)]
+    pub limits: Limits,
 }
 
 /// Checks of the request body before it goes upstream; the body itself is
@@ -278,6 +284,7 @@ impl ProviderConfig {
             tls: None,
             headers: ProviderHeaders::default(),
             body: ProviderBody::default(),
+            limits: Limits::default(),
         }
     }
 }
@@ -383,6 +390,8 @@ pub struct Provider {
     pub tls: Option<ProviderTls>,
     pub headers: ProviderHeaders,
     pub body: ProviderBody,
+    /// Limits of the provider for every tenant together.
+    pub limits: Limits,
 }
 
 impl Provider {
@@ -461,6 +470,7 @@ impl LlmConfig {
             }
             policy::validate_headers(id, &p.headers)?;
             policy::validate_body(id, p.kind, &p.body)?;
+            p.limits.validate().map_err(|e| format!("llm.providers.{id}.limits.{e}"))?;
             out.insert(
                 id.clone(),
                 Provider {
@@ -475,6 +485,7 @@ impl LlmConfig {
                     tls: p.tls.clone(),
                     headers: p.headers.clone(),
                     body: p.body.clone(),
+                    limits: p.limits,
                 },
             );
         }
@@ -496,6 +507,18 @@ impl LlmConfig {
             }
             if prices.providers().any(|x| x == id) {
                 return Err(format!("llm.pricing: {id} takes its prices from {source}; remove its own entries"));
+            }
+        }
+        // A USD budget of a provider without prices would never be used up:
+        // its usage costs nothing.
+        for p in out.values().filter(|p| p.limits.has_usd_budget()) {
+            if !prices.providers().any(|x| x == p.price_source()) {
+                return Err(format!(
+                    "llm.providers.{}.limits.budget_usd: {} has no [[llm.pricing]] entries, so its usage costs \
+                     nothing and a USD budget would never be used up; add prices or use budget_tokens",
+                    p.id,
+                    p.price_source()
+                ));
             }
         }
         for (name, v) in [
@@ -520,6 +543,7 @@ impl LlmConfig {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use broker_core::limits::Period;
 
     fn provider(kind: ProviderKind, base_url: &str) -> ProviderConfig {
         ProviderConfig::new(kind, base_url)
@@ -767,6 +791,57 @@ mod tests {
         // provider that asks for it is refused rather than left unchecked.
         assert!(!valid("openai", "deny_server_tools = true"));
         assert!(!valid("anthropic", "server_tool_allowlist = [\"web_search_20250305\"]"));
+    }
+
+    #[test]
+    fn provider_limits() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.anthropic]
+            kind = "anthropic"
+            base_url = "https://api.anthropic.com"
+            limits = { rpm = 300, concurrent = 8, budget_tokens = { day = 1_000_000, month = 50_000_000 }, budget_usd = { month = 250.0 } }
+
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example"
+            pricing_from = "anthropic"
+            limits = { budget_usd = { day = 20 } }
+
+            [llm.providers.deepseek]
+            kind = "openai"
+            base_url = "https://api.deepseek.com"
+
+            [[llm.pricing]]
+            provider = "anthropic"
+            model = "m"
+            input = 1.0
+            output = 2.0
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        let l = &p["anthropic"].limits;
+        assert_eq!((l.rpm, l.concurrent), (Some(300), Some(8)));
+        assert_eq!((l.tokens(Period::Day), l.tokens(Period::Month)), (Some(1_000_000), Some(50_000_000)));
+        assert_eq!((l.micro_usd(Period::Day), l.micro_usd(Period::Month)), (None, Some(250_000_000)));
+        // Priced through pricing_from; an integer amount reads as dollars.
+        assert_eq!(p["gateway"].limits.micro_usd(Period::Day), Some(20_000_000));
+        assert!(p["deepseek"].limits.is_empty());
+
+        let with = |limits: &str| {
+            format!("[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\nlimits = {{ {limits} }}\n")
+        };
+        for unknown in ["burst = 5", "budget_tokens = { week = 5 }", "rpm = -1", "budget_usd = 5.0"] {
+            assert!(ServerConfig::parse(&with(unknown)).is_err(), "{unknown}");
+        }
+        let invalid = |limits: &str| ServerConfig::parse(&with(limits)).unwrap().llm.validate().unwrap_err();
+        assert_eq!(invalid("rpm = 0"), "llm.providers.x.limits.rpm must be between 1 and 10000000");
+        assert!(invalid("concurrent = 0").starts_with("llm.providers.x.limits.concurrent "));
+        // A USD budget needs prices to be used up at all.
+        let e = invalid("budget_usd = { day = 5.0 }");
+        assert!(e.starts_with("llm.providers.x.limits.budget_usd: x has no [[llm.pricing]] entries"), "{e}");
+        assert!(ServerConfig::parse(&with("budget_tokens = { day = 0 }")).unwrap().llm.validate().is_ok());
     }
 
     #[test]
