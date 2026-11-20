@@ -131,10 +131,10 @@ async fn other_paths_reach_no_provider() {
         "/llm/p/./gateway/v1/messages",
         "/llm/p/gateway/v1/messages/",
         "/llm/p/gateway",
-        // Reserved ids.
+        // Reserved ids, and one no provider can have.
         "/llm/p/p/v1/messages",
-        "/llm/p/_/limits",
         "/llm/p/limits/v1/messages",
+        "/llm/p/_/limits",
         "/llm/p/",
         "/llm/p",
     ] {

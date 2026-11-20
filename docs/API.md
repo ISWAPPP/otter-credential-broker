@@ -34,7 +34,7 @@ OpenAI-compatible SDK `http://<broker>:8080/llm/p/<provider>` (or
 `/llm/openai/<provider>`). A provider may serve only some endpoints of its
 kind (`endpoints` in its configuration, by name). Provider ids and paths
 are compared exactly as sent, without decoding or normalisation; the ids
-`p`, `_` and `limits` are reserved.
+`p` and `limits` are reserved.
 
 Anything else under `/llm/` is refused (404), as are query keys other than
 `beta`, `limit`, `after_id`, `before_id` (Anthropic) and none (OpenAI).

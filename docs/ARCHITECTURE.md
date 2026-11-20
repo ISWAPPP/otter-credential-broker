@@ -128,7 +128,7 @@ sequenceDiagram
   `/llm/openai/<id>/<path>` only providers of kind `openai`. `<path>` must
   be an endpoint of the provider's kind that the provider serves
   (`endpoints`), compared on the raw path (no decoding, no normalisation);
-  the ids `p`, `_` and `limits` are reserved. The upstream URL is
+  the ids `p` and `limits` are reserved. The upstream URL is
   `base_url + "/" + allowlisted path (+ allowlisted query)`. The provider
   comes from the snapshot the request took when it started (see "Providers
   and configuration reload").

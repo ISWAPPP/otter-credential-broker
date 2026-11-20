@@ -192,8 +192,14 @@ base URL, so a path that carries account details stays out of the API.
 one kind (a public API and a gateway in front of it, say) need no routes of
 their own; `/llm/anthropic/...` and `/llm/openai/<id>/...` stay as they
 were. The new route has its own prefix, so no provider id can shadow an
-older route; `p`, `_` and `limits` are reserved for paths of the broker
-itself.
+older route. The ids `p` and `limits` are reserved anyway, so that no
+provider id reads like a path of the broker itself: `p` is the prefix of
+the route, and `limits` is kept for a later endpoint. Reserving names
+before a first release costs little, and giving them back later breaks
+nothing, while reserving them later would. It does turn away a
+configuration that used either id for an `openai` provider, which loaded
+before: rename such a provider, store each tenant's key under the new
+`llm.<id>` and reissue tokens whose `providers` list names it.
 
 A token without a `providers` list may use every provider, as before. That
 is the wrong default for a provider meant for a few tokens only (one

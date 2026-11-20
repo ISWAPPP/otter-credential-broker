@@ -16,9 +16,10 @@ use figment::Figment;
 use figment::providers::{Data, Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
-/// Provider ids that would collide with paths under `/llm/`: the
-/// `/llm/p/<id>/...` route and the broker's own `/llm/_/...` paths.
-pub const RESERVED_PROVIDER_IDS: &[&str] = &["p", "_", "limits"];
+/// Provider ids kept free for paths of the broker itself under `/llm/`: `p`,
+/// the prefix of the `/llm/p/<id>/...` route, and `limits`, kept for a later
+/// endpoint. No route needs them today; see DECISIONS.md, D-018.
+pub const RESERVED_PROVIDER_IDS: &[&str] = &["p", "limits"];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
