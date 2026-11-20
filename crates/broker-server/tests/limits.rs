@@ -516,14 +516,14 @@ async fn the_limits_endpoint_shows_the_callers_own_and_counts_no_request() {
         v["token"],
         json!({"id": a_id, "label": "worker-1", "expires_at": DAY0 + 3601 + 86_400, "providers": null,
                "rpm": {"limit": 2, "remaining": 0, "resets_at": resets_at}, "concurrent": 16,
-               "budget_tokens": {"limit": 5000.0, "spent": 500.0, "remaining": 4500.0}, "budget_usd": null})
+               "budget_tokens": {"limit": 5000, "spent": 500, "remaining": 4500}, "budget_usd": null})
     );
     assert_eq!(
         v["tenant"],
         json!({"id": "tenant-a", "rpm": {"limit": 50, "remaining": 48, "resets_at": resets_at}, "concurrent": 4,
                "budgets": [
-                   {"period": "day", "unit": "tokens", "limit": 500.0, "spent": 500.0, "reserved": 0.0,
-                    "remaining": 0.0, "resets_at": DAY0 + 86_400},
+                   {"period": "day", "unit": "tokens", "limit": 500, "spent": 500, "reserved": 0,
+                    "remaining": 0, "resets_at": DAY0 + 86_400},
                    {"period": "month", "unit": "usd", "limit": 7.25, "spent": 0.0027, "reserved": 0.0,
                     "remaining": 7.2473, "resets_at": 1_901_232_000}]})
     );
@@ -549,7 +549,7 @@ async fn the_limits_endpoint_shows_the_callers_own_and_counts_no_request() {
     // tenant-b sees its own.
     let v = limits_of(&env, &b).await.json();
     assert_eq!((v["token"]["id"].as_str(), v["tenant"]["id"].as_str()), (Some(b_id.as_str()), Some("tenant-b")));
-    assert_eq!(v["tenant"]["budgets"][0]["spent"], 750.0);
+    assert_eq!(v["tenant"]["budgets"][0]["spent"], 750);
     assert_eq!(v["tenant"]["rpm"]["remaining"], 4);
 
     // Without a valid token there is nothing to see.

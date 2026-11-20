@@ -39,11 +39,25 @@ struct Rate {
     resets_at: Timestamp,
 }
 
+/// Tokens as an integer, USD as dollars.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Amount {
+    Tokens(i64),
+    Usd(f64),
+}
+
+impl Amount {
+    fn of(v: i64, usd: bool) -> Self {
+        if usd { Self::Usd(micro_to_usd(v)) } else { Self::Tokens(v) }
+    }
+}
+
 #[derive(Serialize)]
 struct TokenBudget {
-    limit: f64,
-    spent: f64,
-    remaining: f64,
+    limit: Amount,
+    spent: Amount,
+    remaining: Amount,
 }
 
 #[derive(Serialize)]
@@ -63,11 +77,11 @@ struct TokenView<'a> {
 struct PeriodBudget {
     period: Period,
     unit: &'static str,
-    limit: f64,
-    spent: f64,
+    limit: Amount,
+    spent: Amount,
     /// Held by requests in flight.
-    reserved: f64,
-    remaining: f64,
+    reserved: Amount,
+    remaining: Amount,
     resets_at: Timestamp,
 }
 
@@ -158,7 +172,7 @@ pub async fn view(State(st): State<AppState>, req: Request) -> Response {
         resets_at: window_reset(at),
     };
     let tokens_budget = |limit: Option<i64>, spent: i64, usd: bool| {
-        let amount = |v: i64| if usd { micro_to_usd(v) } else { v as f64 };
+        let amount = |v: i64| Amount::of(v, usd);
         limit.map(|l| TokenBudget {
             limit: amount(l),
             spent: amount(spent),
@@ -189,7 +203,7 @@ pub async fn view(State(st): State<AppState>, req: Request) -> Response {
             ("usd", tenant_limits.micro_usd(period), s.spent_micro_usd, s.reserved_micro_usd),
         ] {
             let Some(limit) = limit else { continue };
-            let amount = |v: i64| if unit == "usd" { micro_to_usd(v) } else { v as f64 };
+            let amount = |v: i64| Amount::of(v, unit == "usd");
             budgets.push(PeriodBudget {
                 period,
                 unit,
