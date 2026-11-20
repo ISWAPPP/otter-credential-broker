@@ -16,6 +16,7 @@ struct Routes {
     anthropic: Upstream,
     openai: Upstream,
     gateway: Upstream,
+    gateway_port: u16,
 }
 
 /// Providers `anthropic` and `gateway` (both of the Anthropic kind; the
@@ -56,7 +57,7 @@ async fn routes() -> Option<Routes> {
     env.put_secret("tenant-a", "llm.anthropic", "llm_api_key", KEY_A).await;
     env.put_secret("tenant-a", "llm.openai", "llm_api_key", OPENAI_KEY).await;
     env.put_secret("tenant-a", "llm.gateway", "llm_api_key", GATEWAY_KEY).await;
-    Some(Routes { env, anthropic, openai, gateway })
+    Some(Routes { env, anthropic, openai, gateway, gateway_port: g.port() })
 }
 
 impl Routes {
@@ -198,5 +199,19 @@ async fn usd_budgets_work_with_borrowed_prices() {
     env.settle().await;
     let (_, t) = env.admin_call("GET", &format!("/v1/admin/tenants/tenant-a/llm-tokens/{token_id}"), None).await;
     assert_eq!(t["spent_micro_usd"].as_i64(), Some(1350), "{t}");
+    r.env.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_admin_view_shows_each_providers_routing() {
+    let Some(r) = routes().await else { return };
+    let (s, v) = r.env.admin_call("GET", "/v1/admin/providers", None).await;
+    assert_eq!(s, StatusCode::OK);
+    let gw = v["providers"].as_array().unwrap().iter().find(|p| p["id"] == "gateway").unwrap().clone();
+    assert_eq!(gw["kind"], "anthropic");
+    assert_eq!(gw["access"], "explicit");
+    assert_eq!(gw["endpoints"], json!(["messages", "count_tokens"]));
+    assert_eq!(gw["pricing_from"], "anthropic");
+    assert_eq!(gw["host"], format!("127.0.0.1:{}", r.gateway_port));
     r.env.cleanup().await;
 }

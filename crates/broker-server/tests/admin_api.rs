@@ -305,3 +305,39 @@ async fn kek_rewrap_endpoint() {
     assert_eq!(v["current_kek_id"], "test-1");
     env.cleanup().await;
 }
+
+#[tokio::test]
+async fn providers_are_listed_read_only() {
+    let Some(env) = Env::new().await else { return };
+    env.seed_keys().await;
+    let (s, v) = env.admin_call("GET", "/v1/admin/providers", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["config_version"].as_u64(), Some(env.state.proxy.snapshot().version()));
+    let providers = v["providers"].as_array().unwrap();
+    let ids: Vec<&str> = providers.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["anthropic", "deepseek", "openrouter"]);
+    assert_eq!(
+        providers[0],
+        json!({"id": "anthropic", "kind": "anthropic", "host": env.upstream_addr.to_string(),
+               "endpoints": ["messages", "count_tokens", "models"], "access": "implicit",
+               "has_tls": false, "tls_not_after": null, "pricing_from": null})
+    );
+    // Only the host of a base URL is shown (openrouter's has the path /v1/).
+    assert_eq!(providers[2]["host"], env.upstream_addr.to_string());
+    assert_eq!(providers[2]["endpoints"], json!(["chat_completions", "models"]));
+    let text = v.to_string();
+    assert!(!text.contains("/v1") && !text.contains(KEY_A) && !text.contains(DS_KEY_A), "{text}");
+
+    // Read-only, admin only, and not on the public listener.
+    let auth = format!("Bearer {ADMIN_TOKEN}");
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        let (s, _) =
+            call(&env.admin, method, "/v1/admin/providers", &[("authorization", &auth)], Some("{}".into())).await;
+        assert!(s == StatusCode::METHOD_NOT_ALLOWED || s == StatusCode::NOT_FOUND, "{method}: {s}");
+    }
+    let (s, _) = call(&env.admin, "GET", "/v1/admin/providers", &[], None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&env.public, "GET", "/v1/admin/providers", &[("authorization", &auth)], None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    env.cleanup().await;
+}

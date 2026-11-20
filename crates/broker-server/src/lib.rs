@@ -114,6 +114,7 @@ pub fn admin_router(state: AppState, timeout: Duration, body_limit: usize) -> Ro
         .route(&format!("{t}/job-tokens/{{id}}/revoke"), post(admin::revoke_job_token))
         .route(&format!("{t}/usage"), get(admin::usage))
         .route("/v1/admin/audit", get(admin::audit))
+        .route("/v1/admin/providers", get(admin::list_providers))
         .route("/v1/admin/kek/rewrap", post(admin::rewrap))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin::require_admin))
         .layer(DefaultBodyLimit::max(body_limit))

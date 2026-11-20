@@ -1,6 +1,7 @@
 //! Admin API for the platform core: secrets (write-only values), internal LLM
-//! tokens, job tokens, usage, audit and KEK maintenance. All routes require an
-//! admin bearer token and are served on the admin listener only.
+//! tokens, job tokens, usage, audit, KEK maintenance and a read-only view of
+//! the configured LLM providers. All routes require an admin bearer token and
+//! are served on the admin listener only.
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -348,6 +349,60 @@ pub async fn rewrap(
     let trace;
     let ctx = ctx!(p, trace);
     Ok(Json(st.keeper.rewrap(ctx, q.limit.unwrap_or(500)).await?).into_response())
+}
+
+// ---------- providers ----------
+
+#[derive(Serialize)]
+struct ProviderView<'a> {
+    id: &'a str,
+    kind: &'static str,
+    /// Host and port of the base URL; its path and query are not shown.
+    host: String,
+    endpoints: Vec<&'static str>,
+    access: &'static str,
+    has_tls: bool,
+    /// Earliest expiry of the provider's CA and client certificates.
+    tls_not_after: Option<i64>,
+    pricing_from: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ProvidersView<'a> {
+    /// Version of the provider configuration in use on this replica.
+    config_version: u64,
+    providers: Vec<ProviderView<'a>>,
+}
+
+/// `GET /v1/admin/providers`: the providers this replica uses. Read-only:
+/// providers change only through the configuration file.
+#[tracing::instrument(name = "admin.providers.list", skip_all)]
+pub async fn list_providers(State(st): State<AppState>) -> Response {
+    let snap = st.proxy.snapshot();
+    let providers = snap
+        .providers()
+        .map(|p| ProviderView {
+            id: &p.id,
+            kind: p.kind.as_str(),
+            host: host(&p.base_url),
+            endpoints: p.endpoints.iter().map(|e| e.name).collect(),
+            access: p.access.as_str(),
+            has_tls: p.tls.is_some(),
+            tls_not_after: snap.tls_not_after(&p.id),
+            pricing_from: p.pricing_from.as_deref(),
+        })
+        .collect();
+    Json(ProvidersView { config_version: snap.version(), providers }).into_response()
+}
+
+/// `host[:port]` of a validated base URL.
+fn host(base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(base_url) else { return String::new() };
+    match (url.host_str(), url.port()) {
+        (Some(h), Some(port)) => format!("{h}:{port}"),
+        (Some(h), None) => h.to_owned(),
+        (None, _) => String::new(),
+    }
 }
 
 // ---------- worker ----------

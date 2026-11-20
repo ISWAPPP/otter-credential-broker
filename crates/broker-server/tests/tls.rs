@@ -90,6 +90,18 @@ async fn each_provider_presents_only_its_own_client_certificate() {
     assert_eq!(snapshot.tls_not_after("gateway-ca"), Some(4_922_899_200));
     assert_eq!(snapshot.tls_not_after("anthropic"), None);
     assert_eq!(gauge("ocb_upstream_tls_cert_expiry_timestamp{provider=\"gateway-ca\"}"), Some(4_922_899_200.0));
+
+    let (_, v) = env.admin_call("GET", "/v1/admin/providers", None).await;
+    let view = |id: &str| v["providers"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap().clone();
+    assert_eq!(
+        (view("gateway")["has_tls"].as_bool(), view("gateway")["tls_not_after"].as_i64()),
+        (Some(true), Some(4_904_409_600))
+    );
+    assert_eq!(
+        (view("anthropic")["has_tls"].as_bool(), view("anthropic")["tls_not_after"].as_i64()),
+        (Some(false), None)
+    );
+    assert!(!v.to_string().contains("fixtures"), "file paths are not shown");
     env.cleanup().await;
 }
 
