@@ -201,6 +201,13 @@ tenant's gateway, an expensive pool): with `access = "explicit"` a provider
 serves only tokens whose list names it. The check uses the token row's
 provider list, which the row MAC covers.
 
+Provider ids are not secret. An unknown id, or an endpoint a provider does
+not serve, gets 404 before the token is checked, as on the older routes,
+so a caller without a token can list the configured ids. Hiding them would
+need a token lookup before every 404; access depends on the token check,
+not on ids being unknown, so ids should simply not carry confidential
+names.
+
 ## D-019 Reloading providers and prices (accepted)
 
 Providers, prices and the clients of providers with TLS settings form one

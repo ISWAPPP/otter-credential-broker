@@ -74,6 +74,13 @@
   configurations; `ocb_config_version` shows each replica's.
 - **Configuration changes affect new requests only.** Removing a provider
   or making it explicit does not stop a stream that is already running.
+- **Provider ids are visible without a token.** An unknown provider, or an
+  endpoint a provider does not serve, gets 404 before the token is
+  checked, so a caller without a token can find out which ids are
+  configured and which endpoints each one serves, explicit providers
+  included. Ids are not secret: access is enforced by the token check
+  (`access = "explicit"` included), not by hiding ids, so an id should not
+  carry a confidential name such as a customer's.
 - **Abandoned generations are paid for.** Because the exchange drains the
   upstream response for accounting, a request the caller cancels still runs
   to completion at the provider (bounded by its `max_tokens`) and is billed.

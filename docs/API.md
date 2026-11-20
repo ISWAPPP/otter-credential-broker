@@ -45,7 +45,8 @@ usage), 401 (missing, unknown, expired or revoked token), 402
 `budget_exceeded`, 403 (provider not allowed for the token: left out of its
 `providers` list, or a provider with `access = "explicit"` that the list
 does not name; or no key for the tenant), 404 (unknown provider, or an
-endpoint the provider does not serve), 413, 429 `rate_limited` (token
+endpoint the provider does not serve; answered before the token is
+checked, so provider ids are not secret), 413, 429 `rate_limited` (token
 rate limit, or too many failed token checks from one address) or
 `too_many_in_flight`, both with `Retry-After`, 502 `upstream_unavailable` or
 `upstream_bad_encoding` (compressed response refused), 503 `shutting_down`,
