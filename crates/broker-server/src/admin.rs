@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::AppState;
-use crate::config::ProviderHeaders;
+use crate::config::{ProviderBody, ProviderHeaders};
 use crate::error::{ApiError, JsonBody};
 use crate::observe::current_trace_id;
 
@@ -368,6 +368,8 @@ struct ProviderView<'a> {
     pricing_from: Option<&'a str>,
     /// Headers passed through by name prefix, beyond the fixed allowlists.
     headers: &'a ProviderHeaders,
+    /// Checks of the request body.
+    body: &'a ProviderBody,
 }
 
 #[derive(Serialize)]
@@ -394,6 +396,7 @@ pub async fn list_providers(State(st): State<AppState>) -> Response {
             tls_not_after: snap.tls_not_after(&p.id),
             pricing_from: p.pricing_from.as_deref(),
             headers: &p.headers,
+            body: &p.body,
         })
         .collect();
     Json(ProvidersView { config_version: snap.version(), providers }).into_response()

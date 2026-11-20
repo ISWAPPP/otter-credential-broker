@@ -321,7 +321,8 @@ async fn providers_are_listed_read_only() {
         json!({"id": "anthropic", "kind": "anthropic", "host": env.upstream_addr.to_string(),
                "endpoints": ["messages", "count_tokens", "models"], "access": "implicit",
                "has_tls": false, "tls_not_after": null, "pricing_from": null,
-               "headers": {"request_forward_prefixes": [], "response_forward_prefixes": []}})
+               "headers": {"request_forward_prefixes": [], "response_forward_prefixes": []},
+               "body": {"deny_server_tools": false, "server_tool_allowlist": []}})
     );
     // Only the host of a base URL is shown (openrouter's has the path /v1/).
     assert_eq!(providers[2]["host"], env.upstream_addr.to_string());

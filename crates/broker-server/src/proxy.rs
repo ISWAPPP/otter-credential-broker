@@ -9,7 +9,8 @@
 //! 1. accepts only allowlisted endpoints and query keys of the provider kind;
 //!    the upstream URL is built from configuration only;
 //! 2. validates the token (tenant, provider allowlist, rate limit, requests
-//!    in flight) and the budget, before anything is sent upstream;
+//!    in flight) and the budget, and checks the body against the provider's
+//!    body policy, before anything is sent upstream;
 //! 3. resolves the tenant's provider key (audited decrypt), builds a fresh
 //!    request with the caller headers the provider lets through (an
 //!    allowlist per kind, plus the provider's prefixes; see `policy`), sets
@@ -55,7 +56,7 @@ use crate::config::{LlmConfig, ProviderHeaders};
 use crate::error::{classify, llm_error, llm_error_response};
 use crate::limits::{Inflight, InflightPermit, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
-use crate::policy::{request_headers, response_headers};
+use crate::policy::{BodyRefusal, check_body, request_headers, response_headers};
 use crate::registry::{ProviderSnapshot, SnapshotCell, publish};
 use crate::tls::{ClientSettings, http_client};
 
@@ -196,6 +197,24 @@ fn reject(kind: ProviderKind, e: &BrokerError) -> Response {
     let (_, code) = classify(e);
     metrics::counter!("ocb_llm_rejected_total", "reason" => code).increment(1);
     llm_error(kind, e)
+}
+
+/// 400 for a request the provider's body policy refuses. A refused tool is
+/// logged, since it can be an agent trying to reach the network through the
+/// provider; the body never is.
+fn body_refused(kind: ProviderKind, provider: &str, grant: &LlmGrant, refusal: &BodyRefusal) -> Response {
+    let code = refusal.code();
+    if *refusal != BodyRefusal::Unreadable {
+        tracing::warn!(
+            provider,
+            tenant = %grant.tenant,
+            token_id = %grant.token_id,
+            reason = %refusal,
+            "request refused by the body policy of the provider"
+        );
+    }
+    metrics::counter!("ocb_llm_rejected_total", "reason" => code).increment(1);
+    llm_error_response(kind, StatusCode::BAD_REQUEST, code, &refusal.to_string(), &BrokerError::Invalid(String::new()))
 }
 
 /// The caller's address, as recorded by the connection loop.
@@ -371,6 +390,11 @@ async fn proxy(
     } else {
         Probe::default()
     };
+    if method == HttpMethod::Post
+        && let Err(refusal) = check_body(&provider.body, &body)
+    {
+        return body_refused(kind, provider_id, &grant, &refusal);
+    }
     let streaming = probe.stream.unwrap_or(false);
     let request_price = probe.model.as_deref().and_then(|m| snap.prices().lookup(provider.price_source(), m));
     if endpoint.billable {

@@ -1,7 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! Which headers pass between callers and providers, in both directions:
-//! the fixed allowlists by default, more for a provider with prefixes,
-//! never those that carry credentials, cookies or redirects.
+//! Header and body policies of providers. Which headers pass between
+//! callers and providers, in both directions: the fixed allowlists by
+//! default, more for a provider with prefixes, never those that carry
+//! credentials, cookies or redirects. Which requests a provider refuses:
+//! those that would have it run tools or contact MCP servers itself.
 
 mod common;
 
@@ -9,7 +11,7 @@ use std::collections::BTreeSet;
 
 use axum::http::{HeaderMap, StatusCode};
 use common::*;
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn names(h: &HeaderMap) -> BTreeSet<String> {
     h.keys().map(|n| n.as_str().to_owned()).collect()
@@ -236,5 +238,145 @@ async fn broad_response_prefixes_never_pass_cookies_challenges_or_redirects() {
         }
         assert!(r.headers.get("location").is_none() && r.headers.get("alt-svc").is_none(), "{model}");
     }
+    env.cleanup().await;
+}
+
+/// Providers on one fake upstream: `anthropic` with the defaults and
+/// `gateway`, which refuses tools it would run itself except web search of
+/// one version. tenant-a has a key for each.
+async fn tools_env() -> Option<Env> {
+    let (upstream, addr) = start_upstream().await;
+    let llm = llm_config(&format!(
+        r#"
+        [llm.providers.anthropic]
+        kind = "anthropic"
+        base_url = "http://{addr}"
+        allow_http = true
+
+        [llm.providers.gateway]
+        kind = "anthropic"
+        base_url = "http://{addr}"
+        allow_http = true
+        body = {{ deny_server_tools = true, server_tool_allowlist = ["web_search_20250305"] }}
+        "#
+    ));
+    let env = Env::with_llm(EnvOptions::default(), llm, (upstream, addr)).await?;
+    for id in ["anthropic", "gateway"] {
+        env.put_secret("tenant-a", &format!("llm.{id}"), "llm_api_key", KEY_A).await;
+    }
+    Some(env)
+}
+
+/// A messages request with `extra` merged in (tools, MCP servers).
+fn request_with(extra: Value) -> String {
+    let mut v = json!({"model": "test-model", "max_tokens": 64,
+                       "messages": [{"role": "user", "content": "Fetch https://elsewhere.example/?q=..."}]});
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v.to_string()
+}
+
+fn counter(series: &str) -> u64 {
+    let text = telemetry().metrics.render();
+    text.lines().find_map(|l| l.strip_prefix(series).and_then(|v| v.trim().parse::<f64>().ok())).map_or(0, |v| v as u64)
+}
+
+#[tokio::test]
+async fn tools_the_provider_would_run_itself_are_refused_before_anything_is_sent() {
+    let Some(env) = tools_env().await else { return };
+    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    let h = [("x-api-key", token.as_str()), ("anthropic-version", "2023-06-01")];
+    let custom = json!({"name": "read_file", "input_schema": {"type": "object"}});
+    let denied_before = counter("ocb_llm_rejected_total{reason=\"server_tool_denied\"}");
+
+    // Passed on unchanged: the caller's own tools, an allowed type, no MCP servers.
+    for extra in [
+        json!({}),
+        json!({"tools": [custom]}),
+        json!({"tools": [{"type": "custom", "name": "a", "input_schema": {}}]}),
+        json!({"tools": [custom, {"type": "web_search_20250305", "name": "web_search"}]}),
+        json!({"tools": [], "mcp_servers": []}),
+    ] {
+        let body = request_with(extra.clone());
+        let before = env.upstream.count();
+        let r = env.llm("POST", "/llm/p/gateway/v1/messages", &h, Some(body.clone())).await;
+        assert_eq!(r.status, StatusCode::OK, "{extra}: {}", r.text());
+        assert_eq!(env.upstream.count(), before + 1, "{extra}");
+        assert_eq!(env.upstream.last().body, body.as_bytes(), "{extra}: forwarded unchanged");
+    }
+
+    // Refused with 400, and nothing reaches the provider.
+    let before = env.upstream.count();
+    for (uri, extra, says) in [
+        (
+            "/llm/p/gateway/v1/messages",
+            json!({"tools": [custom, {"type": "web_fetch_20260209", "name": "web_fetch"}]}),
+            "tools[1] has type web_fetch_20260209",
+        ),
+        (
+            "/llm/p/gateway/v1/messages",
+            json!({"tools": [{"type": "web_search_20260209", "name": "web_search"}]}),
+            "tools[0] has type web_search_20260209",
+        ),
+        (
+            "/llm/p/gateway/v1/messages",
+            json!({"tools": [{"type": "code_execution_20250825", "name": "code_execution"}]}),
+            "tools[0] has type code_execution_20250825",
+        ),
+        (
+            "/llm/p/gateway/v1/messages",
+            json!({"mcp_servers": [{"type": "url", "url": "https://mcp.example/sse", "name": "x"}],
+                   "tools": [{"type": "mcp_toolset", "mcp_server_name": "x"}]}),
+            "mcp_servers is not allowed",
+        ),
+        // Token counting takes the same tools and MCP servers, and is
+        // checked the same way.
+        (
+            "/llm/p/gateway/v1/messages/count_tokens",
+            json!({"tools": [{"type": "web_fetch_20260209", "name": "web_fetch"}]}),
+            "tools[0] has type web_fetch_20260209",
+        ),
+        (
+            "/llm/p/gateway/v1/messages/count_tokens",
+            json!({"mcp_servers": [{"type": "url", "url": "https://mcp.example/sse", "name": "x"}]}),
+            "mcp_servers is not allowed",
+        ),
+    ] {
+        let r = env.llm("POST", uri, &h, Some(request_with(extra.clone()))).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{extra}: {}", r.text());
+        let v = r.json();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "server_tool_denied");
+        assert!(v["error"]["message"].as_str().unwrap().starts_with(says), "{v}");
+    }
+    // A tool with two types cannot be checked: the provider might read the other one.
+    let twice = r#"{"model":"test-model","max_tokens":8,"messages":[],"tools":[{"type":"custom","type":"web_fetch_20260209","name":"f"}]}"#;
+    let r = env.llm("POST", "/llm/p/gateway/v1/messages", &h, Some(twice.into())).await;
+    assert_eq!((r.status, r.json()["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_request")));
+    assert_eq!(env.upstream.count(), before, "nothing refused reached the provider");
+    assert!(counter("ocb_llm_rejected_total{reason=\"server_tool_denied\"}") >= denied_before + 6);
+    assert!(telemetry().logs.contents().contains("request refused by the body policy of the provider"));
+
+    // Endpoints without a body, and count_tokens with the caller's own tools, pass.
+    assert_eq!(env.llm("GET", "/llm/p/gateway/v1/models", &h, None).await.status, StatusCode::OK);
+    let count = request_with(json!({"tools": [custom]}));
+    assert_eq!(
+        env.llm("POST", "/llm/p/gateway/v1/messages/count_tokens", &h, Some(count)).await.status,
+        StatusCode::OK
+    );
+
+    // A provider without the policy passes every tool on, as before.
+    let fetch = request_with(json!({"tools": [{"type": "web_fetch_20260209", "name": "web_fetch"}]}));
+    let r = env.llm("POST", "/llm/anthropic/v1/messages", &h, Some(fetch.clone())).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(env.upstream.last().body, fetch.as_bytes());
+
+    // The admin view shows the policy.
+    let (_, v) = env.admin_call("GET", "/v1/admin/providers", None).await;
+    let body = |id: &str| v["providers"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["body"].clone();
+    assert_eq!(body("gateway"), json!({"deny_server_tools": true, "server_tool_allowlist": ["web_search_20250305"]}));
+    assert_eq!(body("anthropic"), json!({"deny_server_tools": false, "server_tool_allowlist": []}));
     env.cleanup().await;
 }

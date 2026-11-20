@@ -1,24 +1,33 @@
-//! Which headers pass between callers and providers.
+//! What a provider lets through: which headers pass between callers and
+//! the provider, and which request bodies it refuses.
 //!
-//! Callers' headers go upstream when they are on the allowlist of the
-//! provider's kind; upstream response headers come back when they are on
-//! [`FORWARDED_RESPONSE_HEADERS`]. A provider can add more in each
+//! Headers. Callers' headers go upstream when they are on the allowlist of
+//! the provider's kind; upstream response headers come back when they are
+//! on [`FORWARDED_RESPONSE_HEADERS`]. A provider can add more in each
 //! direction by name prefix (`headers` in its configuration); without
-//! prefixes it forwards exactly the allowlists.
+//! prefixes it forwards exactly the allowlists. Some headers are never
+//! forwarded, whatever the prefixes say: those that carry credentials or
+//! cookies, decide where a request goes or how a body is framed, hop-by-hop
+//! headers, and headers the broker sets itself. A prefix that could match
+//! one of them is refused when the configuration is loaded, and every header
+//! forwarded by prefix is checked against them again.
 //!
-//! Some headers are never forwarded, whatever the prefixes say: those that
-//! carry credentials or cookies, decide where a request goes or how a body
-//! is framed, hop-by-hop headers, and headers the broker sets itself. A
-//! prefix that could match one of them is refused when the configuration is
-//! loaded, and every header forwarded by prefix is checked against them
-//! again.
+//! Body. A provider of kind `anthropic` with `body.deny_server_tools`
+//! refuses requests that would have it reach out on its own: MCP servers it
+//! would connect to (`mcp_servers`), and tools it defines and runs itself,
+//! such as web search, web fetch or code execution. Such tools are told
+//! apart from the caller's own by their `type`: a tool with a type other
+//! than `custom` is refused unless the type is on `server_tool_allowlist`.
+//! The body is otherwise forwarded unchanged.
 
 use std::fmt;
 
 use axum::http::HeaderMap;
 use broker_core::llm::ProviderKind;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 
-use crate::config::ProviderHeaders;
+use crate::config::{ProviderBody, ProviderHeaders};
 
 /// Upstream response headers passed back for every provider. Everything
 /// else (cookies, provider account and rate-limit details, hop-by-hop
@@ -173,6 +182,125 @@ pub(crate) fn response_headers(h: &ProviderHeaders, upstream: &HeaderMap) -> Hea
         }
     }
     out
+}
+
+/// Checks the `body` of provider `id`, of kind `kind`.
+pub(crate) fn validate_body(id: &str, kind: ProviderKind, b: &ProviderBody) -> Result<(), String> {
+    let what = format!("llm.providers.{id}.body");
+    if *b == ProviderBody::default() {
+        return Ok(());
+    }
+    if kind != ProviderKind::Anthropic {
+        return Err(format!("{what}: only providers of kind anthropic check request bodies"));
+    }
+    if !b.deny_server_tools {
+        return Err(format!("{what}.server_tool_allowlist: has no effect without deny_server_tools = true"));
+    }
+    for (i, t) in b.server_tool_allowlist.iter().enumerate() {
+        if t.is_empty() || !t.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') {
+            return Err(format!(
+                "{what}.server_tool_allowlist: {t:?} is not a tool type (lowercase letters, digits and '_', e.g. web_search_20250305)"
+            ));
+        }
+        if b.server_tool_allowlist[..i].contains(t) {
+            return Err(format!("{what}.server_tool_allowlist: {t:?} is listed twice"));
+        }
+    }
+    Ok(())
+}
+
+/// Why the body policy refused a request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BodyRefusal {
+    /// The body is not a JSON object, or its `tools` or `mcp_servers` do
+    /// not have their usual shape, a key given twice included: it cannot be
+    /// checked.
+    Unreadable,
+    /// `mcp_servers` names servers the provider would connect to.
+    McpServers,
+    /// `tools[index]` has a type that is neither `custom` nor allowed. The
+    /// type is kept when it looks like one.
+    ToolType { index: usize, tool_type: Option<String> },
+}
+
+impl BodyRefusal {
+    /// The error code callers see.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Unreadable => "invalid_request",
+            Self::McpServers | Self::ToolType { .. } => "server_tool_denied",
+        }
+    }
+}
+
+impl fmt::Display for BodyRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let allowed = "this provider accepts custom tools and only the tool types it is configured to allow";
+        match self {
+            Self::Unreadable => f.write_str(
+                "request body must be a JSON object, with tools an array of objects and mcp_servers an array, \
+                 and no key given twice",
+            ),
+            Self::McpServers => {
+                f.write_str("mcp_servers is not allowed: this provider does not connect to MCP servers for a caller")
+            }
+            Self::ToolType { index, tool_type: Some(t) } => {
+                write!(f, "tools[{index}] has type {t}, which is not allowed: {allowed}")
+            }
+            Self::ToolType { index, tool_type: None } => {
+                write!(f, "tools[{index}] has a type that is not allowed: {allowed}")
+            }
+        }
+    }
+}
+
+/// The parts of a request body the body policy reads. serde refuses a
+/// field given twice, so a body cannot carry two `tools`, or a tool two
+/// `type`s, of which the broker would check one and the provider use the
+/// other.
+#[derive(Deserialize)]
+struct BodyTools {
+    #[serde(default)]
+    tools: Option<Vec<ToolType>>,
+    #[serde(default)]
+    mcp_servers: Option<Vec<IgnoredAny>>,
+}
+
+/// A tool as the body policy sees it. (serde would read a tool given as an
+/// array by position; the provider refuses such a tool, so nothing passes
+/// that way.)
+#[derive(Deserialize)]
+struct ToolType {
+    /// Absent (or null) for the caller's own tools.
+    #[serde(default, rename = "type")]
+    tool_type: Option<String>,
+}
+
+/// Checks a request body against the provider's body policy.
+pub(crate) fn check_body(policy: &ProviderBody, body: &[u8]) -> Result<(), BodyRefusal> {
+    if !policy.deny_server_tools {
+        return Ok(());
+    }
+    // serde would also read a struct from an array, by position.
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return Err(BodyRefusal::Unreadable);
+    }
+    let parsed: BodyTools = serde_json::from_slice(body).map_err(|_| BodyRefusal::Unreadable)?;
+    if parsed.mcp_servers.is_some_and(|s| !s.is_empty()) {
+        return Err(BodyRefusal::McpServers);
+    }
+    for (index, tool) in parsed.tools.unwrap_or_default().into_iter().enumerate() {
+        let Some(t) = tool.tool_type else { continue };
+        if t == "custom" || policy.server_tool_allowlist.contains(&t) {
+            continue;
+        }
+        // Shown back only when it cannot be anything but a tool type.
+        let plain = !t.is_empty()
+            && t.len() <= 64
+            && t.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'.');
+        return Err(BodyRefusal::ToolType { index, tool_type: plain.then_some(t) });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -350,5 +478,103 @@ mod tests {
             "x-custom",
         ]);
         assert_eq!(names(&response_headers(&p, &upstream)), ["x-custom"]);
+    }
+
+    fn deny(allow: &[&str]) -> ProviderBody {
+        ProviderBody { deny_server_tools: true, server_tool_allowlist: allow.iter().map(|t| (*t).to_owned()).collect() }
+    }
+
+    #[test]
+    fn body_policy_settings() {
+        let anthropic = ProviderKind::Anthropic;
+        assert!(validate_body("gw", anthropic, &ProviderBody::default()).is_ok());
+        assert!(validate_body("ds", ProviderKind::Openai, &ProviderBody::default()).is_ok());
+        assert!(validate_body("gw", anthropic, &deny(&[])).is_ok());
+        assert!(validate_body("gw", anthropic, &deny(&["web_search_20250305", "text_editor_20250728"])).is_ok());
+        assert_eq!(
+            validate_body("ds", ProviderKind::Openai, &deny(&[])).unwrap_err(),
+            "llm.providers.ds.body: only providers of kind anthropic check request bodies"
+        );
+        let allow_only =
+            ProviderBody { deny_server_tools: false, server_tool_allowlist: vec!["web_search_20250305".into()] };
+        assert!(validate_body("gw", anthropic, &allow_only).is_err(), "an allowlist without the deny");
+        for bad in ["", "web_search_*", "web_search*", "Web_Search_20250305", "web-search", "web_search_20250305 "] {
+            assert!(validate_body("gw", anthropic, &deny(&[bad])).is_err(), "{bad:?}");
+        }
+        assert!(validate_body("gw", anthropic, &deny(&["bash_20250124", "bash_20250124"])).is_err(), "listed twice");
+    }
+
+    #[test]
+    fn tools_the_provider_would_run_itself_are_refused() {
+        let policy = deny(&["web_search_20250305"]);
+        let check = |body: &str| check_body(&policy, body.as_bytes());
+        let tool = |index, t: &str| Err(BodyRefusal::ToolType { index, tool_type: Some(t.to_owned()) });
+        for ok in [
+            r#"{"model":"m","messages":[]}"#,
+            r#" {"tools":null,"mcp_servers":null}"#,
+            r#"{"tools":[],"mcp_servers":[]}"#,
+            // The caller's own tools; a `type` inside a tool's schema is not its type.
+            r#"{"tools":[{"name":"read_file","input_schema":{"type":"object"}}]}"#,
+            r#"{"tools":[{"type":"custom","name":"a","input_schema":{}},{"type":null,"name":"b"}]}"#,
+            // An escaped `custom` reads as `custom`, here as at the provider.
+            r#"{"tools":[{"type":"cust\u006fm","name":"c"}]}"#,
+            // Types that appear elsewhere in the body are not tools.
+            r#"{"messages":[{"role":"user","content":[{"type":"web_fetch_tool_result"}]}],"tools":[]}"#,
+            // Allowed by name, version date included.
+            r#"{"tools":[{"type":"web_search_20250305","name":"web_search"}]}"#,
+        ] {
+            assert_eq!(check(ok), Ok(()), "{ok}");
+        }
+        let fetch = r#"{"tools":[{"name":"a"},{"type":"web_fetch_20260209","name":"web_fetch"}]}"#;
+        assert_eq!(check(fetch), tool(1, "web_fetch_20260209"));
+        let newer = r#"{"tools":[{"type":"web_search_20260209","name":"web_search"}]}"#;
+        assert_eq!(check(newer), tool(0, "web_search_20260209"), "exact types only");
+        let code = r#"{"tools":[{"type":"code_execution_20250825","name":"code_execution"}]}"#;
+        assert_eq!(check(code), tool(0, "code_execution_20250825"));
+        // Any type but `custom` needs an entry, the provider's client-side
+        // tools included: the broker cannot tell which run where.
+        assert_eq!(check(r#"{"tools":[{"type":"bash_20250124","name":"bash"}]}"#), tool(0, "bash_20250124"));
+        let toolset = r#"{"tools":[{"type":"mcp_toolset","mcp_server_name":"x"}]}"#;
+        assert_eq!(check(toolset), tool(0, "mcp_toolset"));
+        for odd in [r#"{"tools":[{"type":""}]}"#, r#"{"tools":[{"type":"web search & more"}]}"#] {
+            assert_eq!(check(odd), Err(BodyRefusal::ToolType { index: 0, tool_type: None }), "{odd}");
+        }
+        let mcp = r#"{"mcp_servers":[{"type":"url","url":"https://mcp.example/sse","name":"x"}],"tools":[]}"#;
+        assert_eq!(check(mcp), Err(BodyRefusal::McpServers));
+
+        for unreadable in [
+            "",
+            "not json",
+            "[]",
+            r#"[[{"type":"web_fetch_20260209"}]]"#,
+            r#""tools""#,
+            r#"{"tools":{"type":"web_fetch_20260209"}}"#,
+            r#"{"tools":["web_fetch_20260209"]}"#,
+            r#"{"tools":[{"type":5}]}"#,
+            r#"{"mcp_servers":{"x":{"url":"https://mcp.example"}}}"#,
+            r#"{"mcp_servers":"https://mcp.example"}"#,
+            // A key given twice: the provider may read the other one.
+            r#"{"tools":[{"type":"custom","type":"web_fetch_20260209"}]}"#,
+            r#"{"tools":[{"type":"web_fetch_20260209","type":"custom"}]}"#,
+            r#"{"tools":[],"tools":[{"type":"web_fetch_20260209"}]}"#,
+            r#"{"mcp_servers":[],"mcp_servers":[{"type":"url"}]}"#,
+            r#"{"tools":[]} {}"#,
+        ] {
+            assert_eq!(check(unreadable), Err(BodyRefusal::Unreadable), "{unreadable}");
+        }
+        // Without deny_server_tools the body is not looked at.
+        assert_eq!(check_body(&ProviderBody::default(), b"not json"), Ok(()));
+        assert_eq!(check_body(&ProviderBody::default(), fetch.as_bytes()), Ok(()));
+    }
+
+    #[test]
+    fn refusals_say_what_was_refused_without_echoing_odd_input() {
+        let shown = BodyRefusal::ToolType { index: 1, tool_type: Some("web_fetch_20260209".into()) };
+        assert!(shown.to_string().starts_with("tools[1] has type web_fetch_20260209, which is not allowed"));
+        assert_eq!(shown.code(), "server_tool_denied");
+        let hidden = BodyRefusal::ToolType { index: 0, tool_type: None };
+        assert!(hidden.to_string().starts_with("tools[0] has a type that is not allowed"));
+        assert_eq!(BodyRefusal::McpServers.code(), "server_tool_denied");
+        assert_eq!(BodyRefusal::Unreadable.code(), "invalid_request");
     }
 }

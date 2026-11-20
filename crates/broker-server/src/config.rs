@@ -193,6 +193,28 @@ pub struct ProviderConfig {
     /// None by default.
     #[serde(default)]
     pub headers: ProviderHeaders,
+    /// Checks of the request body. None by default.
+    #[serde(default)]
+    pub body: ProviderBody,
+}
+
+/// Checks of the request body before it goes upstream; the body itself is
+/// never changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBody {
+    /// Kind `anthropic` only: refuse requests that would have the provider
+    /// reach out on its own, that is with a non-empty `mcp_servers` or with
+    /// a tool whose `type` is anything but `custom` (web search, web fetch,
+    /// code execution and the provider's other tools), unless the type is
+    /// in `server_tool_allowlist`.
+    #[serde(default)]
+    pub deny_server_tools: bool,
+    /// Tool types let through all the same, compared exactly, version date
+    /// included: `web_search_20250305` does not let `web_search_20260209`
+    /// through.
+    #[serde(default)]
+    pub server_tool_allowlist: Vec<String>,
 }
 
 /// Headers a provider passes through besides the fixed allowlists, chosen
@@ -255,6 +277,7 @@ impl ProviderConfig {
             pricing_from: None,
             tls: None,
             headers: ProviderHeaders::default(),
+            body: ProviderBody::default(),
         }
     }
 }
@@ -359,6 +382,7 @@ pub struct Provider {
     pub pricing_from: Option<String>,
     pub tls: Option<ProviderTls>,
     pub headers: ProviderHeaders,
+    pub body: ProviderBody,
 }
 
 impl Provider {
@@ -436,6 +460,7 @@ impl LlmConfig {
                 }
             }
             policy::validate_headers(id, &p.headers)?;
+            policy::validate_body(id, p.kind, &p.body)?;
             out.insert(
                 id.clone(),
                 Provider {
@@ -449,6 +474,7 @@ impl LlmConfig {
                     pricing_from: p.pricing_from.clone(),
                     tls: p.tls.clone(),
                     headers: p.headers.clone(),
+                    body: p.body.clone(),
                 },
             );
         }
@@ -709,6 +735,38 @@ mod tests {
         let wide = ServerConfig::parse(&with("request_forward_prefixes = [\"x-\"]")).unwrap();
         let e = wide.llm.validate().unwrap_err();
         assert!(e.starts_with("llm.providers.x.headers.request_forward_prefixes: "), "{e}");
+    }
+
+    #[test]
+    fn provider_body() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example"
+            body = { deny_server_tools = true, server_tool_allowlist = ["web_search_20250305"] }
+
+            [llm.providers.anthropic]
+            kind = "anthropic"
+            base_url = "https://api.anthropic.com"
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        assert!(p["gateway"].body.deny_server_tools);
+        assert_eq!(p["gateway"].body.server_tool_allowlist, ["web_search_20250305"]);
+        assert_eq!(p["anthropic"].body, ProviderBody::default());
+
+        let with = |kind: &str, body: &str| {
+            format!("[llm.providers.x]\nkind = \"{kind}\"\nbase_url = \"https://x.example\"\nbody = {{ {body} }}\n")
+        };
+        assert!(ServerConfig::parse(&with("anthropic", "deny_mcp = true")).is_err(), "unknown key");
+        let valid = |kind: &str, body: &str| ServerConfig::parse(&with(kind, body)).unwrap().llm.validate().is_ok();
+        assert!(valid("openai", "deny_server_tools = false"));
+        // Only the anthropic kind checks bodies; an OpenAI-compatible
+        // provider that asks for it is refused rather than left unchecked.
+        assert!(!valid("openai", "deny_server_tools = true"));
+        assert!(!valid("anthropic", "server_tool_allowlist = [\"web_search_20250305\"]"));
     }
 
     #[test]
