@@ -101,6 +101,11 @@ const NEVER_UPSTREAM: &[Name] = &[
 
 /// Upstream response headers never passed back.
 const NEVER_BACK: &[Name] = &[
+    // The credentials the broker sends upstream: an upstream that echoes
+    // request headers would hand the provider key to the caller.
+    Name::Exact("authorization"),
+    Name::Exact("proxy-authorization"),
+    Name::Exact("x-api-key"),
     // How the broker's own response is framed and encoded.
     Name::Exact("content-length"),
     Name::Exact("content-encoding"),
@@ -346,7 +351,9 @@ mod tests {
     fn prefixes_that_could_match_a_header_never_forwarded_are_refused() {
         let ok = |request: &[&str], response: &[&str]| validate_headers("gw", &prefixes(request, response));
         assert!(ok(&[], &[]).is_ok());
-        assert!(ok(&["anthropic-", "x-stainless-", "x-app"], &["anthropic-ratelimit-", "x-", "retry"]).is_ok());
+        assert!(
+            ok(&["anthropic-", "x-stainless-", "x-app"], &["anthropic-ratelimit-", "x-ratelimit-", "retry"]).is_ok()
+        );
         // `x-forwarded` and `ratelimit` are families: a longer prefix inside
         // one is refused as well as a shorter one.
         for bad in [
@@ -374,6 +381,12 @@ mod tests {
         }
         for bad in [
             "",
+            "x-",
+            "x",
+            "x-api",
+            "authorization",
+            "a",
+            "proxy-a",
             "set-",
             "set-cookie2",
             "www-",
@@ -397,6 +410,13 @@ mod tests {
         assert_eq!(
             e,
             "llm.providers.gw.headers.request_forward_prefixes: \"x-\" could match x-api-key, which is never forwarded"
+        );
+        // Nor back: an upstream that echoes request headers would return the
+        // provider key in it.
+        let e = ok(&[], &["x-"]).unwrap_err();
+        assert_eq!(
+            e,
+            "llm.providers.gw.headers.response_forward_prefixes: \"x-\" could match x-api-key, which is never forwarded"
         );
         let e = ok(&[], &["ocb"]).unwrap_err();
         assert!(e.ends_with("\"ocb\" could match ocb-*, which is never forwarded"), "{e}");
@@ -462,6 +482,9 @@ mod tests {
         ]);
         assert_eq!(names(&request_headers(ProviderKind::Anthropic, &p, &caller)), ["x-custom"]);
         let upstream = headers(&[
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
             "content-length",
             "content-encoding",
             "transfer-encoding",

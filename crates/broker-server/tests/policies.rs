@@ -157,7 +157,7 @@ async fn prefix_env() -> Option<Env> {
         kind = "anthropic"
         base_url = "http://{addr}"
         allow_http = true
-        headers = {{ response_forward_prefixes = ["x-", "anthropic-"] }}
+        headers = {{ response_forward_prefixes = ["x-ratelimit-", "x-upstream-", "anthropic-"] }}
         "#
     ));
     let env = Env::with_llm(EnvOptions::default(), llm, (upstream, addr)).await?;
