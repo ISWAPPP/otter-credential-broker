@@ -120,6 +120,10 @@ export uses the standard `OTEL_*` variables and is off by default.
   Endpoints, query keys and caller headers are allowlisted, and redirects
   are never followed. A provider with its own TLS settings trusts only its
   own CA.
+- A provider can be set to pass more headers by name prefix, never
+  credentials, cookies or redirects, and to refuse requests that would have
+  it run tools on its own side (web search, web fetch, code execution, MCP
+  servers), which would let an agent reach past its network rules.
 - Budgets and rate limits are enforced in PostgreSQL, so they hold across
   replicas. Usage comes from the provider's own report even when the caller
   hangs up.

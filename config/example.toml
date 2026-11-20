@@ -105,6 +105,27 @@ max_concurrent_total = 1024
 #                          an HTTP client of its own that trusts only the CA
 #                          certificates in ca_file (no public roots) and
 #                          presents the client certificate (optional pair)
+#   headers = { request_forward_prefixes = [...], response_forward_prefixes = [...] }
+#                          also pass caller headers upstream, and upstream
+#                          headers back, whose names start with one of these
+#                          lowercase prefixes. Without them only the kind's
+#                          allowlist goes up, and content-type, cache-control,
+#                          retry-after, request-id, x-request-id and
+#                          x-should-retry come back. Credentials, cookies,
+#                          routing, framing and hop-by-hop headers, the
+#                          broker's own, set-cookie, www-authenticate,
+#                          location, alt-svc, ratelimit* and ocb-* never
+#                          pass; a prefix that could match one is refused.
+#                          Meant for a provider whose headers concern one
+#                          owner, such as a gateway in front of one account
+#   body = { deny_server_tools = true, server_tool_allowlist = [...] }
+#                          kind anthropic: refuse (400) requests with
+#                          mcp_servers, or with a tool the provider would run
+#                          itself (any tool type but custom: web search, web
+#                          fetch, code execution, ...), except the types
+#                          listed, compared exactly, version date included,
+#                          e.g. "web_search_20250305". Turn it on for
+#                          providers that agents use
 [llm.providers.anthropic]
 kind = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -123,6 +144,8 @@ base_url = "https://openrouter.ai/api/v1"
 
 # An Anthropic-compatible gateway on the internal network, reached over
 # mutual TLS, priced like `anthropic` and open only to tokens that name it.
+# It gets every anthropic-* header of the SDK, passes its rate-limit headers
+# back and refuses tools it would run itself.
 # Mount the certificate Secret as a directory (no subPath) so renewed
 # certificates are picked up.
 # [llm.providers.gateway]
@@ -132,6 +155,8 @@ base_url = "https://openrouter.ai/api/v1"
 # endpoints = ["messages", "count_tokens"]
 # pricing_from = "anthropic"
 # tls = { ca_file = "/etc/otter-credential-broker/gateway-tls/ca.crt", client_cert = "/etc/otter-credential-broker/gateway-tls/tls.crt", client_key = "/etc/otter-credential-broker/gateway-tls/tls.key" }
+# headers = { request_forward_prefixes = ["anthropic-"], response_forward_prefixes = ["anthropic-ratelimit-"] }
+# body = { deny_server_tools = true }
 
 # Prices in USD per million tokens. The entries below are placeholders:
 # replace the model ids and prices with the provider's current ones.

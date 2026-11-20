@@ -40,7 +40,9 @@
 | Impersonating a provider that is reached over a private network (a gateway with its own CA) | A provider with `tls` trusts only its `ca_file`; built-in and platform roots are off, so a certificate from a public CA or from another provider's CA is refused before anything, the key included, is sent. Tested with a server whose certificate comes from another CA. |
 | A client certificate offered to the wrong host | Each provider with `tls` has a client of its own; providers without `tls` use one shared client, which is built without a client certificate. Tested: a provider with `tls` but no client certificate presents none, even to a server that asks, and only providers with `tls` get a client of their own. |
 | A bad configuration while the broker runs | A changed config file is validated in full before anything is applied; an invalid one is refused and the running one stays. Changes outside `llm.providers` and `llm.pricing` are not applied until a restart. TLS files that do not fit together (a renewed certificate with the old key) are refused. A change refused only because TLS files it names are missing or do not fit together is tried again whenever one of those files changes, so a change whose Secret is updated after the config file, a stricter `access` say, is not silently left unapplied. Requests in flight keep the configuration they started with; a reload resets neither the in-flight limits nor the failed-token limiter, and shutdown still waits for every stream. |
-| Header smuggling (hop-by-hop `Connection`, duplicate auth headers, provider org headers, method override) | The upstream request is built from scratch with an allowlist of caller headers; auth is always set by the broker; ambiguous credentials are refused. CL/TE conflicts are rejected by the HTTP server. |
+| Header smuggling (hop-by-hop `Connection`, duplicate auth headers, provider org headers, method override) | The upstream request is built from scratch with an allowlist of caller headers; auth is always set by the broker; ambiguous credentials are refused. CL/TE conflicts are rejected by the HTTP server. A provider can pass more caller headers by prefix, but never credentials, cookies, routing, framing or hop-by-hop headers, nor those the broker sets: a prefix that could match one makes the configuration invalid, and every header forwarded by prefix is checked against the list again. Tested with prefixes that validation would refuse. |
+| Response headers that act on the caller or show what is not the caller's (cookies, credential challenges, redirects, account ids, rate limits of a key) | A fixed set of response headers comes back by default. A provider can pass more by prefix, meant for a provider whose headers concern one owner; `set-cookie`, `www-authenticate`, `location`, `alt-svc` and the names kept for the broker's own limit headers (`ratelimit*`, `ocb-*`) never pass, whatever the prefixes. |
+| An agent reaching the network through tools the provider runs itself (web search and fetch, code execution, MCP servers named in the request), past the rule that agent pods reach only the broker | `body.deny_server_tools` on a provider of kind `anthropic` refuses, before anything is sent, a request with a non-empty `mcp_servers` or with a tool whose `type` is not `custom` and not on the provider's allowlist (exact types, version date included). Any type but `custom` counts, so a new provider tool is refused until it is reviewed and listed. A key given twice makes the body unreadable, so the broker cannot check one `tools` or `type` while the provider uses another. Off by default; see residual risks for what it does not cover. |
 | Avoiding accounting by hanging up (before the response head or mid-stream), reading slowly or making the caller time out | The upstream exchange runs in its own task, which owns accounting and reads the upstream response to its end regardless of the caller; usage comes from the provider's report. Tested for each case. |
 | Avoiding accounting with hidden reasoning (billed but not streamed) on aborted responses | Aborted responses are drained (above). Where no report can be had (stalled or failed stream, no response, shutdown cut, compressed body) output is charged at least at the request's `max_tokens` / `max_completion_tokens`. |
 | Avoiding accounting via other endpoints (batches, files) or streaming without usage | Only allowlisted endpoints are reachable; OpenAI-compatible streams must request usage (configurable). |
@@ -105,11 +107,26 @@
   sequence. A key split across separately encoded fragments would not be
   caught; the model never sees the key, so only a reflecting upstream could
   produce it.
-- **Provider-side egress.** Request bodies are forwarded unchanged, so
-  provider server-side tools (web fetch, MCP connectors, code execution) are
-  available to agents if the provider and the request enable them. Policy for
-  that belongs to the agent platform, or to a future body policy in the
-  proxy.
+- **Provider-side egress.** Request bodies are forwarded unchanged. On a
+  provider of kind `anthropic` with `body.deny_server_tools`, tools the
+  provider would run itself and MCP servers are refused; on any other
+  provider an agent can use them if the provider and the request enable
+  them. The policy does not cover content the provider fetches by URL
+  (image or document blocks with a `url` source), server-side features of
+  OpenAI-compatible providers (each spells them its own way, so the
+  `openai` kind has no body policy), or features a provider adds outside
+  `tools` and `mcp_servers`. Restricting those belongs to the agent
+  platform or the provider account.
+- **Headers passed by prefix are not inspected.** A prefix passes whatever
+  the caller or the provider puts in matching headers. On a provider that
+  serves several tenants, a broad response prefix shows one tenant's
+  agents the account details and rate-limit use of that tenant's key, and
+  a broad request prefix lets agents send headers that change what the
+  provider does. This is why the defaults stay closed: the shared
+  providers of a default configuration serve tenants with their own keys,
+  and the header allowlist is what keeps account details away from agent
+  pods. Prefixes are meant for providers whose headers concern one owner,
+  and should be as narrow as the use needs.
 - **Revocation does not stop a stream already in progress.** New requests
   are refused immediately.
 - **What database write access still allows**: deleting rows, resetting

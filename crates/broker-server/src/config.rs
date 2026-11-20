@@ -802,4 +802,25 @@ mod tests {
         }
         assert_eq!(ServerConfig::parse(&manifest_config()).unwrap().database.max_connections, 10);
     }
+
+    /// config/example.toml with its commented-out gateway uncommented.
+    fn example_with_gateway() -> String {
+        let text = include_str!("../../../config/example.toml");
+        let start = text.find("# [llm.providers.gateway]").unwrap();
+        let gateway: Vec<&str> = text[start..].lines().map_while(|l| l.strip_prefix("# ")).collect();
+        format!("{text}\n{}\n", gateway.join("\n"))
+    }
+
+    #[test]
+    fn the_example_gateway_loads() {
+        let cfg = ServerConfig::parse(&example_with_gateway()).unwrap();
+        let (providers, _) = cfg.llm.validate().unwrap();
+        let gw = &providers["gateway"];
+        assert_eq!(gw.access, ProviderAccess::Explicit);
+        assert_eq!(gw.price_source(), "anthropic");
+        assert!(gw.tls.as_ref().is_some_and(|t| t.client_key.is_some()));
+        assert_eq!(gw.headers.request_forward_prefixes, ["anthropic-"]);
+        assert_eq!(gw.headers.response_forward_prefixes, ["anthropic-ratelimit-"]);
+        assert!(gw.body.deny_server_tools);
+    }
 }

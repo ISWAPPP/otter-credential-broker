@@ -14,6 +14,11 @@ set; anything else is `other`), `route` (the route template, never the raw
 path), `status` and `trace_id`, so all lines of one request can be
 correlated, also with the platform's traces.
 
+A request refused by a provider's body policy (a tool the provider would
+run itself, or MCP servers) is logged at warn, `request refused by the
+body policy of the provider`, with the provider, tenant, token id and what
+was refused (the tool's index and type); never the body.
+
 ## Traces
 
 A tracer provider always exists, so spans have real W3C trace and span ids.
@@ -86,7 +91,7 @@ Served on the metrics listener (`metrics_listen`, default `:9090`) at
 | `ocb_llm_cost_microdollars_total` | counter | tenant, provider, model |
 | `ocb_llm_budget_denials_total` | counter | tenant, kind = tokens, usd, unpriced_model |
 | `ocb_llm_rate_limited_total` | counter | tenant |
-| `ocb_llm_rejected_total` | counter | reason (error code of a request the proxy refused or could not complete, e.g. `unauthorized`, `rate_limited`, `too_many_in_flight`, `budget_exceeded`, `upstream_timeout`, `upstream_unavailable`, `upstream_bad_encoding`, `shutting_down`) |
+| `ocb_llm_rejected_total` | counter | reason (error code of a request the proxy refused or could not complete, e.g. `unauthorized`, `rate_limited`, `too_many_in_flight`, `budget_exceeded`, `server_tool_denied`, `upstream_timeout`, `upstream_unavailable`, `upstream_bad_encoding`, `shutting_down`) |
 | `ocb_llm_errors_total` | counter | provider, kind = an `outcome` other than `complete` |
 | `ocb_llm_usage_estimated_total` | counter | provider |
 | `ocb_llm_unpriced_response_model_total` | counter | provider (billed at the highest configured price) |

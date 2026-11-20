@@ -112,12 +112,12 @@ sequenceDiagram
   H->>H: take the provider snapshot; provider, endpoint and query allowlists, address limiter
   H->>DB: UPDATE llm_tokens ... RETURNING (valid? MAC ok? count rate-limit window)
   H->>H: in-flight permit, read body, parse model/stream/max_tokens only
-  H->>H: budget pre-check, price lookup
+  H->>H: body policy (tools, mcp_servers), budget pre-check, price lookup
   H->>DB: audit secret.decrypt, then SELECT sealed llm.<provider> of the token's tenant
   H->>X: spawn with request, key, permit
-  X->>P: same body, allowlisted headers, x-api-key: <tenant key>, traceparent
+  X->>P: same body, allowed headers, x-api-key: <tenant key>, traceparent
   P-->>X: status + JSON or SSE
-  X-->>H: response head (status, allowlisted headers)
+  X-->>H: response head (status, allowed headers)
   H-->>A: head; body chunks follow from the task
   X-->>A: same bytes (tap reads usage, redactor guards the key)
   X->>DB: UPDATE spend + INSERT llm_usage (after the upstream body ends)
@@ -147,14 +147,27 @@ sequenceDiagram
   added atomically (saturating). Concurrent requests can each pass the
   pre-check, so a budget can be exceeded by the cost of the requests in
   flight at that moment (at most `max_concurrent_per_token` per replica).
+- **Body policy.** A provider of kind `anthropic` with
+  `body.deny_server_tools` refuses, with 400 `server_tool_denied`, a request
+  to any of its POST endpoints whose `mcp_servers` is not empty or that has
+  a tool with a `type` other than `custom`, unless the type is on its
+  `server_tool_allowlist` (exact match). Only `tools` and `mcp_servers` are
+  read for this, and a key given twice makes the body unreadable (400), so
+  the broker cannot check one value while the provider uses another.
+  Nothing is sent upstream for a refused request. Without the policy only
+  the fields accounting needs are read.
 - **Request.** A fresh request: allowlisted caller headers only
   (`content-type`, `accept`, `anthropic-version`, `anthropic-beta` for
   Anthropic; `content-type`, `accept`, `http-referer`, `x-title` for
-  OpenAI-compatible), provider auth set by the broker (marked sensitive),
-  `accept-encoding: identity`, `traceparent`. The body bytes are forwarded
-  unchanged. No redirects are followed and proxy environment variables are
-  ignored. A provider with `tls` is reached through a client of its own;
-  the others share one (see "TLS to providers").
+  OpenAI-compatible) and those that start with one of the provider's
+  `headers.request_forward_prefixes`, provider auth set by the broker
+  (marked sensitive), `accept-encoding: identity`, `traceparent`.
+  Credentials, cookies, routing, framing and hop-by-hop headers, and those
+  the broker sets, are never taken from the caller (see "Header and body
+  policies"). The body bytes are forwarded unchanged. No redirects are
+  followed and proxy environment variables are ignored. A provider with
+  `tls` is reached through a client of its own; the others share one (see
+  "TLS to providers").
 - **Exchange task.** The upstream request and its response belong to a task
   of their own, which also does the accounting. The handler waits at most
   `response_timeout_secs` for the response head and then streams what the
@@ -166,7 +179,10 @@ sequenceDiagram
   abandons runs to completion at the provider and is billed.
 - **Response.** Status passed through. Headers: `content-type`,
   `cache-control`, `retry-after`, `request-id`, `x-request-id` and
-  `x-should-retry` (the provider telling SDKs whether to retry). Success
+  `x-should-retry` (the provider telling SDKs whether to retry), and those
+  that start with one of the provider's `headers.response_forward_prefixes`
+  (never `set-cookie`, `www-authenticate`, `location`, `alt-svc`,
+  `ratelimit*`, `ocb-*`, framing or hop-by-hop headers). Success
   bodies are streamed chunk by chunk; any occurrence of the provider key is
   replaced by `[REDACTED]` (a tail that could be the start of the key is held
   back until the next chunk). Compressed success bodies are refused (502):
@@ -224,6 +240,8 @@ URL, and optionally:
 | `access` | `implicit` (default): every token of a tenant may use it unless the token's `providers` list leaves it out; `explicit`: only tokens whose list names it |
 | `pricing_from` | price its usage with the entries of another provider of the same kind (e.g. a gateway in front of a public API); no chains, and no entries of its own |
 | `tls` | `ca_file`, optionally `client_cert` and `client_key`: a client of its own that trusts only that CA and presents that certificate |
+| `headers` | `request_forward_prefixes`, `response_forward_prefixes`: more headers passed in each direction, by name prefix; none by default |
+| `body` | `deny_server_tools`, `server_tool_allowlist` (kind `anthropic`): refuse requests that would have the provider run tools or contact MCP servers itself; off by default |
 
 Several providers may share a kind; `/llm/p/<id>/...` reaches each of them.
 
@@ -289,6 +307,38 @@ a public CA nor another provider's private CA can stand in for this
 provider's server, and the client certificate is presented to this
 provider only. The earliest expiry of its CA and client certificates is
 exported as `ocb_upstream_tls_cert_expiry_timestamp{provider}`.
+
+### Header and body policies
+
+What passes besides the body is closed by default: caller headers on the
+allowlist of the provider's kind on the way up, `content-type`,
+`cache-control`, `retry-after`, `request-id`, `x-request-id` and
+`x-should-retry` on the way back. A provider can open more by name prefix
+(`headers.request_forward_prefixes`, `headers.response_forward_prefixes`),
+for example a gateway in front of one owner's account that needs every
+`anthropic-*` header of the SDK and whose rate-limit headers the caller
+may see. Prefixes are lowercase, as header names are compared. Some
+headers never pass, whatever the prefixes:
+
+| Direction | Never forwarded |
+|---|---|
+| caller to provider | `authorization`, `x-api-key`, `proxy-authorization`, `cookie`; `host`, `forwarded`, `x-forwarded-*`; `content-length`, `content-encoding`, `transfer-encoding`; hop-by-hop headers; `accept-encoding`, `traceparent`, `tracestate` (set by the broker) |
+| provider to caller | `content-length`, `content-encoding`, `transfer-encoding`; hop-by-hop headers and `proxy-authenticate`; `set-cookie*`, `www-authenticate`; `ratelimit*`, `ocb-*` (kept for the broker's own limit headers); `location`, `alt-svc` |
+
+A prefix that could match one of them (`x-` matches `x-api-key`, `rate`
+matches `ratelimit`) makes the configuration invalid, and every header
+forwarded by prefix is checked against the list again.
+
+The body policy (`body.deny_server_tools`, kind `anthropic` only) is
+described under "LLM request". It reads `tools` and `mcp_servers` of every
+POST body sent to the provider, token counting included, since it takes
+the same fields. Allowed tool types are compared exactly, version date
+included. A provider of kind `openai` cannot have a body policy:
+OpenAI-compatible providers spell their server-side features in their own
+ways, so asking for one is refused at load rather than left unchecked.
+
+Both are part of the provider configuration: a reload changes them for new
+requests, and `GET /v1/admin/providers` shows them.
 
 ## Limits
 

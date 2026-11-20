@@ -72,7 +72,8 @@ Not chosen yet; `LICENSE` is a placeholder until it is.
 
 - Request bodies are forwarded byte for byte; the proxy reads only `model`,
   `stream`, `stream_options.include_usage` and `max_tokens` /
-  `max_completion_tokens`. No format translation.
+  `max_completion_tokens`, and `tools` and `mcp_servers` for a provider
+  with a body policy (D-021). No format translation.
 - Responses (JSON or SSE) are streamed unchanged, except that the provider
   key is replaced should it ever appear. The proxy asks for uncompressed
   responses and refuses compressed success bodies, which it could neither
@@ -84,7 +85,8 @@ Not chosen yet; `LICENSE` is a placeholder until it is.
   files and everything else are refused: they would bypass accounting or
   expose data unrelated to the agent's job. Redirects are not followed and
   proxy environment variables are ignored.
-- Caller headers are allowlisted; the proxy always sets auth itself.
+- Caller headers are allowlisted per kind, and a provider can add more by
+  prefix (D-021); the proxy always sets auth itself.
 - The token is accepted as `x-api-key` or `Authorization: Bearer`, so stock
   SDKs work by changing only the base URL and the key.
 - Proxy errors use the provider's error shape. A used-up budget is 402: the
@@ -249,3 +251,50 @@ cannot vouch for public hosts, a public CA cannot vouch for the private
 endpoint, and a client certificate only goes to the endpoint it was issued
 for. Certificate files are reloaded when they change (D-019); a renewed
 certificate that does not match its key is refused until it does.
+
+## D-021 Header and body policy per provider (accepted)
+
+What passes besides the body stays closed by default: caller headers on
+the allowlist of the provider's kind, and `content-type`, `cache-control`,
+`retry-after`, `request-id`, `x-request-id` and `x-should-retry` back.
+`x-should-retry` joined that list because the common SDKs follow it over
+their own guess from the status, and it says nothing about the account.
+
+A provider can pass more headers in each direction by name prefix
+(`headers.request_forward_prefixes`, `headers.response_forward_prefixes`).
+A gateway in front of one owner's account may need every header the SDK
+sends, and the owner may want its rate-limit headers to reach the caller.
+Opening this by default would show agent pods the account details and
+rate-limit use of keys on providers that serve several tenants, and let
+agents send headers that change what a provider does, so it is a setting
+of the provider, meant for providers whose headers concern one owner.
+Prefixes rather than exact names, because a provider's headers come in
+families that grow (a rate limit per window, a header per SDK option); a
+prefix as long as a whole name serves for one header. Credentials,
+cookies, routing, framing, hop-by-hop and the broker's own headers never
+pass, nor, on the way back, `set-cookie`, `www-authenticate`, `location`,
+`alt-svc` and the `ratelimit*` and `ocb-*` names kept for the broker's own
+limit headers. A prefix that could match one of them is refused at load
+rather than narrowed in silence, and the list is applied again to each
+header forwarded, so neither check depends on the other.
+
+With `body.deny_server_tools`, a provider of kind `anthropic` refuses
+requests that would have it act on the network itself: a non-empty
+`mcp_servers`, or a tool whose `type` is not `custom`. Agent pods may reach
+only the broker; tools the provider runs on its side (web search and
+fetch, code execution, MCP connections) would let them fetch and send data
+anywhere through it. Any type but `custom` counts, the provider's
+client-side tools included: the broker cannot tell where a type runs, and a
+new tool should be reviewed before it passes. Allowed types
+(`server_tool_allowlist`) are compared exactly, version date included,
+since a newer version of a tool can do more. Only `tools` and `mcp_servers`
+are read, the body is forwarded unchanged, and a key given twice makes the
+body unreadable, so that the broker and the provider cannot read different
+values. Token counting is checked like messages because it takes the same
+fields. The `openai` kind has no body policy: OpenAI-compatible providers
+spell their server-side features in their own ways, and a setting that
+checked nothing would only look like protection, so asking for one is a
+configuration error.
+
+Both are part of the provider configuration: reloaded like the rest of it
+(D-019) and shown by `GET /v1/admin/providers` (D-017).
