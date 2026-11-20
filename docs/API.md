@@ -52,7 +52,8 @@ prefixes: headers with credentials or cookies, routing (host,
 forwarding, method override, URL rewrite), the client's address, framing
 and hop-by-hop headers, the ones the broker sets, and on the way back
 `set-cookie`, `www-authenticate`, `location`, `alt-svc`, `ratelimit*` and
-`ocb-*`.
+`ocb-*`. A response header whose value holds the provider key or the
+caller's token is dropped.
 
 Server-side tools. A provider of kind `anthropic` with
 `body.deny_server_tools = true` refuses, before anything is sent upstream,
