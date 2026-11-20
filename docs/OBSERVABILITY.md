@@ -97,7 +97,8 @@ Served on the metrics listener (`metrics_listen`, default `:9090`) at
 | `ocb_secret_decrypts_total` | counter | purpose = llm.proxy, job |
 | `ocb_job_redemptions_total` | counter | result = ok, unauthorized, error |
 | `ocb_config_version` | gauge | (version of the provider configuration in use: the first 48 bits of a SHA-256 over providers, prices and TLS file contents; equal on replicas that serve the same configuration) |
-| `ocb_config_reload_total` | counter | result = applied, unchanged, invalid, restart_required (one per changed config file or set of TLS files) |
+| `ocb_config_reload_total` | counter | result = applied, unchanged, invalid, restart_required (one per change looked at: a changed config file, a changed set of TLS files in use, or a refused config file looked at again because a TLS file it names changed) |
+| `ocb_config_reload_pending` | gauge | (1 while the config file or the TLS files in use hold a change that is not applied: refused, waiting for a restart, or the config file cannot be read; 0 otherwise) |
 | `ocb_upstream_tls_cert_expiry_timestamp` | gauge | provider (providers with `tls`: earliest `notAfter` of the CA and client certificates, Unix seconds; NaN once a reload removed the provider's TLS settings) |
 
 Label cardinality is bounded: `model` is the configured price entry (prefix
@@ -177,8 +178,9 @@ groups:
         expr: histogram_quantile(0.95, sum by (le, provider) (rate(ocb_llm_time_to_first_token_seconds_bucket[10m]))) > 20
         for: 15m
       - alert: CredentialBrokerConfigNotApplied
-        expr: increase(ocb_config_reload_total{result=~"invalid|restart_required"}[15m]) > 0
-        annotations: { summary: "A changed configuration was refused or needs a restart; see the broker's log" }
+        expr: max(ocb_config_reload_pending) > 0
+        for: 5m
+        annotations: { summary: "The config file or a provider's TLS files hold a change that is refused or needs a restart; see the broker's log" }
       - alert: CredentialBrokerConfigDiverged
         expr: count(count_values("version", ocb_config_version)) > 1
         for: 15m

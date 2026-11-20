@@ -275,6 +275,8 @@ Replicas pick up a change independently, within the kubelet's sync delay
 plus `reload_interval_secs`. `ocb_config_version`, the first 48 bits of a
 SHA-256 over providers, prices and TLS file contents, shows which
 configuration each replica serves; `GET /v1/admin/providers` shows it too.
+`ocb_config_reload_pending` is 1 for as long as the files a replica reads
+hold a change it does not apply (refused, or waiting for a restart).
 
 ### TLS to providers
 

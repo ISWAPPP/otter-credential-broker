@@ -22,7 +22,9 @@
 //! running configuration (`applied`), or kept if the new files cannot be
 //! used (`invalid`, e.g. a certificate without its matching key).
 //!
-//! Every outcome is counted in `ocb_config_reload_total{result}`.
+//! Every outcome is counted in `ocb_config_reload_total{result}`. A count
+//! records one look; `ocb_config_reload_pending` is 1 for as long as the
+//! config file or the TLS files in use hold a change that is not applied.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -74,6 +76,9 @@ pub struct Reloader {
     running: ServerConfig,
     /// Hash of the content looked at last, whether it was applied or not.
     seen: Option<[u8; 32]>,
+    /// The content looked at last was refused (`invalid` or
+    /// `restart_required`).
+    refused: bool,
     /// The content looked at last was refused only because the TLS files it
     /// names could not be used: those files, as they were then. It is looked
     /// at again once one of them changes.
@@ -94,13 +99,33 @@ impl Reloader {
         for r in ReloadResult::ALL {
             metrics::counter!("ocb_config_reload_total", "result" => r.as_str()).increment(0);
         }
-        Self { path, proxy, running, seen: None, pending_tls: None, readable: true, first: true, failed_tls: None }
+        metrics::gauge!("ocb_config_reload_pending").set(0.0);
+        Self {
+            path,
+            proxy,
+            running,
+            seen: None,
+            refused: false,
+            pending_tls: None,
+            readable: true,
+            first: true,
+            failed_tls: None,
+        }
     }
 
     /// Looks at the config file and the TLS files in use once and applies
     /// what changed. `None` when there was nothing new to look at.
     pub fn check(&mut self) -> Option<ReloadResult> {
-        self.check_file().or_else(|| self.check_tls())
+        let result = self.check_file().or_else(|| self.check_tls());
+        metrics::gauge!("ocb_config_reload_pending").set(f64::from(u8::from(self.pending())));
+        result
+    }
+
+    /// Whether the config file or a TLS file in use holds a change that is
+    /// not applied: refused, waiting for a restart, or the config file
+    /// cannot be read (`ocb_config_reload_pending`).
+    pub fn pending(&self) -> bool {
+        !self.readable || self.refused || self.failed_tls.is_some()
     }
 
     fn check_file(&mut self) -> Option<ReloadResult> {
@@ -126,6 +151,7 @@ impl Reloader {
         }
         self.seen = Some(hash);
         let result = self.reload(&content);
+        self.refused = matches!(result, ReloadResult::Invalid | ReloadResult::RestartRequired);
         if std::mem::take(&mut self.first) && result == ReloadResult::Unchanged {
             return None;
         }
@@ -196,6 +222,9 @@ impl Reloader {
             providers = snapshot.providers().count(),
             "provider configuration reloaded"
         );
+        // Built from the TLS files as they are now: an earlier failure of
+        // the files in use no longer applies.
+        self.failed_tls = None;
         self.proxy.install(snapshot);
         ReloadResult::Applied
     }
@@ -216,7 +245,10 @@ impl Reloader {
             return None;
         }
         let result = match self.proxy.prepare(&self.running.llm) {
-            Ok(next) if next.version() == current.version() => ReloadResult::Unchanged,
+            Ok(next) if next.version() == current.version() => {
+                self.failed_tls = None;
+                ReloadResult::Unchanged
+            }
             Ok(next) => {
                 tracing::info!(
                     version = next.version(),

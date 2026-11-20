@@ -218,6 +218,7 @@ async fn an_invalid_configuration_is_refused_and_the_current_one_kept() {
         write(&path, &broken);
         assert_eq!(reloader.check(), Some(ReloadResult::Invalid), "{broken}");
         assert_eq!(reloader.check(), None, "the same content is looked at once");
+        assert!(reloader.pending(), "but stays pending");
         assert_eq!(proxy.snapshot().version(), version);
     }
     assert!(counter("ocb_config_reload_total{result=\"invalid\"}") >= invalid + 5);
@@ -226,10 +227,12 @@ async fn an_invalid_configuration_is_refused_and_the_current_one_kept() {
     std::fs::remove_file(&path).unwrap();
     assert_eq!(reloader.check(), Some(ReloadResult::Invalid));
     assert_eq!(reloader.check(), None);
+    assert!(reloader.pending());
     // Back to the content in use: nothing to apply.
     write(&path, &cfg.toml());
     assert_eq!(reloader.check(), Some(ReloadResult::Unchanged));
     assert_eq!(proxy.snapshot().version(), version);
+    assert!(!reloader.pending());
 }
 
 #[tokio::test]
@@ -248,6 +251,8 @@ async fn changes_outside_providers_and_pricing_need_a_restart() {
     cfg.max_concurrent_total = 8;
     write(&path, &cfg.toml());
     assert_eq!(reloader.check(), Some(ReloadResult::RestartRequired));
+    assert_eq!(reloader.check(), None);
+    assert!(reloader.pending());
     assert_eq!(proxy.snapshot().version(), version);
     let price = |p: &LlmProxy| p.snapshot().prices().lookup("anthropic", "test-model").unwrap().input;
     assert_eq!(price(&proxy), 3.0);
@@ -261,8 +266,10 @@ async fn changes_outside_providers_and_pricing_need_a_restart() {
     // Without the other changes, the price applies.
     write(&path, &cfg.toml());
     assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert!(!reloader.pending());
     assert_eq!(price(&proxy), 15.0);
-    assert!(telemetry().metrics.render().contains("ocb_config_version "));
+    let metrics = telemetry().metrics.render();
+    assert!(metrics.contains("ocb_config_version ") && metrics.contains("ocb_config_reload_pending "));
 }
 
 /// A provider with its own TLS settings; nothing connects to it here.
@@ -299,6 +306,7 @@ async fn a_change_refused_for_missing_tls_files_applies_once_they_arrive() {
     write(&path, &cfg.toml());
     assert_eq!(reloader.check(), Some(ReloadResult::Invalid));
     assert_eq!(reloader.check(), None, "refused once while the file is missing");
+    assert!(reloader.pending());
     assert_eq!(proxy.snapshot().version(), version);
 
     // A file that cannot be used: looked at again and refused again, once.
@@ -311,6 +319,7 @@ async fn a_change_refused_for_missing_tls_files_applies_once_they_arrive() {
     // The CA arrives: the whole change applies.
     replace(&ca, &tls_fixture("ca.pem"));
     assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert!(!reloader.pending());
     assert!(proxy.has_provider("gateway"));
     assert_eq!(proxy.snapshot().provider("anthropic").unwrap().access, ProviderAccess::Explicit);
     assert_eq!(reloader.check(), None);
@@ -340,6 +349,7 @@ async fn a_price_change_made_during_a_certificate_rotation_applies_with_the_new_
     assert_eq!(reloader.check(), Some(ReloadResult::Invalid), "the new configuration");
     assert_eq!(reloader.check(), Some(ReloadResult::Invalid), "the renewed files of the running configuration");
     assert_eq!(reloader.check(), None);
+    assert!(reloader.pending());
     assert_eq!(price(&proxy), 3.0);
     assert_eq!(proxy.snapshot().tls_not_after("gateway"), Some(4_904_409_600));
 
@@ -347,6 +357,7 @@ async fn a_price_change_made_during_a_certificate_rotation_applies_with_the_new_
     // certificate.
     replace(&key, &tls_fixture("client-b.key"));
     assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert!(!reloader.pending(), "neither the configuration nor the files in use wait");
     assert_eq!(price(&proxy), 6.0);
     assert_eq!(proxy.snapshot().tls_not_after("gateway"), Some(4_912_358_400));
     assert_eq!(reloader.check(), None);

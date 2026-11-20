@@ -183,6 +183,7 @@ async fn rotated_certificates_are_used_by_new_requests() {
     replace(&cert, &tls_fixture("client-b.pem"));
     assert_eq!(reloader.check(), Some(ReloadResult::Invalid));
     assert_eq!(reloader.check(), None);
+    assert!(reloader.pending());
     assert_eq!(proxy.snapshot().version(), version);
     assert_eq!(call(&env, &token, "rotating").await.status, StatusCode::OK);
     assert_eq!(server.last_client_cert(), Some(fixture_cert("client-a.pem")));
@@ -190,6 +191,7 @@ async fn rotated_certificates_are_used_by_new_requests() {
     // With the new key in place the rotation applies to new requests.
     replace(&key, &tls_fixture("client-b.key"));
     assert_eq!(reloader.check(), Some(ReloadResult::Applied));
+    assert!(!reloader.pending());
     assert_ne!(proxy.snapshot().version(), version);
     let connections = server.connections();
     assert_eq!(call(&env, &token, "rotating").await.status, StatusCode::OK);
