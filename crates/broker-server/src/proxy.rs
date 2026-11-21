@@ -1,4 +1,7 @@
-//! LLM proxy: `/llm/anthropic/<endpoint>` and `/llm/openai/<provider>/<endpoint>`.
+//! LLM proxy: `/llm/p/<provider>/<endpoint>` for any configured provider,
+//! plus the older `/llm/anthropic/<endpoint>` (the provider with id
+//! `anthropic`) and `/llm/openai/<provider>/<endpoint>` (OpenAI-compatible
+//! providers).
 //!
 //! A caller (an agent pod) authenticates with an internal LLM token, sent the
 //! way its SDK sends an API key (`x-api-key` or `Authorization: Bearer`). The
@@ -6,23 +9,25 @@
 //! 1. accepts only allowlisted endpoints and query keys of the provider kind;
 //!    the upstream URL is built from configuration only;
 //! 2. validates the token (tenant, provider allowlist, rate limit, requests
-//!    in flight) and the budget, before anything is sent upstream;
+//!    in flight) and the budget, and checks the body against the provider's
+//!    body policy, before anything is sent upstream;
 //! 3. resolves the tenant's provider key (audited decrypt), builds a fresh
-//!    request with an allowlist of caller headers, sets the provider auth
-//!    header itself and forwards the body bytes unchanged;
+//!    request with the caller headers the provider lets through (an
+//!    allowlist per kind, plus the provider's prefixes; see `policy`), sets
+//!    the provider auth header itself and forwards the body bytes unchanged;
 //! 4. hands the upstream exchange to its own task. That task streams the
-//!    response back unchanged (status, allowlisted headers, body bytes) while
-//!    a tap extracts usage and a redactor replaces the provider key should it
-//!    ever appear. It owns accounting: when the caller disconnects, reads too
-//!    slowly, or gives up waiting, the task keeps reading the upstream
-//!    response to its end, so usage comes from the provider's own report and
-//!    cannot be avoided by hanging up;
+//!    response back unchanged (status, the headers the provider lets
+//!    through, body bytes) while a tap extracts usage and a redactor
+//!    replaces the provider key should it ever appear (a header that holds
+//!    the key or the caller's token is dropped). It owns accounting:
+//!    when the caller disconnects, reads too slowly, or gives up waiting, the
+//!    task keeps reading the upstream response to its end, so usage comes
+//!    from the provider's own report and cannot be avoided by hanging up;
 //! 5. passes upstream error bodies through only after scrubbing anything
 //!    key-like.
 //!
 //! Request and response bodies, keys and tokens are never logged.
 
-use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,12 +36,13 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use broker_core::keeper::LlmGrant;
-use broker_core::llm::pricing::PriceTable;
+use broker_core::keeper::{Authorized, LlmGrant};
+use broker_core::limits::{LimitKind, LimitLevel, LimitRefusal, Limits, Reservation};
 use broker_core::llm::scrub::{StreamRedactor, scrub_error_body};
 use broker_core::llm::usage::{TapReport, Usage, UsageSource, UsageTap};
 use broker_core::llm::{Endpoint, HttpMethod, ProviderKind};
-use broker_core::store::NewUsageRow;
+use broker_core::store::{NewUsageRow, SpendRow};
+use broker_core::tokens::TokenDigest;
 use broker_core::{BrokerError, Keeper, Secret};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -49,63 +55,110 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::AppState;
 use crate::admin::auth_failure;
-use crate::config::{LlmConfig, Provider};
-use crate::error::{classify, llm_error, llm_error_response};
-use crate::limits::{Inflight, InflightPermit, seconds_to_next_minute};
+use crate::config::{LlmConfig, ProviderHeaders};
+use crate::error::{classify, llm_error, llm_error_response, llm_limit_error};
+use crate::limit_view::LimitView;
+use crate::limits::{Inflight, InflightKey, InflightPermit, InflightRefusal, MinuteLimiter, seconds_to_next_minute};
 use crate::observe::{context_from_traceparent, inject_context, trace_id_of};
-
-/// Response headers passed back to the caller. Everything else (cookies,
-/// provider account and rate-limit details, hop-by-hop headers) is dropped.
-const FORWARDED_RESPONSE_HEADERS: &[&str] =
-    &["content-type", "cache-control", "retry-after", "request-id", "x-request-id"];
+use crate::policy::{BodyRefusal, check_body, request_headers, response_headers};
+use crate::registry::{ProviderSnapshot, SnapshotCell, publish};
+use crate::tls::{ClientSettings, http_client};
 
 /// Chunks buffered between the exchange task and a caller.
 const CLIENT_BUFFER: usize = 32;
 /// Upper bound for a request's `max_tokens` used in conservative estimates.
 const MAX_TOKENS_CAP: u64 = 10_000_000;
 
-/// Shared proxy state: validated providers, prices, the upstream client and
-/// the exchange tasks.
+/// Proxy settings that only change with a restart.
+#[derive(Debug, Clone, Copy)]
+struct Settings {
+    max_request_bytes: usize,
+    request_read_timeout: Duration,
+    response_timeout: Duration,
+    idle_timeout: Duration,
+    max_error_body_bytes: usize,
+    max_buffered_response_bytes: usize,
+    max_reservation_tokens: u64,
+}
+
+impl Settings {
+    fn from(cfg: &LlmConfig) -> Self {
+        Self {
+            max_request_bytes: cfg.max_request_bytes,
+            request_read_timeout: Duration::from_secs(cfg.request_read_timeout_secs),
+            response_timeout: Duration::from_secs(cfg.response_timeout_secs),
+            idle_timeout: Duration::from_secs(cfg.idle_timeout_secs),
+            max_error_body_bytes: cfg.max_error_body_bytes,
+            max_buffered_response_bytes: cfg.max_buffered_response_bytes,
+            max_reservation_tokens: cfg.max_reservation_tokens,
+        }
+    }
+}
+
+/// The proxy of one process. Providers, prices and the clients of providers
+/// with their own TLS settings sit in a snapshot that a configuration reload
+/// replaces; everything else lives as long as the process and is never
+/// replaced: the exchange tasks (which shutdown waits for), the shutdown
+/// switch, the in-flight limits and the client shared by providers without
+/// TLS settings.
 pub struct LlmProxy {
-    providers: BTreeMap<String, Provider>,
-    prices: PriceTable,
+    snapshot: SnapshotCell,
+    /// Platform roots, no client certificate.
     http: reqwest::Client,
-    cfg: LlmConfig,
+    clients: ClientSettings,
+    settings: Settings,
     tracker: TaskTracker,
     shutdown: CancellationToken,
     inflight: Arc<Inflight>,
+    /// Requests to `GET /llm/_/limits` per valid token.
+    limits_views: MinuteLimiter<TokenDigest>,
 }
 
 impl LlmProxy {
+    /// Validates `cfg`, reads the TLS files of its providers and sets up
+    /// their clients.
     pub fn new(cfg: &LlmConfig) -> Result<Self, String> {
-        let (providers, prices) = cfg.validate()?;
-        // No read timeout on the client: it would also cut the wait for the
-        // response headers, which for non-streaming requests lasts the whole
-        // generation. The idle timeout is applied between body chunks by the
-        // exchange; the total timeout bounds everything.
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
-            .timeout(Duration::from_secs(cfg.max_duration_secs))
-            // Never follow redirects: the key must only ever go to the configured host.
-            .redirect(reqwest::redirect::Policy::none())
-            // Never route through proxies from the environment either.
-            .no_proxy()
-            .user_agent(concat!("otter-credential-broker/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| format!("HTTP client: {e}"))?;
+        let clients = ClientSettings {
+            connect_timeout: Duration::from_secs(cfg.connect_timeout_secs),
+            total_timeout: Duration::from_secs(cfg.max_duration_secs),
+        };
+        let snapshot = ProviderSnapshot::build(cfg, clients, None)?;
+        let http = http_client(clients, None)?;
+        publish(&snapshot, None);
         Ok(Self {
-            providers,
-            prices,
+            snapshot: SnapshotCell::new(snapshot),
             http,
-            cfg: cfg.clone(),
+            clients,
+            settings: Settings::from(cfg),
             tracker: TaskTracker::new(),
             shutdown: CancellationToken::new(),
             inflight: Inflight::new(cfg.max_concurrent_per_token, cfg.max_concurrent_total),
+            limits_views: MinuteLimiter::new(cfg.limits_endpoint_per_minute),
         })
     }
 
+    /// The providers and prices new requests use.
+    pub fn snapshot(&self) -> Arc<ProviderSnapshot> {
+        self.snapshot.load()
+    }
+
+    /// Builds a snapshot from the providers and prices of `cfg`, with the
+    /// current content of their TLS files, without installing it. Only
+    /// `llm.providers` and `llm.pricing` are taken from `cfg`: the other
+    /// settings of the proxy keep their values from start.
+    pub fn prepare(&self, cfg: &LlmConfig) -> Result<ProviderSnapshot, String> {
+        ProviderSnapshot::build(cfg, self.clients, Some(&self.snapshot()))
+    }
+
+    /// Makes `next` the snapshot of new requests. Requests already running
+    /// finish with the snapshot they started with.
+    pub fn install(&self, next: ProviderSnapshot) {
+        let previous = self.snapshot.replace(next);
+        publish(&self.snapshot(), Some(&previous));
+    }
+
     pub fn has_provider(&self, id: &str) -> bool {
-        self.providers.contains_key(id)
+        self.snapshot().provider(id).is_some()
     }
 
     /// Exchange tasks still running (each finishes with its accounting).
@@ -122,24 +175,137 @@ impl LlmProxy {
     pub fn inflight(&self) -> &Inflight {
         &self.inflight
     }
+
+    /// Requests to `GET /llm/_/limits`, per valid token.
+    pub fn limits_views(&self) -> &MinuteLimiter<TokenDigest> {
+        &self.limits_views
+    }
 }
 
+/// `/llm/p/<provider>/<endpoint>`: any configured provider, by id.
+pub async fn by_id(State(st): State<AppState>, req: Request) -> Response {
+    let (provider, rest) = split_provider(req.uri().path(), "/llm/p/");
+    proxy(st, &provider, None, &rest, req).await
+}
+
+/// `/llm/anthropic/<endpoint>`: the provider with id `anthropic`.
 pub async fn anthropic(State(st): State<AppState>, req: Request) -> Response {
     let rest = req.uri().path().strip_prefix("/llm/anthropic/").unwrap_or("").to_owned();
-    proxy(st, "anthropic", ProviderKind::Anthropic, &rest, req).await
+    proxy(st, "anthropic", Some(ProviderKind::Anthropic), &rest, req).await
 }
 
+/// `/llm/openai/<provider>/<endpoint>`: OpenAI-compatible providers.
 pub async fn openai(State(st): State<AppState>, req: Request) -> Response {
-    let tail = req.uri().path().strip_prefix("/llm/openai/").unwrap_or("");
+    let (provider, rest) = split_provider(req.uri().path(), "/llm/openai/");
+    proxy(st, &provider, Some(ProviderKind::Openai), &rest, req).await
+}
+
+/// Provider id and endpoint path from the raw request path (no decoding).
+fn split_provider(path: &str, prefix: &str) -> (String, String) {
+    let tail = path.strip_prefix(prefix).unwrap_or("");
     let (provider, rest) = tail.split_once('/').unwrap_or((tail, ""));
-    let (provider, rest) = (provider.to_owned(), rest.to_owned());
-    proxy(st, &provider, ProviderKind::Openai, &rest, req).await
+    (provider.to_owned(), rest.to_owned())
 }
 
 fn reject(kind: ProviderKind, e: &BrokerError) -> Response {
     let (_, code) = classify(e);
     metrics::counter!("ocb_llm_rejected_total", "reason" => code).increment(1);
     llm_error(kind, e)
+}
+
+/// 402 or 429 for a request refused by a limit of `level`, which the
+/// response names. `provider` labels the denial in the metrics.
+fn refused(
+    view: &mut LimitView,
+    kind: ProviderKind,
+    provider: &str,
+    tenant: &str,
+    level: LimitLevel,
+    e: &BrokerError,
+) -> Response {
+    view.refused(
+        level,
+        match e {
+            BrokerError::Limit(r) => Some(r),
+            _ => None,
+        },
+    );
+    let (_, code) = classify(e);
+    metrics::counter!("ocb_llm_rejected_total", "reason" => code).increment(1);
+    let what = match e {
+        BrokerError::Limit(r) => r.kind.as_str(),
+        BrokerError::RateLimited { .. } => LimitKind::Rate.as_str(),
+        _ => LimitKind::Budget.as_str(),
+    };
+    metrics::counter!(
+        "ocb_limit_denials_total",
+        "level" => level.as_str(), "kind" => what, "provider" => provider.to_owned(), "tenant" => tenant.to_owned()
+    )
+    .increment(1);
+    llm_limit_error(kind, level, e)
+}
+
+/// The token's own rate limit refusal, worded like those of the other levels.
+fn token_rate_refusal(auth: &Authorized, e: BrokerError) -> BrokerError {
+    let BrokerError::RateLimited { retry_after_secs } = e else { return e };
+    BrokerError::Limit(LimitRefusal {
+        level: LimitLevel::Token,
+        kind: LimitKind::Rate,
+        message: format!(
+            "rate limit of this LLM token exceeded ({} requests per minute), retry after {retry_after_secs}s",
+            auth.token_rpm.limit
+        ),
+        retry_after_secs: Some(retry_after_secs),
+        budget: None,
+    })
+}
+
+/// A request over a cap on requests in flight, on this replica. The
+/// replica's total is reported at the global level, without naming the
+/// provider, whose own cap it is not.
+fn in_flight_refusal(refusal: InflightRefusal, provider: &str) -> BrokerError {
+    let message = match refusal {
+        InflightRefusal::Level(LimitLevel::Token) => "this LLM token has too many requests in flight".to_owned(),
+        InflightRefusal::Level(LimitLevel::Tenant) => "the tenant has too many requests in flight".to_owned(),
+        InflightRefusal::Level(LimitLevel::Global) => format!("too many requests in flight for provider {provider}"),
+        InflightRefusal::Replica => "the broker has too many requests in flight".to_owned(),
+    };
+    BrokerError::Limit(LimitRefusal {
+        level: refusal.level(),
+        kind: LimitKind::InFlight,
+        message,
+        retry_after_secs: None,
+        budget: None,
+    })
+}
+
+/// Counts a refusal by the token's budget, or of a model without a price
+/// under its USD budget.
+fn token_budget_denied(grant: &LlmGrant, e: &BrokerError) {
+    let what = match (e, grant.budget_tokens) {
+        (BrokerError::BudgetExceeded(_), Some(b)) if grant.spent_tokens >= b => "tokens",
+        (BrokerError::BudgetExceeded(_), _) => "usd",
+        _ => "unpriced_model",
+    };
+    metrics::counter!("ocb_llm_budget_denials_total", "tenant" => grant.tenant.clone(), "kind" => what).increment(1);
+}
+
+/// 400 for a request the provider's body policy refuses. A refused tool is
+/// logged, since it can be an agent trying to reach the network through the
+/// provider; the body never is.
+fn body_refused(kind: ProviderKind, provider: &str, grant: &LlmGrant, refusal: &BodyRefusal) -> Response {
+    let code = refusal.code();
+    if *refusal != BodyRefusal::Unreadable {
+        tracing::warn!(
+            provider,
+            tenant = %grant.tenant,
+            token_id = %grant.token_id,
+            reason = %refusal,
+            "request refused by the body policy of the provider"
+        );
+    }
+    metrics::counter!("ocb_llm_rejected_total", "reason" => code).increment(1);
+    llm_error_response(kind, StatusCode::BAD_REQUEST, code, &refusal.to_string(), &BrokerError::Invalid(String::new()))
 }
 
 /// The caller's address, as recorded by the connection loop.
@@ -149,7 +315,7 @@ pub(crate) fn peer_ip(req: &Request) -> Option<IpAddr> {
 
 /// The internal token, from `x-api-key` or `Authorization: Bearer`. More than
 /// one value, or two different values, is ambiguous and refused.
-fn caller_token(headers: &HeaderMap) -> Result<String, BrokerError> {
+pub(crate) fn caller_token(headers: &HeaderMap) -> Result<String, BrokerError> {
     let one = |name: &str| -> Result<Option<String>, BrokerError> {
         let mut it = headers.get_all(name).iter();
         let Some(v) = it.next() else { return Ok(None) };
@@ -230,28 +396,35 @@ fn probe(body: &[u8]) -> Result<Probe, BrokerError> {
     Ok(p)
 }
 
-fn forwarded_response_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for name in FORWARDED_RESPONSE_HEADERS {
-        for v in src.get_all(*name) {
-            out.append(HeaderName::from_static(name), v.clone());
-        }
-    }
-    out
-}
-
-async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, req: Request) -> Response {
+/// Proxies one request to `provider_id`. A route that implies a provider
+/// kind (`route_kind`) only reaches providers of that kind.
+async fn proxy(
+    st: AppState,
+    provider_id: &str,
+    route_kind: Option<ProviderKind>,
+    rest: &str,
+    req: Request,
+) -> Response {
     let started = Instant::now();
     let px = st.proxy.clone();
-    let Some(provider) = px.providers.get(provider_id).filter(|p| p.kind == kind).cloned() else {
-        return reject(kind, &BrokerError::NotFound("unknown LLM provider".into()));
+    // Taken once: the request keeps these providers and prices to the end of
+    // its accounting, whatever a reload does in the meantime.
+    let snap = px.snapshot();
+    let Some(provider) = snap.provider(provider_id).filter(|p| route_kind.is_none_or(|k| p.kind == k)) else {
+        // Without a provider there is no error shape to copy; the generic
+        // route answers in the OpenAI-compatible one.
+        return reject(
+            route_kind.unwrap_or(ProviderKind::Openai),
+            &BrokerError::NotFound("unknown LLM provider".into()),
+        );
     };
+    let kind = provider.kind;
     let method = match *req.method() {
         Method::GET => HttpMethod::Get,
         Method::POST => HttpMethod::Post,
         _ => return reject(kind, &BrokerError::NotFound("unsupported endpoint".into())),
     };
-    let Some(endpoint) = kind.find_endpoint(method, rest) else {
+    let Some(endpoint) = provider.endpoint(method, rest) else {
         return reject(kind, &BrokerError::NotFound("unsupported endpoint".into()));
     };
     let query = match check_query(kind, req.uri().query()) {
@@ -270,8 +443,8 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
             return reject(kind, &e);
         }
     };
-    let grant = match st.keeper.authorize_llm(token.expose(), provider_id).await {
-        Ok(g) => g,
+    let auth = match st.keeper.authorize(token.expose(), provider_id, provider.access).await {
+        Ok(a) => a,
         Err(e) => {
             if matches!(e, BrokerError::Unauthorized) {
                 st.limiter.failed(peer);
@@ -280,59 +453,154 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
             return reject(kind, &e);
         }
     };
-    let Some(permit) = px.inflight.acquire(&grant.token_id) else {
-        return reject(kind, &BrokerError::TooManyInFlight("this LLM token has too many requests in flight".into()));
+    // Every answer from here on shows the caller its limits.
+    let mut view = LimitView::new(&auth);
+    macro_rules! done {
+        ($resp:expr) => {{
+            let mut resp: Response = $resp;
+            view.apply(resp.headers_mut());
+            return resp;
+        }};
+    }
+    // Limits, level by level: a level only counts a request the levels
+    // below it let through, so a token over its limits never uses up its
+    // tenant's, and a tenant over its limits never the provider's. The
+    // windows are counted before the body is read, so that a request over
+    // them is refused without reading it; a request refused after them, for
+    // its body or by a reservation, has been counted in them.
+    let tenant = auth.grant.tenant.clone();
+    if let Err(e) = auth.check_token_rate() {
+        done!(refused(&mut view, kind, provider_id, &tenant, LimitLevel::Token, &token_rate_refusal(&auth, e)));
+    }
+    let permit = match px.inflight.acquire_for(InflightKey {
+        token_id: &auth.grant.token_id,
+        tenant: &tenant,
+        tenant_max: auth.tenant_limits.concurrent,
+        provider: provider_id,
+        provider_max: provider.limits.concurrent,
+    }) {
+        Ok(p) => p,
+        Err(refusal) => {
+            let e = in_flight_refusal(refusal, provider_id);
+            // Denials of the replica's total are counted for no provider.
+            let label = if refusal == InflightRefusal::Replica { "" } else { provider_id };
+            done!(refused(&mut view, kind, label, &tenant, refusal.level(), &e))
+        }
     };
+    // A budget that was used up when the token was found refuses before the
+    // windows above it count: the token's, then the tenant's, as read with
+    // the token. The reservation below decides for the tenant, whose budget
+    // requests in flight may use up meanwhile, and for the provider.
+    if endpoint.billable {
+        if let Some(e) = auth.grant.budget_used_up() {
+            token_budget_denied(&auth.grant, &e);
+            done!(refused(&mut view, kind, provider_id, &tenant, LimitLevel::Token, &e));
+        }
+        if let Some(e) = auth.tenant_budget_used_up() {
+            done!(refused(&mut view, kind, provider_id, &tenant, LimitLevel::Tenant, &e));
+        }
+    }
+    match st.keeper.count_request(&auth, provider_id, provider.limits.rpm).await {
+        Ok(c) => view.counted(&c),
+        Err(e) => done!(match &e {
+            BrokerError::Limit(r) => refused(&mut view, kind, provider_id, &tenant, r.level, &e),
+            _ => reject(kind, &e),
+        }),
+    }
+    let grant = auth.grant.clone();
 
     let (parts, body) = req.into_parts();
     let read = tokio::time::timeout(
-        Duration::from_secs(px.cfg.request_read_timeout_secs),
-        axum::body::to_bytes(body, px.cfg.max_request_bytes),
+        px.settings.request_read_timeout,
+        axum::body::to_bytes(body, px.settings.max_request_bytes),
     )
     .await;
     let body = match read {
         Ok(Ok(b)) => b,
         Ok(Err(_)) => {
-            return reject(
+            done!(reject(
                 kind,
-                &BrokerError::TooLarge(format!("request body exceeds {} bytes", px.cfg.max_request_bytes)),
-            );
+                &BrokerError::TooLarge(format!("request body exceeds {} bytes", px.settings.max_request_bytes)),
+            ));
         }
-        Err(_) => return reject(kind, &BrokerError::Invalid("request body was not received in time".into())),
+        Err(_) => done!(reject(kind, &BrokerError::Invalid("request body was not received in time".into()))),
     };
     let probe = if endpoint.billable {
         match probe(&body) {
             Ok(p) => p,
-            Err(e) => return reject(kind, &e),
+            Err(e) => done!(reject(kind, &e)),
         }
     } else {
         Probe::default()
     };
+    if method == HttpMethod::Post
+        && let Err(refusal) = check_body(&provider.body, &body)
+    {
+        done!(body_refused(kind, provider_id, &grant, &refusal));
+    }
     let streaming = probe.stream.unwrap_or(false);
-    let request_price = probe.model.as_deref().and_then(|m| px.prices.lookup(provider_id, m));
+    let request_price = probe.model.as_deref().and_then(|m| snap.prices().lookup(provider.price_source(), m));
     if endpoint.billable {
         if let Err(e) = grant.check_budget(probe.model.as_deref(), request_price) {
-            let what = match (&e, grant.budget_tokens) {
-                (BrokerError::BudgetExceeded(_), Some(b)) if grant.spent_tokens >= b => "tokens",
-                (BrokerError::BudgetExceeded(_), _) => "usd",
-                _ => "unpriced_model",
-            };
-            metrics::counter!("ocb_llm_budget_denials_total", "tenant" => grant.tenant.clone(), "kind" => what)
-                .increment(1);
-            return reject(kind, &e);
+            token_budget_denied(&grant, &e);
+            done!(match e {
+                BrokerError::BudgetExceeded(_) => refused(&mut view, kind, provider_id, &tenant, LimitLevel::Token, &e),
+                _ => reject(kind, &e),
+            });
         }
         if kind == ProviderKind::Openai
             && streaming
             && provider.require_stream_usage
             && !probe.stream_options.as_ref().and_then(|o| o.include_usage).unwrap_or(false)
         {
-            return reject(
+            done!(reject(
                 kind,
                 &BrokerError::Invalid(
                     "streaming requests must set stream_options.include_usage = true (usage is required for accounting)"
                         .into(),
                 ),
-            );
+            ));
+        }
+    }
+    // Budgets of the tenant and the provider: the request reserves its
+    // most output on each, all or nothing, until it is accounted. The
+    // token's own budget is checked above, as before.
+    let mut held = Held::none(&st.keeper, &px.tracker);
+    if endpoint.billable && (auth.tenant_limits.has_budget() || provider.limits.has_budget()) {
+        if request_price.is_none() {
+            let whose = if auth.tenant_limits.has_usd_budget() {
+                Some("the tenant".to_owned())
+            } else {
+                provider.limits.has_usd_budget().then(|| format!("provider {provider_id}"))
+            };
+            if let Some(whose) = whose {
+                metrics::counter!("ocb_llm_budget_denials_total", "tenant" => tenant.clone(), "kind" => "unpriced_model")
+                    .increment(1);
+                done!(reject(
+                    kind,
+                    &BrokerError::Invalid(format!(
+                        "model {} has no configured price; the USD budget of {whose} can only be used with priced models",
+                        probe.model.as_deref().unwrap_or("(none)")
+                    )),
+                ));
+            }
+        }
+        let cap = px.settings.max_reservation_tokens;
+        let tokens = probe.max_output().unwrap_or(cap).min(cap);
+        let micro_usd =
+            request_price.map_or(0, |p| p.cost_micro_usd(&Usage { output_tokens: tokens, ..Usage::default() }));
+        let tokens = i64::try_from(tokens).unwrap_or(i64::MAX);
+        match reserve(&st.keeper, &px.tracker, &auth, provider_id, provider.limits, tokens, micro_usd).await {
+            Ok((h, rows)) => {
+                view.reserved(&auth.tenant_limits, &tenant, &rows);
+                held = h;
+            }
+            Err(e) => {
+                done!(match &e {
+                    BrokerError::Limit(r) => refused(&mut view, kind, provider_id, &tenant, r.level, &e),
+                    _ => reject(kind, &e),
+                });
+            }
         }
     }
 
@@ -367,7 +635,7 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
         Ok(k) => k,
         Err(e) => {
             let _e = span.enter();
-            return reject(kind, &e);
+            done!(reject(kind, &e));
         }
     };
 
@@ -376,14 +644,9 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
         url.push('?');
         url.push_str(q);
     }
-    let mut headers = HeaderMap::new();
-    for name in kind.forwarded_request_headers() {
-        for v in parts.headers.get_all(*name) {
-            headers.append(HeaderName::from_static(name), v.clone());
-        }
-    }
+    let mut headers = request_headers(kind, &provider.headers, &parts.headers);
     headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    let auth = match kind {
+    let provider_auth = match kind {
         ProviderKind::Anthropic => {
             HeaderValue::from_str(key.expose()).map(|v| (HeaderName::from_static("x-api-key"), v))
         }
@@ -391,8 +654,8 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
             HeaderValue::from_str(&format!("Bearer {}", key.expose())).map(|v| (header::AUTHORIZATION, v))
         }
     };
-    let Ok((auth_name, mut auth_value)) = auth else {
-        return reject(kind, &BrokerError::Internal("stored provider key is not a valid header value".into()));
+    let Ok((auth_name, mut auth_value)) = provider_auth else {
+        done!(reject(kind, &BrokerError::Internal("stored provider key is not a valid header value".into())));
     };
     auth_value.set_sensitive(true);
     headers.insert(auth_name, auth_value);
@@ -403,17 +666,21 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
         HttpMethod::Get => reqwest::Method::GET,
         HttpMethod::Post => reqwest::Method::POST,
     };
-    let mut request = px.http.request(up_method, &url).headers(headers);
+    // A provider with TLS settings has a client of its own; the others share
+    // one that never presents a client certificate.
+    let http = snap.tls_client(provider_id).map_or(&px.http, |c| &c.http);
+    let mut request = http.request(up_method, &url).headers(headers);
     if method == HttpMethod::Post {
         request = request.body(body.clone());
     }
 
     let fin = Finisher {
         keeper: st.keeper.clone(),
-        prices: px.clone(),
+        snapshot: snap.clone(),
         span: span.clone(),
         grant,
         provider: provider_id.to_owned(),
+        price_source: provider.price_source().to_owned(),
         endpoint,
         model: probe.model.clone(),
         max_output: probe.max_output(),
@@ -421,6 +688,7 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
         request_bytes: body.len() as u64,
         trace_id,
         status: 0,
+        reservations: held.take(),
     };
     drop(body);
     let exchange = Exchange {
@@ -428,10 +696,11 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
         request,
         key,
         token,
+        header_policy: provider.headers.clone(),
         fin,
-        max_error_body: px.cfg.max_error_body_bytes,
-        json_cap: px.cfg.max_buffered_response_bytes,
-        idle: Duration::from_secs(px.cfg.idle_timeout_secs),
+        max_error_body: px.settings.max_error_body_bytes,
+        json_cap: px.settings.max_buffered_response_bytes,
+        idle: px.settings.idle_timeout,
         shutdown: px.shutdown.clone(),
         _permit: permit,
     };
@@ -441,7 +710,7 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
 
     // Wait for the response head. If this times out, or the caller goes away
     // (this future is dropped), the exchange carries on and accounts by itself.
-    match tokio::time::timeout(Duration::from_secs(px.cfg.response_timeout_secs), head_rx).await {
+    let mut resp = match tokio::time::timeout(px.settings.response_timeout, head_rx).await {
         Ok(Ok(Head::Stream { status, headers, rx, abort })) => {
             let mut r = Response::new(client_body(rx, abort));
             *r.status_mut() = status;
@@ -468,7 +737,9 @@ async fn proxy(st: AppState, provider_id: &str, kind: ProviderKind, rest: &str, 
                 &BrokerError::Internal(String::new()),
             )
         }
-    }
+    };
+    view.apply(resp.headers_mut());
+    resp
 }
 
 /// What the exchange task tells the waiting handler.
@@ -567,6 +838,8 @@ struct Exchange {
     request: reqwest::RequestBuilder,
     key: Secret<String>,
     token: Secret<String>,
+    /// Decides which response headers are passed back.
+    header_policy: ProviderHeaders,
     fin: Finisher,
     max_error_body: usize,
     json_cap: usize,
@@ -579,7 +852,19 @@ struct Exchange {
 
 impl Exchange {
     async fn run(self, head_tx: oneshot::Sender<Head>) {
-        let Exchange { kind, request, key, token, mut fin, max_error_body, json_cap, idle, shutdown, _permit } = self;
+        let Exchange {
+            kind,
+            request,
+            key,
+            token,
+            header_policy,
+            mut fin,
+            max_error_body,
+            json_cap,
+            idle,
+            shutdown,
+            _permit,
+        } = self;
         let provider = fin.provider.clone();
         let sent = tokio::select! {
             r = request.send() => r,
@@ -620,7 +905,12 @@ impl Exchange {
 
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         fin.status = status.as_u16();
-        let headers = forwarded_response_headers(resp.headers());
+        let (headers, dropped) =
+            response_headers(&header_policy, resp.headers(), &[key.expose().as_bytes(), token.expose().as_bytes()]);
+        if dropped > 0 {
+            tracing::warn!(count = dropped, "provider key or caller token found in upstream response headers; dropped");
+            metrics::counter!("ocb_llm_key_redactions_total", "provider" => provider.clone()).increment(dropped as u64);
+        }
         if !status.is_success() {
             // Read a little more than the limit so a key straddling the cut is
             // still found whole, scrub, then cut.
@@ -721,10 +1011,13 @@ impl Exchange {
 /// Everything needed to account for a request once its exchange is over.
 struct Finisher {
     keeper: Arc<Keeper>,
-    prices: Arc<LlmProxy>,
+    /// The snapshot the request started with: its prices apply.
+    snapshot: Arc<ProviderSnapshot>,
     span: Span,
     grant: LlmGrant,
     provider: String,
+    /// Provider whose prices apply (`pricing_from`, or the provider itself).
+    price_source: String,
     endpoint: &'static Endpoint,
     model: Option<String>,
     max_output: Option<u64>,
@@ -732,6 +1025,94 @@ struct Finisher {
     request_bytes: u64,
     trace_id: Option<String>,
     status: u16,
+    /// What the request holds on the budgets of its tenant and provider,
+    /// settled with its usage.
+    reservations: Vec<Reservation>,
+}
+
+/// Reservations of a request that has not reached its exchange yet. A
+/// request that ends before (no key for the provider, the caller gone)
+/// gives them back when this is dropped; the exchange takes them over
+/// otherwise.
+struct Held {
+    keeper: Arc<Keeper>,
+    tracker: TaskTracker,
+    reservations: Vec<Reservation>,
+}
+
+impl Held {
+    fn none(keeper: &Arc<Keeper>, tracker: &TaskTracker) -> Self {
+        Self { keeper: keeper.clone(), tracker: tracker.clone(), reservations: Vec::new() }
+    }
+
+    fn take(&mut self) -> Vec<Reservation> {
+        std::mem::take(&mut self.reservations)
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let reservations = self.take();
+        if reservations.is_empty() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let keeper = self.keeper.clone();
+        self.tracker.spawn(async move {
+            for (attempt, wait_ms) in [(1, 200u64), (2, 1000), (3, 0)] {
+                match keeper.release(&reservations).await {
+                    Ok(()) => return,
+                    // Given back twice, they would free what other requests
+                    // in flight hold.
+                    Err(e @ BrokerError::CommitUnknown(_)) => {
+                        tracing::error!(error = %e, "a reservation may not have been given back; not retried");
+                        metrics::counter!("ocb_llm_accounting_failures_total").increment(1);
+                        return;
+                    }
+                    Err(e) if attempt < 3 => {
+                        tracing::warn!(error = %e, attempt, "giving back a reservation failed; retrying");
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to give back a reservation; it stays until its period ends");
+                        metrics::counter!("ocb_llm_accounting_failures_total").increment(1);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Reserves on the budgets of the tenant and the provider, in a task of
+/// its own. Awaited in the handler, a reservation would be cut short when
+/// the handler is dropped (the caller goes away, the process shuts down),
+/// and one cut while its commit is under way can still be committed, with
+/// nobody left to give it back until its period ends. The task always runs
+/// to its end; when the handler is no longer there to take the
+/// reservations, they are dropped in the task, which gives them back.
+async fn reserve(
+    keeper: &Arc<Keeper>,
+    tracker: &TaskTracker,
+    auth: &Authorized,
+    provider: &str,
+    limits: Limits,
+    tokens: i64,
+    micro_usd: i64,
+) -> Result<(Held, Vec<SpendRow>), BrokerError> {
+    let (tx, rx) = oneshot::channel();
+    let task = {
+        let (keeper, tracker, auth, provider) = (keeper.clone(), tracker.clone(), auth.clone(), provider.to_owned());
+        async move {
+            let reserved = keeper.reserve(&auth, &provider, &limits, tokens, micro_usd).await.map(|r| {
+                let held = Held { keeper: keeper.clone(), tracker, reservations: r.reservations };
+                (held, r.rows)
+            });
+            // Refused once the handler is gone: dropping what it would
+            // have taken gives the reservations back.
+            let _ = tx.send(reserved);
+        }
+    };
+    tracker.spawn(task.in_current_span());
+    rx.await.unwrap_or_else(|_| Err(BrokerError::Internal("the reservation ended without an answer".into())))
 }
 
 impl Finisher {
@@ -771,7 +1152,7 @@ impl Finisher {
         let duration = self.started.elapsed();
         let u = report.usage;
         let (price, fallback) =
-            self.prices.prices.billing_price(&self.provider, self.model.as_deref(), report.model.as_deref());
+            self.snapshot.prices().billing_price(&self.price_source, self.model.as_deref(), report.model.as_deref());
         if fallback {
             tracing::warn!("provider reported a model without a configured price; billed at the highest known price");
             metrics::counter!("ocb_llm_unpriced_response_model_total", "provider" => self.provider.clone())
@@ -863,10 +1244,17 @@ impl Finisher {
             trace_id: self.trace_id.clone(),
             billable_tokens: i64c(u.billable_tokens()),
         };
-        // A few retries ride out a briefly unavailable database.
+        // A few retries ride out a briefly unavailable database. A write
+        // that may have taken effect is not repeated: it would bill the
+        // usage twice and give back reservations other requests hold.
         for (attempt, wait_ms) in [(1, 200u64), (2, 1000), (3, 0)] {
-            match self.keeper.record_usage(&row).await {
+            match self.keeper.record_usage_settling(&row, &self.reservations).await {
                 Ok(()) => return,
+                Err(e @ BrokerError::CommitUnknown(_)) => {
+                    tracing::error!(error = %e, "LLM usage may not have been recorded; not retried");
+                    metrics::counter!("ocb_llm_accounting_failures_total").increment(1);
+                    return;
+                }
                 Err(e) if attempt < 3 => {
                     tracing::warn!(error = %e, attempt, "recording LLM usage failed; retrying");
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;

@@ -9,12 +9,24 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use broker_core::KeeperSettings;
-use broker_core::llm::ProviderKind;
+use broker_core::limits::Limits;
 use broker_core::llm::pricing::{ModelPrice, PriceTable};
+use broker_core::llm::{Endpoint, HttpMethod, ProviderAccess, ProviderKind};
 use broker_core::validate;
 use figment::Figment;
-use figment::providers::{Env, Format, Serialized, Toml};
+use figment::providers::{Data, Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
+
+use crate::policy;
+
+/// Provider ids kept free for paths of the broker itself under `/llm/`: `p`,
+/// the prefix of the `/llm/p/<id>/...` route, and `limits`, so that no
+/// provider reads like `/llm/_/limits`, where callers see their limits.
+/// Neither route could be shadowed by a provider; see DECISIONS.md, D-018.
+pub const RESERVED_PROVIDER_IDS: &[&str] = &["p", "limits"];
+
+/// Upper bound of `llm.max_reservation_tokens`.
+const MAX_RESERVATION_TOKENS: u64 = 10_000_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +46,10 @@ pub struct ServerConfig {
     /// File with the token key (64 hex chars): keys the digests of issued
     /// tokens and the MACs of token rows. Changing it invalidates all tokens.
     pub token_key_file: PathBuf,
+    /// How often the config file is checked for changes. Changes to
+    /// `llm.providers` and `llm.pricing` apply without a restart; other
+    /// changes are reported as needing one. 0 turns checking off.
+    pub reload_interval_secs: u64,
     pub http: HttpSettings,
     pub keeper: KeeperSettings,
     pub llm: LlmConfig,
@@ -132,8 +148,16 @@ pub struct LlmConfig {
     pub max_concurrent_per_token: u32,
     /// Requests in flight in total (per replica).
     pub max_concurrent_total: u32,
-    /// Upstream providers by id. `/llm/anthropic/...` uses the provider with
-    /// id `anthropic`; `/llm/openai/<id>/...` uses OpenAI-compatible ones.
+    /// Most tokens a billable request reserves on the budgets of its tenant
+    /// and provider until it is accounted: its `max_tokens` (or
+    /// `max_completion_tokens`) up to this, and this when it sets neither.
+    pub max_reservation_tokens: u64,
+    /// Requests per LLM token and minute (per replica) to `GET /llm/_/limits`,
+    /// which reads the database but counts against no rate limit.
+    pub limits_endpoint_per_minute: u32,
+    /// Upstream providers by id. `/llm/p/<id>/...` reaches any of them;
+    /// the older routes stay: `/llm/anthropic/...` uses the provider with id
+    /// `anthropic`, `/llm/openai/<id>/...` OpenAI-compatible ones.
     pub providers: BTreeMap<String, ProviderConfig>,
     /// USD per million tokens, per provider and model.
     pub pricing: Vec<ModelPrice>,
@@ -156,10 +180,124 @@ pub struct ProviderConfig {
     /// modified and usage would otherwise be missing.
     #[serde(default = "yes")]
     pub require_stream_usage: bool,
+    /// `implicit`: every LLM token of a tenant may use the provider unless
+    /// its `providers` list leaves it out. `explicit`: only tokens whose
+    /// `providers` list names it.
+    #[serde(default)]
+    pub access: ProviderAccess,
+    /// Endpoints served, by name: a subset of the kind's endpoints
+    /// (`messages`, `count_tokens`, `models` for `anthropic`;
+    /// `chat_completions`, `models` for `openai`). All of them when left out.
+    #[serde(default)]
+    pub endpoints: Option<Vec<String>>,
+    /// Price this provider's usage with the `[[llm.pricing]]` entries of
+    /// another provider of the same kind (e.g. a gateway in front of it).
+    /// The provider then has no entries of its own.
+    #[serde(default)]
+    pub pricing_from: Option<String>,
+    /// TLS to the provider with a private CA and, optionally, a client
+    /// certificate. The provider gets an HTTP client of its own that trusts
+    /// only `ca_file`; providers without `tls` share one client that trusts
+    /// the usual public roots and never presents a client certificate.
+    #[serde(default)]
+    pub tls: Option<ProviderTls>,
+    /// Headers passed through by name prefix, beyond the fixed allowlists.
+    /// None by default.
+    #[serde(default)]
+    pub headers: ProviderHeaders,
+    /// Checks of the request body. None by default.
+    #[serde(default)]
+    pub body: ProviderBody,
+    /// Limits of the provider for every tenant together (the global level):
+    /// requests per minute, requests in flight per replica, and budgets in
+    /// tokens or USD per UTC day or month. None by default.
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+/// Checks of the request body before it goes upstream; the body itself is
+/// never changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBody {
+    /// Kind `anthropic` only: refuse requests that would have the provider
+    /// reach out on its own, that is with a non-empty `mcp_servers` or with
+    /// a tool whose `type` is anything but `custom` (web search, web fetch,
+    /// code execution and the provider's other tools), unless the type is
+    /// in `server_tool_allowlist`.
+    #[serde(default)]
+    pub deny_server_tools: bool,
+    /// Tool types let through all the same, compared exactly, version date
+    /// included: `web_search_20250305` does not let `web_search_20260209`
+    /// through.
+    #[serde(default)]
+    pub server_tool_allowlist: Vec<String>,
+}
+
+/// Headers a provider passes through besides the fixed allowlists, chosen
+/// by the start of their (lowercase) names. Headers that carry credentials,
+/// cookies, routing or framing, and headers the broker sets itself, are
+/// never passed, whatever the prefixes say; a prefix that could match one
+/// is refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderHeaders {
+    /// Caller headers that start with one of these are sent upstream too,
+    /// e.g. `["anthropic-"]` for a gateway that needs every header of the
+    /// Anthropic SDK.
+    #[serde(default)]
+    pub request_forward_prefixes: Vec<String>,
+    /// Upstream response headers that start with one of these are passed
+    /// back to the caller too, e.g. `["anthropic-ratelimit-"]`.
+    #[serde(default)]
+    pub response_forward_prefixes: Vec<String>,
+}
+
+/// TLS files of a provider, all PEM. Their content is checked for changes
+/// like the config file (see `reload_interval_secs`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderTls {
+    /// The CA certificate(s) the provider's server certificate must chain to.
+    pub ca_file: PathBuf,
+    /// Client certificate (chain) presented to the provider; needs
+    /// `client_key`.
+    #[serde(default)]
+    pub client_cert: Option<PathBuf>,
+    /// Private key of `client_cert` (PKCS#8, PKCS#1 or SEC1, unencrypted).
+    #[serde(default)]
+    pub client_key: Option<PathBuf>,
+}
+
+impl ProviderTls {
+    /// The files named: `ca_file`, then `client_cert` and `client_key` if set.
+    pub fn files(&self) -> impl Iterator<Item = &PathBuf> {
+        [Some(&self.ca_file), self.client_cert.as_ref(), self.client_key.as_ref()].into_iter().flatten()
+    }
 }
 
 fn yes() -> bool {
     true
+}
+
+impl ProviderConfig {
+    /// A provider with every optional setting at its default.
+    pub fn new(kind: ProviderKind, base_url: impl Into<String>) -> Self {
+        Self {
+            kind,
+            base_url: base_url.into(),
+            allow_http: false,
+            propagate_trace_context: true,
+            require_stream_usage: true,
+            access: ProviderAccess::default(),
+            endpoints: None,
+            pricing_from: None,
+            tls: None,
+            headers: ProviderHeaders::default(),
+            body: ProviderBody::default(),
+            limits: Limits::default(),
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -182,6 +320,7 @@ impl Default for ServerConfig {
             },
             admin_tokens_file: PathBuf::from("/etc/otter-credential-broker/admin/tokens"),
             token_key_file: PathBuf::from("/etc/otter-credential-broker/kek/token-key"),
+            reload_interval_secs: 5,
             http: HttpSettings::default(),
             keeper: KeeperSettings::default(),
             llm: LlmConfig::default(),
@@ -202,6 +341,8 @@ impl Default for LlmConfig {
             max_buffered_response_bytes: 32 * 1024 * 1024,
             max_concurrent_per_token: 16,
             max_concurrent_total: 1024,
+            max_reservation_tokens: 32_000,
+            limits_endpoint_per_minute: 30,
             providers: BTreeMap::new(),
             pricing: Vec::new(),
         }
@@ -216,6 +357,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "kek",
     "admin_tokens_file",
     "token_key_file",
+    "reload_interval_secs",
     "http",
     "keeper",
     "llm",
@@ -223,9 +365,18 @@ const TOP_LEVEL_KEYS: &[&str] = &[
 
 impl ServerConfig {
     pub fn load(file: Option<&Path>) -> Result<Self, Box<figment::Error>> {
+        Self::extract(file.map(Toml::file_exact))
+    }
+
+    /// Like [`ServerConfig::load`], with the content of the file given.
+    pub fn parse(toml: &str) -> Result<Self, Box<figment::Error>> {
+        Self::extract(Some(Toml::string(toml)))
+    }
+
+    fn extract(file: Option<Data<Toml>>) -> Result<Self, Box<figment::Error>> {
         let mut fig = Figment::from(Serialized::defaults(Self::default()));
         if let Some(f) = file {
-            fig = fig.merge(Toml::file_exact(f));
+            fig = fig.merge(f);
         }
         // Only known keys: OCB_CONFIG and test variables are not config.
         let env = Env::prefixed("OCB_")
@@ -244,6 +395,53 @@ pub struct Provider {
     pub base_url: String,
     pub propagate_trace_context: bool,
     pub require_stream_usage: bool,
+    pub access: ProviderAccess,
+    /// The endpoints this provider serves (a subset of its kind's).
+    pub endpoints: Vec<&'static Endpoint>,
+    /// Provider whose prices apply to this one.
+    pub pricing_from: Option<String>,
+    pub tls: Option<ProviderTls>,
+    pub headers: ProviderHeaders,
+    pub body: ProviderBody,
+    /// Limits of the provider for every tenant together.
+    pub limits: Limits,
+}
+
+impl Provider {
+    /// The provider whose `[[llm.pricing]]` entries price this one's usage.
+    pub fn price_source(&self) -> &str {
+        self.pricing_from.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The endpoint at `path` for `method`, if this provider serves it.
+    pub fn endpoint(&self, method: HttpMethod, path: &str) -> Option<&'static Endpoint> {
+        self.endpoints.iter().copied().find(|e| e.method == method && e.path == path)
+    }
+}
+
+/// The endpoints named in a provider's configuration; all of its kind's
+/// when none are named.
+fn provider_endpoints(id: &str, p: &ProviderConfig) -> Result<Vec<&'static Endpoint>, String> {
+    let Some(names) = &p.endpoints else { return Ok(p.kind.endpoints().iter().collect()) };
+    if names.is_empty() {
+        return Err(format!("llm.providers.{id}.endpoints: must not be empty (leave it out to allow all)"));
+    }
+    let mut out: Vec<&'static Endpoint> = Vec::new();
+    for name in names {
+        let Some(e) = p.kind.endpoint_named(name) else {
+            let known: Vec<&str> = p.kind.endpoints().iter().map(|e| e.name).collect();
+            return Err(format!(
+                "llm.providers.{id}.endpoints: {name:?} is not an endpoint of kind {}; known: {}",
+                p.kind.as_str(),
+                known.join(", ")
+            ));
+        };
+        if out.contains(&e) {
+            return Err(format!("llm.providers.{id}.endpoints: {name:?} is listed twice"));
+        }
+        out.push(e);
+    }
+    Ok(out)
 }
 
 impl LlmConfig {
@@ -252,10 +450,10 @@ impl LlmConfig {
     pub fn validate(&self) -> Result<(BTreeMap<String, Provider>, PriceTable), String> {
         let mut out = BTreeMap::new();
         for (id, p) in &self.providers {
-            validate::provider_id(id).map_err(|e| format!("llm.providers.{id}: {e}"))?;
-            if p.kind == ProviderKind::Anthropic && id != "anthropic" {
-                return Err(format!("llm.providers.{id}: providers of kind anthropic must have the id `anthropic`"));
+            if RESERVED_PROVIDER_IDS.contains(&id.as_str()) {
+                return Err(format!("llm.providers.{id}: this id is reserved"));
             }
+            validate::provider_id(id).map_err(|e| format!("llm.providers.{id}: {e}"))?;
             let url = reqwest::Url::parse(&p.base_url).map_err(|e| format!("llm.providers.{id}.base_url: {e}"))?;
             match url.scheme() {
                 "https" => {}
@@ -272,6 +470,20 @@ impl LlmConfig {
                     "llm.providers.{id}.base_url: must have a host and no credentials, query or fragment"
                 ));
             }
+            if let Some(tls) = &p.tls {
+                if url.scheme() != "https" {
+                    return Err(format!("llm.providers.{id}.tls: needs an https base_url"));
+                }
+                if tls.client_cert.is_some() != tls.client_key.is_some() {
+                    return Err(format!("llm.providers.{id}.tls: client_cert and client_key go together"));
+                }
+                if tls.files().any(|f| f.as_os_str().is_empty()) {
+                    return Err(format!("llm.providers.{id}.tls: file paths must not be empty"));
+                }
+            }
+            policy::validate_headers(id, &p.headers)?;
+            policy::validate_body(id, p.kind, &p.body)?;
+            p.limits.validate().map_err(|e| format!("llm.providers.{id}.limits.{e}"))?;
             out.insert(
                 id.clone(),
                 Provider {
@@ -280,12 +492,47 @@ impl LlmConfig {
                     base_url: url.as_str().trim_end_matches('/').to_owned(),
                     propagate_trace_context: p.propagate_trace_context,
                     require_stream_usage: p.require_stream_usage,
+                    access: p.access,
+                    endpoints: provider_endpoints(id, p)?,
+                    pricing_from: p.pricing_from.clone(),
+                    tls: p.tls.clone(),
+                    headers: p.headers.clone(),
+                    body: p.body.clone(),
+                    limits: p.limits,
                 },
             );
         }
         let prices = PriceTable::new(self.pricing.clone())?;
         if let Some(unknown) = prices.providers().find(|p| !out.contains_key(*p)) {
             return Err(format!("llm.pricing: unknown provider {unknown}"));
+        }
+        for (id, p) in &self.providers {
+            let Some(source) = &p.pricing_from else { continue };
+            let what = format!("llm.providers.{id}.pricing_from");
+            let Some(s) = self.providers.get(source).filter(|_| source != id) else {
+                return Err(format!("{what}: must name another configured provider"));
+            };
+            if s.kind != p.kind {
+                return Err(format!("{what}: {source} is of another kind"));
+            }
+            if s.pricing_from.is_some() {
+                return Err(format!("{what}: {source} takes its prices from elsewhere itself (no chains)"));
+            }
+            if prices.providers().any(|x| x == id) {
+                return Err(format!("llm.pricing: {id} takes its prices from {source}; remove its own entries"));
+            }
+        }
+        // A USD budget of a provider without prices would never be used up:
+        // its usage costs nothing.
+        for p in out.values().filter(|p| p.limits.has_usd_budget()) {
+            if !prices.providers().any(|x| x == p.price_source()) {
+                return Err(format!(
+                    "llm.providers.{}.limits.budget_usd: {} has no [[llm.pricing]] entries, so its usage costs \
+                     nothing and a USD budget would never be used up; add prices or use budget_tokens",
+                    p.id,
+                    p.price_source()
+                ));
+            }
         }
         for (name, v) in [
             ("request_read_timeout_secs", self.request_read_timeout_secs),
@@ -301,6 +548,12 @@ impl LlmConfig {
         if self.max_concurrent_per_token == 0 || self.max_concurrent_total == 0 {
             return Err("llm.max_concurrent_per_token and llm.max_concurrent_total must be positive".into());
         }
+        if self.limits_endpoint_per_minute == 0 {
+            return Err("llm.limits_endpoint_per_minute must be positive".into());
+        }
+        if !(1..=MAX_RESERVATION_TOKENS).contains(&self.max_reservation_tokens) {
+            return Err(format!("llm.max_reservation_tokens must be between 1 and {MAX_RESERVATION_TOKENS}"));
+        }
         Ok((out, prices))
     }
 }
@@ -309,15 +562,10 @@ impl LlmConfig {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use broker_core::limits::Period;
 
     fn provider(kind: ProviderKind, base_url: &str) -> ProviderConfig {
-        ProviderConfig {
-            kind,
-            base_url: base_url.into(),
-            allow_http: false,
-            propagate_trace_context: true,
-            require_stream_usage: true,
-        }
+        ProviderConfig::new(kind, base_url)
     }
 
     #[test]
@@ -333,8 +581,10 @@ mod tests {
             ("x", ProviderKind::Openai, "https://user:pw@host.example"),
             ("x", ProviderKind::Openai, "https://host.example/?a=1"),
             ("x", ProviderKind::Openai, "file:///etc/passwd"),
-            ("x", ProviderKind::Anthropic, "https://host.example"),
             ("Bad.Id", ProviderKind::Openai, "https://host.example"),
+            ("p", ProviderKind::Anthropic, "https://host.example"),
+            ("limits", ProviderKind::Openai, "https://host.example"),
+            ("_", ProviderKind::Openai, "https://host.example"),
         ] {
             let mut c = LlmConfig::default();
             c.providers.insert(id.into(), provider(kind, url));
@@ -348,9 +598,338 @@ mod tests {
     }
 
     #[test]
+    fn several_providers_of_one_kind() {
+        let mut c = LlmConfig::default();
+        c.providers.insert("anthropic".into(), provider(ProviderKind::Anthropic, "https://api.anthropic.com"));
+        c.providers.insert("gateway".into(), provider(ProviderKind::Anthropic, "https://gateway.example:8443/"));
+        let (p, _) = c.validate().unwrap();
+        assert_eq!(p["gateway"].kind, ProviderKind::Anthropic);
+        assert_eq!(p["gateway"].base_url, "https://gateway.example:8443");
+    }
+
+    #[test]
+    fn provider_access() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.anthropic]
+            kind = "anthropic"
+            base_url = "https://api.anthropic.com"
+
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example"
+            access = "explicit"
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        assert_eq!(p["anthropic"].access, ProviderAccess::Implicit);
+        assert_eq!(p["gateway"].access, ProviderAccess::Explicit);
+        let bad = "[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\naccess = \"open\"\n";
+        assert!(ServerConfig::parse(bad).is_err());
+    }
+
+    #[test]
+    fn provider_endpoints() {
+        let mut c = LlmConfig::default();
+        let mut gw = provider(ProviderKind::Anthropic, "https://gateway.example");
+        gw.endpoints = Some(vec!["messages".into(), "count_tokens".into()]);
+        c.providers.insert("gateway".into(), gw);
+        c.providers.insert("deepseek".into(), provider(ProviderKind::Openai, "https://api.deepseek.com"));
+        let (p, _) = c.validate().unwrap();
+        let names = |id: &str| p[id].endpoints.iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names("gateway"), ["messages", "count_tokens"]);
+        assert_eq!(names("deepseek"), ["chat_completions", "models"]);
+        assert!(p["gateway"].endpoint(HttpMethod::Post, "v1/messages").is_some());
+        assert!(p["gateway"].endpoint(HttpMethod::Get, "v1/models").is_none());
+
+        for bad in [vec![], vec!["chat_completions"], vec!["v1/messages"], vec!["messages", "messages"]] {
+            let mut c = LlmConfig::default();
+            let mut gw = provider(ProviderKind::Anthropic, "https://gateway.example");
+            gw.endpoints = Some(bad.iter().map(|s| s.to_string()).collect());
+            c.providers.insert("gateway".into(), gw);
+            assert!(c.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pricing_from() {
+        let price = |provider: &str| ModelPrice {
+            provider: provider.into(),
+            model: "m".into(),
+            input: 1.0,
+            output: 2.0,
+            cache_read: None,
+            cache_write: None,
+            cache_write_1h: None,
+            free: false,
+        };
+        let config = |pricing_from: &[(&str, &str)], pricing: Vec<ModelPrice>| {
+            let mut c = LlmConfig::default();
+            for id in ["anthropic", "gateway", "gateway-2"] {
+                c.providers.insert(id.into(), provider(ProviderKind::Anthropic, "https://host.example"));
+            }
+            c.providers.insert("openai".into(), provider(ProviderKind::Openai, "https://api.openai.com/v1"));
+            for (id, from) in pricing_from {
+                c.providers.get_mut(*id).unwrap().pricing_from = Some((*from).into());
+            }
+            c.pricing = pricing;
+            c.validate()
+        };
+        let (p, prices) =
+            config(&[("gateway", "anthropic"), ("gateway-2", "anthropic")], vec![price("anthropic")]).unwrap();
+        assert_eq!(p["gateway"].price_source(), "anthropic");
+        assert_eq!(p["anthropic"].price_source(), "anthropic");
+        assert_eq!(prices.lookup(p["gateway"].price_source(), "m").unwrap().output, 2.0);
+        // Without prices of its own the source is still fine (no prices then).
+        assert!(config(&[("gateway", "anthropic")], vec![]).is_ok());
+
+        for (bad, pricing) in [
+            (vec![("gateway", "missing")], vec![]),
+            (vec![("gateway", "gateway")], vec![]),
+            (vec![("gateway", "openai")], vec![]),
+            (vec![("gateway", "anthropic"), ("anthropic", "gateway-2")], vec![]),
+            (vec![("gateway", "gateway-2"), ("gateway-2", "anthropic")], vec![]),
+            (vec![("gateway", "anthropic")], vec![price("anthropic"), price("gateway")]),
+        ] {
+            assert!(config(&bad, pricing).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn provider_tls() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example:8443"
+            tls = { ca_file = "/tls/ca.crt", client_cert = "/tls/tls.crt", client_key = "/tls/tls.key" }
+
+            [llm.providers.internal]
+            kind = "openai"
+            base_url = "https://models.example/v1"
+            tls = { ca_file = "/tls/ca.crt" }
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        assert_eq!(p["gateway"].tls.as_ref().unwrap().client_key.as_deref(), Some(Path::new("/tls/tls.key")));
+        assert!(p["internal"].tls.as_ref().unwrap().client_cert.is_none());
+
+        let tls = |ca: &str, cert: Option<&str>, key: Option<&str>| ProviderTls {
+            ca_file: ca.into(),
+            client_cert: cert.map(Into::into),
+            client_key: key.map(Into::into),
+        };
+        for (url, bad) in [
+            ("https://gateway.example", tls("/tls/ca.crt", Some("/tls/tls.crt"), None)),
+            ("https://gateway.example", tls("/tls/ca.crt", None, Some("/tls/tls.key"))),
+            ("https://gateway.example", tls("", None, None)),
+            ("http://gateway.example", tls("/tls/ca.crt", None, None)),
+        ] {
+            let mut c = LlmConfig::default();
+            let mut gw = provider(ProviderKind::Anthropic, url);
+            gw.allow_http = true;
+            gw.tls = Some(bad.clone());
+            c.providers.insert("gateway".into(), gw);
+            assert!(c.validate().is_err(), "{url} {bad:?}");
+        }
+        let unknown = "[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\ntls = { ca_file = \"/a\", verify = false }\n";
+        assert!(ServerConfig::parse(unknown).is_err());
+    }
+
+    #[test]
+    fn provider_headers() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example"
+            headers = { request_forward_prefixes = ["anthropic-"], response_forward_prefixes = ["anthropic-ratelimit-"] }
+
+            [llm.providers.local]
+            kind = "openai"
+            base_url = "https://models.example/v1"
+            headers = { response_forward_prefixes = ["x-ratelimit-"] }
+
+            [llm.providers.deepseek]
+            kind = "openai"
+            base_url = "https://api.deepseek.com"
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        assert_eq!(p["gateway"].headers.request_forward_prefixes, ["anthropic-"]);
+        assert_eq!(p["gateway"].headers.response_forward_prefixes, ["anthropic-ratelimit-"]);
+        assert!(p["local"].headers.request_forward_prefixes.is_empty());
+        assert_eq!(p["deepseek"].headers, ProviderHeaders::default());
+
+        let with = |headers: &str| {
+            format!(
+                "[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\nheaders = {{ {headers} }}\n"
+            )
+        };
+        // Prefixes only; any other key is refused.
+        for unknown in ["forward = [\"x-app\"]", "request_forward_prefixes = \"anthropic-\""] {
+            assert!(ServerConfig::parse(&with(unknown)).is_err(), "{unknown}");
+        }
+        // A prefix that could match a header never forwarded makes the
+        // configuration invalid.
+        let wide = ServerConfig::parse(&with("request_forward_prefixes = [\"x-\"]")).unwrap();
+        let e = wide.llm.validate().unwrap_err();
+        assert!(e.starts_with("llm.providers.x.headers.request_forward_prefixes: "), "{e}");
+    }
+
+    #[test]
+    fn provider_body() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example"
+            body = { deny_server_tools = true, server_tool_allowlist = ["web_search_20250305"] }
+
+            [llm.providers.anthropic]
+            kind = "anthropic"
+            base_url = "https://api.anthropic.com"
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        assert!(p["gateway"].body.deny_server_tools);
+        assert_eq!(p["gateway"].body.server_tool_allowlist, ["web_search_20250305"]);
+        assert_eq!(p["anthropic"].body, ProviderBody::default());
+
+        let with = |kind: &str, body: &str| {
+            format!("[llm.providers.x]\nkind = \"{kind}\"\nbase_url = \"https://x.example\"\nbody = {{ {body} }}\n")
+        };
+        assert!(ServerConfig::parse(&with("anthropic", "deny_mcp = true")).is_err(), "unknown key");
+        let valid = |kind: &str, body: &str| ServerConfig::parse(&with(kind, body)).unwrap().llm.validate().is_ok();
+        assert!(valid("openai", "deny_server_tools = false"));
+        // Only the anthropic kind checks bodies; an OpenAI-compatible
+        // provider that asks for it is refused rather than left unchecked.
+        assert!(!valid("openai", "deny_server_tools = true"));
+        assert!(!valid("anthropic", "server_tool_allowlist = [\"web_search_20250305\"]"));
+    }
+
+    #[test]
+    fn provider_limits() {
+        let cfg = ServerConfig::parse(
+            r#"
+            [llm.providers.anthropic]
+            kind = "anthropic"
+            base_url = "https://api.anthropic.com"
+            limits = { rpm = 300, concurrent = 8, budget_tokens = { day = 1_000_000, month = 50_000_000 }, budget_usd = { month = 250.0 } }
+
+            [llm.providers.gateway]
+            kind = "anthropic"
+            base_url = "https://gateway.example"
+            pricing_from = "anthropic"
+            limits = { budget_usd = { day = 20 } }
+
+            [llm.providers.deepseek]
+            kind = "openai"
+            base_url = "https://api.deepseek.com"
+
+            [[llm.pricing]]
+            provider = "anthropic"
+            model = "m"
+            input = 1.0
+            output = 2.0
+            "#,
+        )
+        .unwrap();
+        let (p, _) = cfg.llm.validate().unwrap();
+        let l = &p["anthropic"].limits;
+        assert_eq!((l.rpm, l.concurrent), (Some(300), Some(8)));
+        assert_eq!((l.tokens(Period::Day), l.tokens(Period::Month)), (Some(1_000_000), Some(50_000_000)));
+        assert_eq!((l.micro_usd(Period::Day), l.micro_usd(Period::Month)), (None, Some(250_000_000)));
+        // Priced through pricing_from; an integer amount reads as dollars.
+        assert_eq!(p["gateway"].limits.micro_usd(Period::Day), Some(20_000_000));
+        assert!(p["deepseek"].limits.is_empty());
+
+        let with = |limits: &str| {
+            format!("[llm.providers.x]\nkind = \"openai\"\nbase_url = \"https://x.example\"\nlimits = {{ {limits} }}\n")
+        };
+        for unknown in ["burst = 5", "budget_tokens = { week = 5 }", "rpm = -1", "budget_usd = 5.0"] {
+            assert!(ServerConfig::parse(&with(unknown)).is_err(), "{unknown}");
+        }
+        let invalid = |limits: &str| ServerConfig::parse(&with(limits)).unwrap().llm.validate().unwrap_err();
+        assert_eq!(invalid("rpm = 0"), "llm.providers.x.limits.rpm must be between 1 and 10000000");
+        assert!(invalid("concurrent = 0").starts_with("llm.providers.x.limits.concurrent "));
+        // A USD budget needs prices to be used up at all.
+        let e = invalid("budget_usd = { day = 5.0 }");
+        assert!(e.starts_with("llm.providers.x.limits.budget_usd: x has no [[llm.pricing]] entries"), "{e}");
+        assert!(ServerConfig::parse(&with("budget_tokens = { day = 0 }")).unwrap().llm.validate().is_ok());
+
+        let mut c = LlmConfig::default();
+        assert_eq!(c.max_reservation_tokens, 32_000);
+        c.max_reservation_tokens = 0;
+        assert_eq!(c.validate().unwrap_err(), "llm.max_reservation_tokens must be between 1 and 10000000");
+    }
+
+    #[test]
     fn defaults_load() {
         let cfg = ServerConfig::load(None).unwrap();
         assert_eq!(cfg.listen.port(), 8080);
         assert_eq!(cfg.admin_listen.port(), 8081);
+    }
+
+    /// The TOML embedded in the ConfigMap of the Kubernetes manifest.
+    fn manifest_config() -> String {
+        let yaml = include_str!("../../../deploy/k8s/broker.yaml");
+        let (_, rest) = yaml.split_once("config.toml: |\n").unwrap();
+        let lines: Vec<&str> = rest
+            .lines()
+            .take_while(|l| l.is_empty() || l.starts_with("    "))
+            .map(|l| l.strip_prefix("    ").unwrap_or(l))
+            .collect();
+        lines.join("\n")
+    }
+
+    #[test]
+    fn shipped_configs_load_as_they_are() {
+        for (name, text) in [
+            ("deploy/k8s/broker.yaml", manifest_config()),
+            ("config/example.toml", include_str!("../../../config/example.toml").to_owned()),
+            ("config/dev.toml", include_str!("../../../config/dev.toml").to_owned()),
+        ] {
+            let cfg = ServerConfig::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (providers, _) = cfg.llm.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(providers["anthropic"].kind, ProviderKind::Anthropic, "{name}");
+            assert_eq!(providers["deepseek"].kind, ProviderKind::Openai, "{name}");
+        }
+        assert_eq!(ServerConfig::parse(&manifest_config()).unwrap().database.max_connections, 10);
+    }
+
+    /// config/example.toml with its commented-out gateway uncommented.
+    fn example_with_gateway() -> String {
+        let text = include_str!("../../../config/example.toml");
+        let start = text.find("# [llm.providers.gateway]").unwrap();
+        let gateway: Vec<&str> = text[start..].lines().map_while(|l| l.strip_prefix("# ")).collect();
+        format!("{text}\n{}\n", gateway.join("\n"))
+    }
+
+    #[test]
+    fn the_example_gateway_loads() {
+        let cfg = ServerConfig::parse(&example_with_gateway()).unwrap();
+        let (providers, _) = cfg.llm.validate().unwrap();
+        let gw = &providers["gateway"];
+        assert_eq!(gw.access, ProviderAccess::Explicit);
+        assert_eq!(gw.price_source(), "anthropic");
+        assert!(gw.tls.as_ref().is_some_and(|t| t.client_key.is_some()));
+        assert_eq!(gw.headers.request_forward_prefixes, ["anthropic-"]);
+        assert_eq!(gw.headers.response_forward_prefixes, ["anthropic-ratelimit-"]);
+        assert!(gw.body.deny_server_tools);
+    }
+
+    #[test]
+    fn the_example_gateway_has_limits() {
+        let cfg = ServerConfig::parse(&example_with_gateway()).unwrap();
+        assert_eq!((cfg.llm.max_reservation_tokens, cfg.llm.limits_endpoint_per_minute), (32_000, 30));
+        let (providers, _) = cfg.llm.validate().unwrap();
+        let limits = &providers["gateway"].limits;
+        assert_eq!((limits.rpm, limits.tokens(Period::Month)), (Some(300), Some(50_000_000)));
+        assert!(providers["anthropic"].limits.is_empty());
     }
 }

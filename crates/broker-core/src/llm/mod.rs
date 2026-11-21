@@ -57,6 +57,31 @@ impl ProviderKind {
     pub fn find_endpoint(self, method: HttpMethod, path: &str) -> Option<&'static Endpoint> {
         self.endpoints().iter().find(|e| e.method == method && e.path == path)
     }
+
+    /// The endpoint with this name (as used in provider configuration).
+    pub fn endpoint_named(self, name: &str) -> Option<&'static Endpoint> {
+        self.endpoints().iter().find(|e| e.name == name)
+    }
+}
+
+/// Which LLM tokens of a tenant may use a provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAccess {
+    /// Every token, unless its `providers` list leaves the provider out.
+    #[default]
+    Implicit,
+    /// Only tokens whose `providers` list names the provider.
+    Explicit,
+}
+
+impl ProviderAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Implicit => "implicit",
+            Self::Explicit => "explicit",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +93,9 @@ pub enum HttpMethod {
 /// An upstream endpoint, relative to the provider's configured base URL.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Endpoint {
+    /// Name in configuration (`endpoints = [...]` of a provider) and the
+    /// admin API.
+    pub name: &'static str,
     pub method: HttpMethod,
     pub path: &'static str,
     /// Generates tokens that cost money (usage is accounted and budgets apply).
@@ -75,14 +103,14 @@ pub struct Endpoint {
 }
 
 const ANTHROPIC_ENDPOINTS: &[Endpoint] = &[
-    Endpoint { method: HttpMethod::Post, path: "v1/messages", billable: true },
-    Endpoint { method: HttpMethod::Post, path: "v1/messages/count_tokens", billable: false },
-    Endpoint { method: HttpMethod::Get, path: "v1/models", billable: false },
+    Endpoint { name: "messages", method: HttpMethod::Post, path: "v1/messages", billable: true },
+    Endpoint { name: "count_tokens", method: HttpMethod::Post, path: "v1/messages/count_tokens", billable: false },
+    Endpoint { name: "models", method: HttpMethod::Get, path: "v1/models", billable: false },
 ];
 
 const OPENAI_ENDPOINTS: &[Endpoint] = &[
-    Endpoint { method: HttpMethod::Post, path: "chat/completions", billable: true },
-    Endpoint { method: HttpMethod::Get, path: "models", billable: false },
+    Endpoint { name: "chat_completions", method: HttpMethod::Post, path: "chat/completions", billable: true },
+    Endpoint { name: "models", method: HttpMethod::Get, path: "models", billable: false },
 ];
 
 /// Name of the secret holding a tenant's API key for a provider. The secret
@@ -112,5 +140,17 @@ mod tests {
         assert!(o.find_endpoint(HttpMethod::Post, "v1/chat/completions").is_none());
         assert!(o.find_endpoint(HttpMethod::Post, "files").is_none());
         assert_eq!(provider_key_secret_name("deepseek"), "llm.deepseek");
+    }
+
+    #[test]
+    fn endpoint_names() {
+        for kind in [ProviderKind::Anthropic, ProviderKind::Openai] {
+            for e in kind.endpoints() {
+                assert_eq!(kind.endpoint_named(e.name), Some(e), "names are unique per kind");
+            }
+        }
+        assert_eq!(ProviderKind::Anthropic.endpoint_named("count_tokens").unwrap().path, "v1/messages/count_tokens");
+        assert!(ProviderKind::Anthropic.endpoint_named("chat_completions").is_none());
+        assert!(ProviderKind::Openai.endpoint_named("v1/models").is_none());
     }
 }

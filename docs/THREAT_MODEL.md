@@ -11,6 +11,12 @@
 5. **Internal LLM tokens**: spend a tenant's budget through the proxy.
 6. **Job tokens**: one-time access to a job's secrets.
 7. **Integrity of accounting and audit**: budgets, usage, who decrypted what.
+8. **Provider configuration and its TLS files**: base URLs and CA files
+   decide where keys are sent and which servers are trusted; client
+   certificate keys identify the broker to a provider.
+9. **Limits of tenants and providers, and their usage**: what the agents
+   of a tenant can spend and how fast; a provider's usage reflects every
+   tenant's activity.
 
 ## Actors and trust
 
@@ -22,22 +28,34 @@
 | LLM providers | trusted for confidentiality of the key they issued; their responses are not trusted to be free of reflected data | outbound HTTPS from the broker |
 | Broker process, its Secrets (KEK, token key, admin tokens) | trusted | |
 | Operators or attackers with database access but without the broker's Secrets | not trusted to read secrets or to mint tokens | PostgreSQL |
+| Whoever can change the config file or the providers' TLS files | trusted like whoever deploys the broker: decides where requests and keys go | ConfigMap and Secrets of the broker |
 
 ## Threats and mitigations
 
 | Threat | Mitigation |
 |---|---|
-| Agent asks for or exfiltrates the provider key (prompt injection, reading env/files) | The key never enters the pod: the pod holds only an internal token. The key is decrypted inside the broker for the upstream request only and is never put in a body. Exact-match redaction removes the key should an upstream ever reflect it in a success response. |
-| Stolen internal LLM token | Works only through the broker (pods have no other route to providers), only for its tenant and allowed providers, within its budget, rate limit and in-flight cap, until its TTL. Revocation is checked on every request (no cache). |
+| Agent asks for or exfiltrates the provider key (prompt injection, reading env/files) | The key never enters the pod: the pod holds only an internal token. The key is decrypted inside the broker for the upstream request only and is never put in a body. Should an upstream ever reflect it, exact-match redaction removes it from success bodies, error bodies are scrubbed (below), and a response header whose value holds the key or the caller's token is dropped whole. |
+| Stolen internal LLM token | Works only through the broker (pods have no other route to providers), only for its tenant and allowed providers, within its budget, rate limit and in-flight cap and those of its tenant and provider, until its TTL. Revocation is checked on every request (no cache). |
 | Token used against another tenant | The tenant comes from the token row, never from the request, and the row's tenant is covered by its MAC. Provider keys are looked up as `(token tenant, llm.<provider>)`; there is no fallback to another tenant's key. Admin routes for token ids and job tokens filter on the tenant in the path. |
 | SSRF / redirecting the key to an attacker host | Upstream URLs are built from configuration plus allowlisted constant paths; the request's Host, `X-Forwarded-*`, `Forwarded`, absolute-form request targets and paths are never used to pick a host. Redirects are not followed; proxy environment variables are ignored. Base URLs must be https unless `allow_http` is set explicitly. Tests prove a trap host is never contacted. |
-| Header smuggling (hop-by-hop `Connection`, duplicate auth headers, provider org headers, method override) | The upstream request is built from scratch with an allowlist of caller headers; auth is always set by the broker; ambiguous credentials are refused. CL/TE conflicts are rejected by the HTTP server. |
+| An admin token used to send tenants' keys elsewhere (changing a provider's base URL or TLS trust) | Providers come only from the config file; the admin API can list them and nothing else. The list shows the host and port of a base URL, not its path, and no keys or file paths. |
+| A token without a provider list reaching a provider meant for a few tokens | With `access = "explicit"` a provider serves only tokens whose `providers` list names it. The list is covered by the token row's MAC and checked on every request. |
+| Impersonating a provider that is reached over a private network (a gateway with its own CA) | A provider with `tls` trusts only its `ca_file`; built-in and platform roots are off, so a certificate from a public CA or from another provider's CA is refused before anything, the key included, is sent. Tested with a server whose certificate comes from another CA. |
+| A client certificate offered to the wrong host | Each provider with `tls` has a client of its own; providers without `tls` use one shared client, which is built without a client certificate. Tested: a provider with `tls` but no client certificate presents none, even to a server that asks, and only providers with `tls` get a client of their own. |
+| A bad configuration while the broker runs | A changed config file is validated in full before anything is applied; an invalid one is refused and the running one stays. Changes outside `llm.providers` and `llm.pricing` are not applied until a restart. TLS files that do not fit together (a renewed certificate with the old key) are refused. A change refused only because TLS files it names are missing or do not fit together is tried again whenever one of those files changes, so a change whose Secret is updated after the config file, a stricter `access` say, is not silently left unapplied. Requests in flight keep the configuration they started with; a reload resets neither the in-flight limits nor the failed-token limiter, and shutdown still waits for every stream. |
+| Header smuggling (hop-by-hop `Connection`, duplicate auth headers, provider org headers, method override) | The upstream request is built from scratch with an allowlist of caller headers; auth is always set by the broker; ambiguous credentials are refused. CL/TE conflicts are rejected by the HTTP server. A provider can pass more caller headers by prefix, but never credentials, cookies, routing headers (`host`, `forwarded`, `x-forwarded-*`, `via`, method overrides such as `x-http-method-override`, URL rewrites such as `x-original-url`), headers that name the client's address (`x-real-ip`, `true-client-ip`, ...), framing or hop-by-hop headers, nor those the broker sets: a prefix that could match one makes the configuration invalid, and every header forwarded by prefix is checked against the list again. Tested with prefixes that validation would refuse. |
+| Response headers that act on the caller or show what is not the caller's (cookies, credential challenges, redirects, account ids, rate limits of a key) | A fixed set of response headers comes back by default. A provider can pass more by prefix, meant for a provider whose headers concern one owner; `authorization`, `proxy-authorization` and `x-api-key` (the credentials the broker sends upstream, should an upstream echo them), `set-cookie`, `www-authenticate`, `location`, `alt-svc` and the names kept for the broker's own limit headers (`ratelimit*`, `ocb-*`) never pass, whatever the prefixes. |
+| An agent reaching the network through tools the provider runs itself (web search and fetch, code execution, MCP servers named in the request), past the rule that agent pods reach only the broker | `body.deny_server_tools` on a provider of kind `anthropic` refuses, before anything is sent, a request with a non-empty `mcp_servers` or with a tool whose `type` is not `custom` and not on the provider's allowlist (exact types, version date included). Any type but `custom` counts, so a new provider tool is refused until it is reviewed and listed. A key given twice makes the body unreadable, so the broker cannot check one `tools` or `type` while the provider uses another. Off by default; see residual risks for what it does not cover. |
 | Avoiding accounting by hanging up (before the response head or mid-stream), reading slowly or making the caller time out | The upstream exchange runs in its own task, which owns accounting and reads the upstream response to its end regardless of the caller; usage comes from the provider's report. Tested for each case. |
 | Avoiding accounting with hidden reasoning (billed but not streamed) on aborted responses | Aborted responses are drained (above). Where no report can be had (stalled or failed stream, no response, shutdown cut, compressed body) output is charged at least at the request's `max_tokens` / `max_completion_tokens`. |
 | Avoiding accounting via other endpoints (batches, files) or streaming without usage | Only allowlisted endpoints are reachable; OpenAI-compatible streams must request usage (configurable). |
 | Paying a cheap model's price for an expensive one (provider-side routing and fallbacks) | Cost uses the model the provider reports as having answered; a model without a price is billed at the provider's highest configured price. |
 | Forgotten zero price disabling USD budgets | Zero input or output prices are rejected unless the entry sets `free = true`. |
-| Budget overshoot | Pre-check before forwarding, atomic post-accounting, at most `max_concurrent_per_token` requests in flight per token and replica. |
+| Budget overshoot | The token's budget: pre-check before forwarding, atomic post-accounting, at most `max_concurrent_per_token` requests in flight per token and replica. Budgets of a tenant and a provider: each billable request reserves its `max_tokens` (at most `llm.max_reservation_tokens`) on each of them before it is sent, all or nothing, and a budget refuses once what is spent and reserved reaches it, so requests in flight cannot all pass a check of what is spent. Usage counts in the period the request was authorized in. See residual risks for the bound. |
+| One token or tenant using up the rate limits of others | Limits are checked from the token up, and a level counts a request only when the levels below it let it through: a token over its own rate never counts in its tenant's window, and a tenant over its own never in the provider's; neither window counts past its limit. Requests in flight are checked in the same order. A token or a tenant whose budget is used up is refused before either window counts it, so its retries take nothing from others. Tested: a token sending ten times its rate at once causes no refusal for another token of its tenant or for another tenant, and requests refused for a used-up budget leave the windows above them as they were. |
+| Learning other tenants' activity from limits | Callers see the numbers of their own token and tenant only. A provider's limits for every tenant show to callers as `ok`, `near` or `exhausted` with the time they renew (`/llm/_/limits`), and refusals of that level carry no numbers. Exact numbers are on the admin listener and in metrics. Tested: the answer of `/llm/_/limits` holds nothing of another tenant. |
+| An upstream forging the broker's limit headers (`RateLimit`, `ocb-budget-*`) | Headers named `ratelimit*` or `ocb-*` from a provider are never passed on, whatever its prefixes, and the broker sets its own after the headers it passes on. Tested with a provider that sends them. |
+| A USD budget that never runs out (usage without a price costs nothing) | A provider with a USD budget must have prices (checked at load); a tenant's USD budget is refused while the tenant holds a key for a provider without prices (checked at `PUT`); while a USD budget applies, a request for a model without a price is refused. |
 | Key leaks via errors | Provider error bodies are scrubbed (exact key, caller token, credential-like runs) before they are cut to size, so a key at the cut is still removed. Broker errors never contain values or echo caller input; JSON parse errors of the admin API are generic. Internal errors are logged without details sent to the caller. |
 | Key leaks via logs, traces, metrics | `Secret<T>` hides values in `Debug`/`Display` and zeroizes on drop; provider auth header values are marked sensitive; incoming `Authorization`, `x-api-key`, `Cookie`, `Proxy-Authorization` are marked sensitive; bodies are never logged; SQL logging carries statements, not bound values; metric labels are bounded (route templates, a fixed set of methods, configured model names, tenant ids). An adversarial test runs many flows with TRACE logging of every crate and checks that no key fragment appears. |
 | Database backup or replica leaked | Values are envelope-encrypted; KEKs are not in the database. Tokens are stored as keyed digests (HMAC) of 256-bit random values. |
@@ -48,7 +66,7 @@
 | Stolen admin token | Admin API on its own port, reachable only from the platform core (NetworkPolicy). Tokens are compared in constant time on digests; principals are named for the audit trail. Moving to Kubernetes TokenReview removes long-lived shared tokens. |
 | Cross-tenant information via metrics | Metrics are on a separate port reachable only by monitoring. |
 | Untrusted callers choosing trace ids (misattributing audit and usage rows, injecting spans into other traces) | On the public listener a caller's `traceparent` is only linked; audit and usage rows carry the broker's trace id or the trace set by the platform at token issuance. |
-| Resource exhaustion: slow or many connections, slow request bodies, floods of bad tokens, many concurrent requests, unbounded metric labels | Header read timeout and connection cap per listener; request body read timeout and size limit; failed token checks per address are capped before any database lookup; in-flight caps per token and replica; upstream connect, idle and total timeouts are enforced by the exchange regardless of the caller; method labels from a fixed set. |
+| Resource exhaustion: slow or many connections, slow request bodies, floods of bad tokens, many concurrent requests, unbounded metric labels | Header read timeout and connection cap per listener; request body read timeout and size limit; failed token checks per address are capped before any database lookup; in-flight caps per token, tenant, provider and replica; `/llm/_/limits`, which counts no request against a rate limit, has a limit of its own per token, checked before any database lookup and counted only for tokens that are found, so made-up tokens cannot fill it (at most 10 000 tokens are kept per replica and minute); upstream connect, idle and total timeouts are enforced by the exchange regardless of the caller; method labels from a fixed set; the token expiry metric exports at most 1000 tenant and label pairs. |
 | Supply chain | `Cargo.lock` committed, pinned toolchain, `cargo deny` (advisories, licenses, bans incl. OpenSSL, sources), `cargo audit` in CI, new dependency versions at least 14 days old, no `unsafe` in our code. |
 
 ## Residual risks and follow-ups
@@ -56,6 +74,22 @@
 - **Plaintext inside the cluster.** The listeners speak HTTP; rely on
   NetworkPolicy and a mesh or add TLS on the listeners. PostgreSQL supports
   TLS (`sslmode=verify-full`, `sslrootcert=`).
+- **Write access to the config file or the TLS files** is as powerful as
+  deploying the broker: it decides where keys are sent and which servers
+  are trusted, and a change applies within seconds, without a restart.
+  Protect the ConfigMap and Secrets with RBAC and review changes.
+- **Replicas reload independently.** For up to the kubelet's sync delay
+  plus `reload_interval_secs`, replicas can serve different provider
+  configurations; `ocb_config_version` shows each replica's.
+- **Configuration changes affect new requests only.** Removing a provider
+  or making it explicit does not stop a stream that is already running.
+- **Provider ids are visible without a token.** An unknown provider, or an
+  endpoint a provider does not serve, gets 404 before the token is
+  checked, so a caller without a token can find out which ids are
+  configured and which endpoints each one serves, explicit providers
+  included. Ids are not secret: access is enforced by the token check
+  (`access = "explicit"` included), not by hiding ids, so an id should not
+  carry a confidential name such as a customer's.
 - **Abandoned generations are paid for.** Because the exchange drains the
   upstream response for accounting, a request the caller cancels still runs
   to completion at the provider (bounded by its `max_tokens`) and is billed.
@@ -63,34 +97,81 @@
 - **Estimates.** When no usage report exists, output is charged at least at
   the request's `max_tokens`. OpenAI-compatible requests may omit it; then
   hidden reasoning in a stalled or failed stream is not covered.
-- **Budget overshoot** by requests already in flight when a budget runs out,
-  bounded by `max_concurrent_per_token` × replicas and the cost per request.
-  A reservation step (reserve `max_tokens` up front) would close it.
-- **Per-replica limits.** In-flight caps and the failed-token limiter are
-  kept in memory per replica, so cluster-wide they scale with the number of
-  replicas. The limiter is keyed by client address.
+- **Budget overshoot.** A token's budget can be exceeded by its requests
+  already in flight when it runs out, bounded by
+  `max_concurrent_per_token` × replicas and the cost per request. A budget
+  of a tenant or a provider admits a request while spent plus reserved is
+  below it, so it is exceeded at most by the last request it admitted and
+  by what requests in flight use beyond their reservations: their input
+  tokens, which are not reserved, and output beyond
+  `llm.max_reservation_tokens`. How many requests can be in flight is
+  bounded by the caps on requests in flight of the level times the
+  replicas (set `concurrent` on tenants and providers with budgets for a
+  firm bound). A budget in USD is exceeded likewise by the cost of input
+  tokens.
+- **Reservations that outlive their request.** A reservation goes back when
+  its request is accounted, or when it ends before reaching the provider,
+  also when the caller hangs up while the reservation is being taken: it
+  is taken in a task the caller cannot cut short (tested by hanging up at
+  every point of a request). If the process dies in between (not a
+  graceful shutdown, which accounts), or accounting fails after its
+  retries, the reservation stays in its period's row until the period
+  ends: at most `llm.max_reservation_tokens` per such request, for the rest
+  of a day or month. `GET /v1/admin/limits` shows what is reserved.
+- **Budgets count from when they are set.** A tenant budget set in the
+  middle of a month does not count the month's earlier usage, and one
+  removed and set again starts from the spend already in the period's row.
+- **Coarse is not nothing.** `/llm/_/limits` tells every tenant using a
+  provider when that provider is near or past its limits for everyone. That
+  is the point (an agent can wait instead of failing), but it does show,
+  coarsely, that others are busy.
+- **Per-replica limits.** Caps on requests in flight (per token, tenant,
+  provider and in total), the failed-token limiter and the limit of
+  `/llm/_/limits` are kept in memory per replica, so cluster-wide they scale
+  with the number of replicas. The failed-token limiter is keyed by client
+  address.
 - **Prices are configuration.** Wrong prices give wrong USD accounting;
   tiered pricing (long context, server tools such as web search, service
   tiers) is not modelled. Token budgets are exact for what the provider
   reports.
 - **Lost accounting writes.** A usage write is retried three times and then
   dropped (counted in `ocb_llm_accounting_failures_total`); a durable outbox
-  would remove that window.
+  would remove that window. A write whose commit got no answer may have
+  taken effect, and repeating it would bill the usage twice and give back
+  reservations that other requests hold; so its outcome is looked up in
+  PostgreSQL first, and a write whose outcome cannot be told is not
+  repeated but dropped and counted the same way.
 - **Exact-match redaction** only catches the key as one contiguous byte
   sequence. A key split across separately encoded fragments would not be
   caught; the model never sees the key, so only a reflecting upstream could
   produce it.
-- **Provider-side egress.** Request bodies are forwarded unchanged, so
-  provider server-side tools (web fetch, MCP connectors, code execution) are
-  available to agents if the provider and the request enable them. Policy for
-  that belongs to the agent platform, or to a future body policy in the
-  proxy.
+- **Provider-side egress.** Request bodies are forwarded unchanged. On a
+  provider of kind `anthropic` with `body.deny_server_tools`, tools the
+  provider would run itself and MCP servers are refused; on any other
+  provider an agent can use them if the provider and the request enable
+  them. The policy does not cover content the provider fetches by URL
+  (image or document blocks with a `url` source), server-side features of
+  OpenAI-compatible providers (each spells them its own way, so the
+  `openai` kind has no body policy), or features a provider adds outside
+  `tools` and `mcp_servers`. Restricting those belongs to the agent
+  platform or the provider account.
+- **Headers passed by prefix are not inspected.** A prefix passes whatever
+  the caller or the provider puts in matching headers. On a provider that
+  serves several tenants, a broad response prefix shows one tenant's
+  agents the account details and rate-limit use of that tenant's key, and
+  a broad request prefix lets agents send headers that change what the
+  provider does. This is why the defaults stay closed: the shared
+  providers of a default configuration serve tenants with their own keys,
+  and the header allowlist is what keeps account details away from agent
+  pods. Prefixes are meant for providers whose headers concern one owner,
+  and should be as narrow as the use needs.
 - **Revocation does not stop a stream already in progress.** New requests
   are refused immediately.
 - **What database write access still allows**: deleting rows, resetting
-  spend or raising budgets, replaying an older ciphertext of the same
-  tenant, name and kind, and clearing `revoked_at` or `used_at` of a token
-  whose value the attacker already has. The audit log is only as strong as
+  spend (of tokens, tenants and providers) or raising budgets (of tokens
+  and tenants), replaying an older ciphertext of the same tenant, name and
+  kind, and clearing `revoked_at` or `used_at` of a token whose value the
+  attacker already has. The audit log is only as strong as
   the database role (see below).
 - **No Row-Level Security yet.** Tenant scoping is enforced in every query
   of the application; PostgreSQL RLS would be a second line.
@@ -98,8 +179,9 @@
   a runtime role with `SELECT, INSERT, UPDATE, DELETE` on the tables but only
   `INSERT, SELECT` on `audit_log`, so the running service cannot rewrite its
   audit trail.
-- **Retention.** `llm_usage`, `audit_log` and spent tokens grow without
-  bound; add retention jobs before high volume.
+- **Retention.** `llm_usage`, `audit_log`, spent tokens and the rows of past
+  periods in `limit_spend` grow without bound; add retention jobs before
+  high volume.
 - **Memory hygiene** is best effort: `Secret<T>` zeroizes, but copies made
   by serde, HTTP header values, TLS buffers and the keyed HMAC state are not
   zeroized.

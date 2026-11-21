@@ -8,6 +8,7 @@ use std::sync::Arc;
 use broker_core::clock::{Clock, ManualClock};
 use broker_core::crypto::{Envelope, KEY_LEN, LocalKeyProvider, random_bytes};
 use broker_core::keeper::{NewJobToken, NewLlmToken, NewSecret, SecretUpdate};
+use broker_core::llm::ProviderAccess::{Explicit, Implicit};
 use broker_core::store::{NewUsageRow, Store, UsageFilter};
 use broker_core::testing::TestDb;
 use broker_core::tokens::TokenHasher;
@@ -151,8 +152,8 @@ async fn provider_keys_resolve_only_within_the_token_tenant() {
     let tb = k.issue_llm_token(ADMIN, "tenant-b", NewLlmToken::default()).await.unwrap();
     assert!(ta.token.expose().starts_with("ocb_llm_"));
 
-    let ga = k.authorize_llm(ta.token.expose(), "anthropic").await.unwrap();
-    let gb = k.authorize_llm(tb.token.expose(), "anthropic").await.unwrap();
+    let ga = k.authorize_llm(ta.token.expose(), "anthropic", Implicit).await.unwrap();
+    let gb = k.authorize_llm(tb.token.expose(), "anthropic", Implicit).await.unwrap();
     assert_eq!(k.provider_key(&ga, "anthropic", Some("trace-1")).await.unwrap().expose(), KEY_A);
     assert_eq!(k.provider_key(&gb, "anthropic", None).await.unwrap().expose(), KEY_B);
     // No key for this provider in the tenant: refused, never another tenant's key.
@@ -180,6 +181,32 @@ async fn provider_keys_resolve_only_within_the_token_tenant() {
 }
 
 #[tokio::test]
+async fn explicit_providers_serve_only_tokens_that_name_them() {
+    let Some(fx) = fixture().await else { return };
+    let k = &fx.keeper;
+    let token = |providers: Option<Vec<&str>>| {
+        let providers = providers.map(|p| p.into_iter().map(String::from).collect());
+        k.issue_llm_token(ADMIN, "tenant-a", NewLlmToken { providers, ..NewLlmToken::default() })
+    };
+    let any = token(None).await.unwrap();
+    let named = token(Some(vec!["gateway"])).await.unwrap();
+    let other = token(Some(vec!["anthropic"])).await.unwrap();
+    // A token without a list reaches implicit providers only.
+    k.authorize_llm(any.token.expose(), "anthropic", Implicit).await.unwrap();
+    assert!(matches!(k.authorize_llm(any.token.expose(), "gateway", Explicit).await, Err(BrokerError::Forbidden(_))));
+    // An explicit provider serves the tokens that name it, and no others.
+    let g = k.authorize_llm(named.token.expose(), "gateway", Explicit).await.unwrap();
+    assert_eq!(g.token_id, named.info.id);
+    assert!(matches!(k.authorize_llm(other.token.expose(), "gateway", Explicit).await, Err(BrokerError::Forbidden(_))));
+    // The list still limits the token everywhere else.
+    assert!(matches!(
+        k.authorize_llm(named.token.expose(), "anthropic", Implicit).await,
+        Err(BrokerError::Forbidden(_))
+    ));
+    fx.db.cleanup().await;
+}
+
+#[tokio::test]
 async fn llm_tokens_validate_revoke_expire_and_rate_limit() {
     let Some(fx) = fixture().await else { return };
     let k = &fx.keeper;
@@ -201,26 +228,26 @@ async fn llm_tokens_validate_revoke_expire_and_rate_limit() {
     // Rate limit: 3 per minute window.
     fx.clock.set(T0 - T0 % 60);
     for _ in 0..3 {
-        k.authorize_llm(tok, "anthropic").await.unwrap();
+        k.authorize_llm(tok, "anthropic", Implicit).await.unwrap();
     }
-    match k.authorize_llm(tok, "anthropic").await {
+    match k.authorize_llm(tok, "anthropic", Implicit).await {
         Err(BrokerError::RateLimited { retry_after_secs }) => assert_eq!(retry_after_secs, 60),
         other => panic!("expected rate limit, got {other:?}"),
     }
     fx.clock.advance(60);
-    let g = k.authorize_llm(tok, "anthropic").await.unwrap();
+    let g = k.authorize_llm(tok, "anthropic", Implicit).await.unwrap();
     assert_eq!(g.run_id.as_deref(), Some("run-1"));
     // Provider allowlist.
-    assert!(matches!(k.authorize_llm(tok, "deepseek").await, Err(BrokerError::Forbidden(_))));
+    assert!(matches!(k.authorize_llm(tok, "deepseek", Implicit).await, Err(BrokerError::Forbidden(_))));
     // Garbage, other token types and look-alikes are rejected without a DB hit.
     for bad in ["", "Bearer x", &tok[..tok.len() - 1], &tok.replace("ocb_llm_", "ocb_job_")] {
-        assert!(matches!(k.authorize_llm(bad, "anthropic").await, Err(BrokerError::Unauthorized)));
+        assert!(matches!(k.authorize_llm(bad, "anthropic", Implicit).await, Err(BrokerError::Unauthorized)));
     }
     // Revocation is effective immediately, and only within the token's tenant.
     assert!(matches!(k.revoke_llm_token(ADMIN, "tenant-b", &t.info.id).await, Err(BrokerError::NotFound(_))));
-    k.authorize_llm(tok, "anthropic").await.unwrap();
+    k.authorize_llm(tok, "anthropic", Implicit).await.unwrap();
     k.revoke_llm_token(ADMIN, "tenant-a", &t.info.id).await.unwrap();
-    assert!(matches!(k.authorize_llm(tok, "anthropic").await, Err(BrokerError::Unauthorized)));
+    assert!(matches!(k.authorize_llm(tok, "anthropic", Implicit).await, Err(BrokerError::Unauthorized)));
     assert!(k.get_llm_token("tenant-a", &t.info.id).await.unwrap().revoked_at.is_some());
     assert!(matches!(k.get_llm_token("tenant-b", &t.info.id).await, Err(BrokerError::NotFound(_))));
 
@@ -229,9 +256,9 @@ async fn llm_tokens_validate_revoke_expire_and_rate_limit() {
         .issue_llm_token(ADMIN, "tenant-a", NewLlmToken { ttl_secs: Some(10), ..NewLlmToken::default() })
         .await
         .unwrap();
-    k.authorize_llm(t2.token.expose(), "anthropic").await.unwrap();
+    k.authorize_llm(t2.token.expose(), "anthropic", Implicit).await.unwrap();
     fx.clock.advance(10);
-    assert!(matches!(k.authorize_llm(t2.token.expose(), "anthropic").await, Err(BrokerError::Unauthorized)));
+    assert!(matches!(k.authorize_llm(t2.token.expose(), "anthropic", Implicit).await, Err(BrokerError::Unauthorized)));
 
     // Issuance limits.
     for bad in [
@@ -259,7 +286,7 @@ async fn usage_accounting_feeds_budgets() {
         .issue_llm_token(ADMIN, "tenant-a", NewLlmToken { budget_tokens: Some(1000), ..NewLlmToken::default() })
         .await
         .unwrap();
-    let g = k.authorize_llm(t.token.expose(), "anthropic").await.unwrap();
+    let g = k.authorize_llm(t.token.expose(), "anthropic", Implicit).await.unwrap();
     g.check_budget(Some("m"), None).unwrap();
     let row = NewUsageRow {
         ts: fx.clock.now(),
@@ -285,7 +312,7 @@ async fn usage_accounting_feeds_budgets() {
     k.record_usage(&row).await.unwrap();
     let info = k.get_llm_token("tenant-a", &t.info.id).await.unwrap();
     assert_eq!((info.spent_tokens, info.spent_micro_usd, info.request_count), (1050, 4200, 1));
-    let g = k.authorize_llm(t.token.expose(), "anthropic").await.unwrap();
+    let g = k.authorize_llm(t.token.expose(), "anthropic", Implicit).await.unwrap();
     assert!(matches!(g.check_budget(Some("m"), None), Err(BrokerError::BudgetExceeded(_))));
     let usage = k.list_usage("tenant-a", &UsageFilter { limit: 10, ..UsageFilter::default() }).await.unwrap();
     assert_eq!(usage.len(), 1);
@@ -367,7 +394,7 @@ async fn job_tokens_are_single_use_tenant_scoped_and_exclude_llm_keys() {
     let lt = k.issue_llm_token(ADMIN, "tenant-a", NewLlmToken::default()).await.unwrap();
     assert!(matches!(k.redeem_job_token(lt.token.expose(), None).await, Err(BrokerError::Unauthorized)));
     let t5 = k.issue_job_token(ADMIN, "tenant-a", job(&["ssh.vm-1"])).await.unwrap();
-    assert!(matches!(k.authorize_llm(t5.token.expose(), "anthropic").await, Err(BrokerError::Unauthorized)));
+    assert!(matches!(k.authorize_llm(t5.token.expose(), "anthropic", Implicit).await, Err(BrokerError::Unauthorized)));
     fx.db.cleanup().await;
 }
 
@@ -393,7 +420,7 @@ async fn kek_rotation_rewraps_without_changing_values() {
     assert!(rotated.list_secrets("tenant-b").await.unwrap().iter().all(|m| m.kek_id == "k2"));
 
     let t = rotated.issue_llm_token(ADMIN, "tenant-a", NewLlmToken::default()).await.unwrap();
-    let g = rotated.authorize_llm(t.token.expose(), "anthropic").await.unwrap();
+    let g = rotated.authorize_llm(t.token.expose(), "anthropic", Implicit).await.unwrap();
     assert_eq!(rotated.provider_key(&g, "anthropic", None).await.unwrap().expose(), KEY_A);
     assert!(rotated.audit_log(None, 10).await.unwrap().iter().any(|e| e.action == "kek.rewrap"));
     fx.db.cleanup().await;
@@ -459,13 +486,13 @@ async fn database_write_access_cannot_mint_tokens_or_widen_them() {
 
     // 4. Move an LLM token to another tenant: refused.
     let t = k.issue_llm_token(ADMIN, "tenant-a", NewLlmToken::default()).await.unwrap();
-    k.authorize_llm(t.token.expose(), "anthropic").await.unwrap();
+    k.authorize_llm(t.token.expose(), "anthropic", Implicit).await.unwrap();
     sqlx::query("UPDATE llm_tokens SET tenant_id = 'tenant-b' WHERE id = $1")
         .bind(&t.info.id)
         .execute(&pool)
         .await
         .unwrap();
-    assert!(matches!(k.authorize_llm(t.token.expose(), "anthropic").await, Err(BrokerError::Unauthorized)));
+    assert!(matches!(k.authorize_llm(t.token.expose(), "anthropic", Implicit).await, Err(BrokerError::Unauthorized)));
     // ... or lift its provider restriction.
     let t = k
         .issue_llm_token(
@@ -476,7 +503,7 @@ async fn database_write_access_cannot_mint_tokens_or_widen_them() {
         .await
         .unwrap();
     sqlx::query("UPDATE llm_tokens SET providers = NULL WHERE id = $1").bind(&t.info.id).execute(&pool).await.unwrap();
-    assert!(matches!(k.authorize_llm(t.token.expose(), "anthropic").await, Err(BrokerError::Unauthorized)));
+    assert!(matches!(k.authorize_llm(t.token.expose(), "anthropic", Implicit).await, Err(BrokerError::Unauthorized)));
     fx.db.cleanup().await;
 }
 

@@ -4,9 +4,10 @@
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Request};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use broker_core::BrokerError;
+use broker_core::limits::{LimitKind, LimitLevel};
 use broker_core::llm::ProviderKind;
 use serde_json::json;
 
@@ -20,12 +21,18 @@ pub fn classify(e: &BrokerError) -> (StatusCode, &'static str) {
         BrokerError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
         BrokerError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
         BrokerError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-        BrokerError::TooManyInFlight(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight"),
         // 402: not retried by the common SDKs, unlike 429.
         BrokerError::BudgetExceeded(_) => (StatusCode::PAYMENT_REQUIRED, "budget_exceeded"),
-        BrokerError::Crypto(_) | BrokerError::Storage(_) | BrokerError::Migrate(_) | BrokerError::Internal(_) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        }
+        BrokerError::Limit(r) => match r.kind {
+            LimitKind::Rate => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            LimitKind::InFlight => (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight"),
+            LimitKind::Budget => (StatusCode::PAYMENT_REQUIRED, "budget_exceeded"),
+        },
+        BrokerError::Crypto(_)
+        | BrokerError::Storage(_)
+        | BrokerError::Migrate(_)
+        | BrokerError::CommitUnknown(_)
+        | BrokerError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
 
@@ -41,7 +48,11 @@ fn public_message(e: &BrokerError, status: StatusCode) -> String {
 fn retry_after(e: &BrokerError, resp: &mut Response) {
     let secs = match e {
         BrokerError::RateLimited { retry_after_secs } => *retry_after_secs,
-        BrokerError::TooManyInFlight(_) => 1,
+        BrokerError::Limit(r) => match (r.kind, r.retry_after_secs) {
+            (_, Some(secs)) => secs,
+            (LimitKind::InFlight, None) => 1,
+            _ => return,
+        },
         _ => return,
     };
     if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
@@ -122,7 +133,33 @@ pub fn llm_error_response(
     message: &str,
     source: &BrokerError,
 ) -> Response {
-    let body = match kind {
+    llm_error_with(kind, status, code, message, source, None)
+}
+
+/// 402 or 429 for a request refused by a limit: an error of the provider's
+/// shape whose `error` object also names the level of the limit, as does
+/// the `ocb-limit-level` header.
+pub fn llm_limit_error(kind: ProviderKind, level: LimitLevel, e: &BrokerError) -> Response {
+    let (status, code) = classify(e);
+    let message = public_message(e, status);
+    let mut resp = llm_error_with(kind, status, code, &message, e, Some(level));
+    resp.headers_mut().insert(LIMIT_LEVEL, HeaderValue::from_static(level.as_str()));
+    resp
+}
+
+/// Names the level of the limit that refused a request, or else of the
+/// budget in the `ocb-budget-*` headers.
+pub const LIMIT_LEVEL: HeaderName = HeaderName::from_static("ocb-limit-level");
+
+fn llm_error_with(
+    kind: ProviderKind,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    source: &BrokerError,
+    level: Option<LimitLevel>,
+) -> Response {
+    let mut body = match kind {
         ProviderKind::Anthropic => {
             let t = match status.as_u16() {
                 400 => "invalid_request_error",
@@ -149,6 +186,9 @@ pub fn llm_error_response(
             json!({ "error": { "message": message, "type": t, "code": code, "param": null } })
         }
     };
+    if let (Some(level), Some(error)) = (level, body.get_mut("error").and_then(|e| e.as_object_mut())) {
+        error.insert("level".into(), level.as_str().into());
+    }
     let mut resp = (status, Json(body)).into_response();
     if status == StatusCode::UNAUTHORIZED {
         resp.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));

@@ -305,3 +305,132 @@ async fn kek_rewrap_endpoint() {
     assert_eq!(v["current_kek_id"], "test-1");
     env.cleanup().await;
 }
+
+#[tokio::test]
+async fn providers_are_listed_read_only() {
+    let Some(env) = Env::new().await else { return };
+    env.seed_keys().await;
+    let (s, v) = env.admin_call("GET", "/v1/admin/providers", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["config_version"].as_u64(), Some(env.state.proxy.snapshot().version()));
+    let providers = v["providers"].as_array().unwrap();
+    let ids: Vec<&str> = providers.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["anthropic", "deepseek", "openrouter"]);
+    assert_eq!(
+        providers[0],
+        json!({"id": "anthropic", "kind": "anthropic", "host": env.upstream_addr.to_string(),
+               "endpoints": ["messages", "count_tokens", "models"], "access": "implicit",
+               "has_tls": false, "tls_not_after": null, "pricing_from": null,
+               "headers": {"request_forward_prefixes": [], "response_forward_prefixes": []},
+               "body": {"deny_server_tools": false, "server_tool_allowlist": []}})
+    );
+    // Only the host of a base URL is shown (openrouter's has the path /v1/).
+    assert_eq!(providers[2]["host"], env.upstream_addr.to_string());
+    assert_eq!(providers[2]["endpoints"], json!(["chat_completions", "models"]));
+    let text = v.to_string();
+    assert!(!text.contains("/v1") && !text.contains(KEY_A) && !text.contains(DS_KEY_A), "{text}");
+
+    // Read-only, admin only, and not on the public listener.
+    let auth = format!("Bearer {ADMIN_TOKEN}");
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        let (s, _) =
+            call(&env.admin, method, "/v1/admin/providers", &[("authorization", &auth)], Some("{}".into())).await;
+        assert!(s == StatusCode::METHOD_NOT_ALLOWED || s == StatusCode::NOT_FOUND, "{method}: {s}");
+    }
+    let (s, _) = call(&env.admin, "GET", "/v1/admin/providers", &[], None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&env.public, "GET", "/v1/admin/providers", &[("authorization", &auth)], None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn limits_of_tenants_are_set_audited_and_shown_with_their_usage() {
+    let Some(env) = Env::new().await else { return };
+    env.seed_keys().await;
+    let day0 = T0 - T0 % 86_400;
+    let uri = "/v1/admin/tenants/tenant-a/limits";
+    let (s, v) = env.admin_call("GET", uri, None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v,
+        json!({"tenant": "tenant-a", "limits": null, "updated_at": null, "updated_by": null,
+               "usage": {"rpm": null, "in_flight": 0, "periods": []}})
+    );
+
+    let limits = json!({"rpm": 600, "concurrent": 8, "budget_tokens": {"day": 100_000}, "budget_usd": {"month": 25.5}});
+    let (s, v) = env.admin_call("PUT", uri, Some(limits)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["limits"],
+        json!({"rpm": 600, "concurrent": 8, "budget_tokens": {"day": 100_000, "month": null},
+               "budget_usd": {"day": null, "month": 25.5}})
+    );
+    assert_eq!((v["updated_by"].as_str(), v["updated_at"].as_i64()), (Some("core"), Some(T0)));
+
+    // A request counts in the tenant's window and in both periods.
+    let (token, _) = env.llm_token("tenant-a", json!({})).await;
+    let r = env
+        .llm("POST", "/llm/anthropic/v1/messages", &[("x-api-key", &token)], Some(anthropic_body("test-model", false)))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    env.settle().await;
+    let (_, v) = env.admin_call("GET", uri, None).await;
+    assert_eq!(v["usage"]["rpm"]["count"], 1);
+    let period = |period: &str, start: i64, resets_at: i64| {
+        json!({"period": period, "start": start, "resets_at": resets_at, "spent_tokens": 250, "spent_usd": 0.00135,
+               "reserved_tokens": 0, "reserved_usd": 0.0})
+    };
+    assert_eq!(
+        v["usage"]["periods"],
+        json!([period("day", day0, day0 + 86_400), period("month", 1_898_553_600, 1_901_232_000)])
+    );
+    let (s, all) = env.admin_call("GET", "/v1/admin/limits", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!((all["global"].clone(), all["tenants"][0]["tenant"].as_str()), (json!([]), Some("tenant-a")));
+    assert_eq!(all["config_version"].as_u64(), Some(env.state.proxy.snapshot().version()));
+    let (_, audit) = env.admin_call("GET", "/v1/admin/audit?tenant=tenant-a", None).await;
+    let set = audit.as_array().unwrap().iter().find(|e| e["action"] == "tenant_limits.set").unwrap().clone();
+    assert_eq!(set["actor"], "core");
+    assert!(set["detail"].as_str().unwrap().contains("\"rpm\":600"), "{set}");
+
+    // Bad limits are refused as a whole.
+    for bad in [
+        json!({"rpm": 0}),
+        json!({"rpm": -1}),
+        json!({"burst": 1}),
+        json!({"budget_tokens": {"week": 1}}),
+        json!({"budget_usd": {"day": -1.0}}),
+        json!({"concurrent": 2_000_000}),
+    ] {
+        let (s, v) = env.admin_call("PUT", uri, Some(bad.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let (s, _) = env.admin_call("PUT", "/v1/admin/tenants/bad%20tenant/limits", Some(json!({"rpm": 1}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(env.admin_call("GET", uri, None).await.1["limits"]["rpm"], 600, "unchanged");
+
+    // A USD budget is refused while the tenant holds a key for a provider
+    // without prices (openrouter has none here): its usage costs nothing.
+    env.put_secret("tenant-b", "llm.openrouter", "llm_api_key", "sk-or-FAKE-tenant-b-0000000000").await;
+    let b = "/v1/admin/tenants/tenant-b/limits";
+    let (s, v) = env.admin_call("PUT", b, Some(json!({"budget_usd": {"day": 5.0}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v["message"].as_str().unwrap().contains("providers without prices (openrouter)"), "{v}");
+    assert_eq!(env.admin_call("PUT", b, Some(json!({"budget_tokens": {"day": 5}}))).await.0, StatusCode::OK);
+
+    // {} removes every limit of a tenant.
+    let (s, v) = env.admin_call("PUT", uri, Some(json!({}))).await;
+    assert_eq!((s, v["limits"].clone()), (StatusCode::OK, Value::Null));
+    let (_, all) = env.admin_call("GET", "/v1/admin/limits", None).await;
+    let tenants: Vec<&str> = all["tenants"].as_array().unwrap().iter().map(|t| t["tenant"].as_str().unwrap()).collect();
+    assert_eq!(tenants, ["tenant-b"]);
+
+    // Admin only.
+    let auth = format!("Bearer {ADMIN_TOKEN}");
+    let (s, _) = call(&env.public, "GET", uri, &[("authorization", &auth)], None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = call(&env.admin, "PUT", uri, &[], Some("{}".into())).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    env.cleanup().await;
+}

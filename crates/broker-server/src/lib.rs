@@ -1,8 +1,8 @@
 //! HTTP layer of `otter-credential-broker`.
 //!
 //! Three listeners, so network policy can separate who reaches what:
-//! - public (`listen`): `/llm/*` proxy for agent pods and `/v1/worker/*` for
-//!   workers;
+//! - public (`listen`): `/llm/*` proxy for agent pods (and `/llm/_/limits`,
+//!   where they see their limits) and `/v1/worker/*` for workers;
 //! - admin (`admin_listen`): `/v1/admin/*` for the platform core;
 //! - metrics (`metrics_listen`): Prometheus `/metrics`.
 //!
@@ -10,13 +10,21 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+mod caller_limits;
 pub mod config;
 pub mod error;
+pub mod limit_metrics;
+mod limit_view;
 pub mod limits;
 pub mod observe;
+mod policy;
 pub mod proxy;
+pub mod registry;
+pub mod reload;
+mod tls;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,8 +55,10 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 pub use config::ServerConfig;
+use limit_metrics::LimitSeries;
 use limits::AuthFailureLimiter;
 pub use proxy::LlmProxy;
+use reload::Reloader;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -107,8 +117,11 @@ pub fn admin_router(state: AppState, timeout: Duration, body_limit: usize) -> Ro
         .route(&format!("{t}/llm-tokens/{{id}}/revoke"), post(admin::revoke_llm_token))
         .route(&format!("{t}/job-tokens"), get(admin::list_job_tokens).post(admin::issue_job_token))
         .route(&format!("{t}/job-tokens/{{id}}/revoke"), post(admin::revoke_job_token))
+        .route(&format!("{t}/limits"), get(admin::get_tenant_limits).put(admin::put_tenant_limits))
         .route(&format!("{t}/usage"), get(admin::usage))
         .route("/v1/admin/audit", get(admin::audit))
+        .route("/v1/admin/providers", get(admin::list_providers))
+        .route("/v1/admin/limits", get(admin::list_limits))
         .route("/v1/admin/kek/rewrap", post(admin::rewrap))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin::require_admin))
         .layer(DefaultBodyLimit::max(body_limit))
@@ -140,6 +153,8 @@ pub fn public_router(state: AppState, o: PublicOptions) -> Router {
     // No global timeout here: responses stream for minutes. Upstream timeouts
     // (connect, response, idle, total) are enforced by the proxy itself.
     let llm = Router::new()
+        .route("/llm/_/limits", get(caller_limits::view))
+        .route("/llm/p/{*path}", any(proxy::by_id))
         .route("/llm/anthropic/{*path}", any(proxy::anthropic))
         .route("/llm/openai/{*path}", any(proxy::openai))
         .layer(DefaultBodyLimit::max(o.llm_body_limit));
@@ -154,15 +169,23 @@ pub fn public_router(state: AppState, o: PublicOptions) -> Router {
     )
 }
 
-/// Metrics listener.
-pub fn metrics_router(handle: Option<PrometheusHandle>) -> Router {
+/// Metrics listener: the recorder's series, then the limit gauges read from
+/// the database (see [`limit_metrics`]).
+pub fn metrics_router(handle: Option<PrometheusHandle>, limits: LimitSeries) -> Router {
     Router::new().route("/healthz", get(healthz)).route(
         "/metrics",
         get(move || {
-            let handle = handle.clone();
+            let (handle, limits) = (handle.clone(), limits.clone());
             async move {
                 match handle {
-                    Some(h) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], h.render()).into_response(),
+                    Some(h) => {
+                        let mut text = h.render();
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str(&limits.render());
+                        ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
+                    }
                     None => StatusCode::NOT_FOUND.into_response(),
                 }
             }
@@ -287,8 +310,30 @@ async fn drain(servers: &mut tokio::task::JoinSet<()>, proxy: &LlmProxy) {
     proxy.tracker().wait().await;
 }
 
+/// Staged shutdown: cancels `stop` so the listeners in `servers` stop
+/// accepting, lets in-flight requests (LLM streams included) finish within
+/// `grace`, then cuts what is left and waits for its accounting.
+pub async fn shutdown(
+    stop: &CancellationToken,
+    servers: &mut tokio::task::JoinSet<()>,
+    proxy: &LlmProxy,
+    grace: Duration,
+) {
+    stop.cancel();
+    if tokio::time::timeout(grace, drain(servers, proxy)).await.is_err() {
+        tracing::warn!("shutdown grace period over; cutting in-flight LLM requests");
+        proxy.abort_all();
+        // Cut exchanges are accounted conservatively before the process exits.
+        if tokio::time::timeout(Duration::from_secs(15), drain(servers, proxy)).await.is_err() {
+            tracing::error!("timed out waiting for usage accounting to finish");
+        }
+    }
+}
+
 /// Builds all components from config and serves until a shutdown signal.
-pub async fn serve(cfg: ServerConfig) -> anyhow::Result<()> {
+/// `config_file` is where `cfg` came from; it is checked for changes every
+/// `reload_interval_secs` (see [`reload`]).
+pub async fn serve(cfg: ServerConfig, config_file: Option<PathBuf>) -> anyhow::Result<()> {
     let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets(observe::LATENCY_BUCKETS)
         .context("metrics buckets")?
@@ -322,13 +367,19 @@ pub async fn serve(cfg: ServerConfig) -> anyhow::Result<()> {
         },
     );
     let admin = admin_router(state.clone(), timeout, cfg.http.body_limit_bytes);
-    let metrics_app = metrics_router(Some(metrics));
+    let gauges = limit_metrics::LimitGauges::new(state.keeper.clone(), proxy.clone());
+    let metrics_app = metrics_router(Some(metrics), gauges.series());
     let opts = ServeOptions {
         header_read_timeout: Duration::from_secs(cfg.http.header_read_timeout_secs.max(1)),
         max_connections: cfg.http.max_connections,
     };
 
     let stop = CancellationToken::new();
+    tokio::spawn(gauges.run(limit_metrics::REFRESH_EVERY, stop.clone()));
+    if cfg.reload_interval_secs > 0 {
+        let reloader = Reloader::new(config_file, cfg.clone(), proxy.clone());
+        tokio::spawn(reloader.run(Duration::from_secs(cfg.reload_interval_secs), stop.clone()));
+    }
     let mut servers = tokio::task::JoinSet::new();
     for (name, addr, app) in [
         ("public", cfg.listen, public),
@@ -343,18 +394,7 @@ pub async fn serve(cfg: ServerConfig) -> anyhow::Result<()> {
         () = shutdown_signal() => tracing::info!("shutdown requested"),
         Some(res) = servers.join_next() => tracing::error!(?res, "a listener stopped unexpectedly"),
     }
-    // Stop accepting; let in-flight requests (including LLM streams) finish
-    // within the grace period, then cut what is left. Cut exchanges are
-    // accounted conservatively before the process exits.
-    stop.cancel();
-    let grace = Duration::from_secs(cfg.http.shutdown_grace_secs);
-    if tokio::time::timeout(grace, drain(&mut servers, &proxy)).await.is_err() {
-        tracing::warn!("shutdown grace period over; cutting in-flight LLM requests");
-        proxy.abort_all();
-        if tokio::time::timeout(Duration::from_secs(15), drain(&mut servers, &proxy)).await.is_err() {
-            tracing::error!("timed out waiting for usage accounting to finish");
-        }
-    }
+    shutdown(&stop, &mut servers, &proxy, Duration::from_secs(cfg.http.shutdown_grace_secs)).await;
     tracing::info!("shutdown complete");
     Ok(())
 }

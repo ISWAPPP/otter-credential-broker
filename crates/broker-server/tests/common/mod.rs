@@ -12,7 +12,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use broker_core::auth::StaticTokenAuthenticator;
 use broker_core::clock::ManualClock;
@@ -98,6 +98,39 @@ fn json_resp(status: StatusCode, body: String) -> Response {
     (status, [(header::CONTENT_TYPE, "application/json"), (header::SET_COOKIE, "upstream=1")], body).into_response()
 }
 
+/// Headers a provider may send with a response, besides `content-type`,
+/// `set-cookie` and `x-should-retry`: some every caller gets, some only
+/// through a provider's response prefixes, some never.
+pub const PROVIDER_RESPONSE_HEADERS: &[(&str, &str)] = &[
+    ("cache-control", "no-cache"),
+    ("retry-after", "7"),
+    ("request-id", "req_0123"),
+    ("x-request-id", "xreq_0123"),
+    ("anthropic-ratelimit-unified-status", "allowed"),
+    ("anthropic-ratelimit-unified-5h-utilization", "0.25"),
+    ("anthropic-ratelimit-requests-remaining", "99"),
+    ("anthropic-organization-id", "org-0123"),
+    ("x-ratelimit-remaining-requests", "59"),
+    ("x-upstream-debug", "1"),
+    ("www-authenticate", "Bearer realm=\"provider\""),
+    ("ratelimit-policy", "\"default\";q=100;w=60"),
+    ("ratelimit", "\"default\";r=50;t=30"),
+    ("ocb-budget-remaining", "999"),
+    ("location", "http://elsewhere.example/"),
+    ("alt-svc", "h3=\":443\""),
+];
+
+/// `resp` with every header of [`PROVIDER_RESPONSE_HEADERS`] and
+/// `x-should-retry: <should_retry>`.
+fn with_provider_headers(mut resp: Response, should_retry: &'static str) -> Response {
+    let h = resp.headers_mut();
+    for (name, value) in PROVIDER_RESPONSE_HEADERS {
+        h.append(HeaderName::from_static(name), HeaderValue::from_static(value));
+    }
+    h.insert("x-should-retry", HeaderValue::from_static(should_retry));
+    resp
+}
+
 /// Chunks with delays, to exercise streaming, idle timeouts and disconnects.
 fn slow_sse(parts: Vec<(Duration, String)>) -> Response {
     let s = stream::unfold(parts.into_iter(), |mut it| async move {
@@ -141,6 +174,14 @@ async fn upstream_handler(State(up): State<Upstream>, req: Request) -> Response 
                 StatusCode::from_u16(529).unwrap(),
                 json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}).to_string(),
             ),
+            "many-headers" => with_provider_headers(json_resp(StatusCode::OK, ANTHROPIC_JSON.into()), "false"),
+            "many-headers-429" => with_provider_headers(
+                json_resp(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    json!({"type":"error","error":{"type":"rate_limit_error","message":"Error"}}).to_string(),
+                ),
+                "true",
+            ),
             "echo-key" if stream => slow_sse(vec![
                 (Duration::ZERO, ANTHROPIC_SSE.split("event: content_block_delta").next().unwrap().to_owned()),
                 // The key is contiguous in the byte stream but split across
@@ -166,6 +207,16 @@ async fn upstream_handler(State(up): State<Upstream>, req: Request) -> Response 
                        "usage":{"input_tokens":5,"output_tokens":5}})
                 .to_string(),
             ),
+            // The key in response headers: one every caller gets, one passed
+            // only by prefix; and a harmless one next to them.
+            "echo-key-header" => {
+                let mut resp = json_resp(StatusCode::OK, ANTHROPIC_JSON.into());
+                let h = resp.headers_mut();
+                h.insert("request-id", HeaderValue::from_str(&format!("req_{key}")).unwrap());
+                h.insert("x-upstream-debug", HeaderValue::from_str(&format!("auth={key}")).unwrap());
+                h.insert("x-upstream-trace", HeaderValue::from_static("t-1"));
+                resp
+            }
             "slow-headers" => {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 json_resp(StatusCode::OK, ANTHROPIC_JSON.into())
@@ -238,13 +289,19 @@ async fn upstream_handler(State(up): State<Upstream>, req: Request) -> Response 
         },
         ("POST", "/v1/messages/count_tokens") => json_resp(StatusCode::OK, r#"{"input_tokens":42}"#.into()),
         ("GET", "/v1/models") => json_resp(StatusCode::OK, r#"{"data":[{"id":"test-model"}]}"#.into()),
-        ("POST", "/v1/chat/completions") => {
-            if stream {
-                sse(OPENAI_SSE_WITH_USAGE)
-            } else {
-                json_resp(StatusCode::OK, OPENAI_JSON.into())
-            }
-        }
+        ("POST", "/v1/chat/completions") => match model {
+            "many-headers" => with_provider_headers(json_resp(StatusCode::OK, OPENAI_JSON.into()), "false"),
+            "many-headers-429" => with_provider_headers(
+                json_resp(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    json!({"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}})
+                        .to_string(),
+                ),
+                "true",
+            ),
+            _ if stream => sse(OPENAI_SSE_WITH_USAGE),
+            _ => json_resp(StatusCode::OK, OPENAI_JSON.into()),
+        },
         ("GET", "/v1/models/") | ("GET", "/v1/models/x") => json_resp(StatusCode::OK, "{}".into()),
         _ => (StatusCode::IM_A_TEAPOT, "unexpected upstream path").into_response(),
     }
@@ -260,6 +317,101 @@ pub async fn start_upstream() -> (Upstream, SocketAddr) {
     (up, addr)
 }
 
+/// A test certificate or key (see tests/fixtures/tls/README.md).
+pub fn tls_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls").join(name)
+}
+
+/// A path as a TOML literal string.
+pub fn lit(p: &std::path::Path) -> String {
+    format!("'{}'", p.display())
+}
+
+/// Replaces `dst` with a copy of `src` all at once, as a Secret volume
+/// update does.
+pub fn replace(dst: &std::path::Path, src: &std::path::Path) {
+    let tmp = dst.with_extension("new");
+    std::fs::copy(src, &tmp).unwrap();
+    std::fs::rename(&tmp, dst).unwrap();
+}
+
+/// The fake upstream behind TLS.
+pub struct TlsUpstream {
+    pub upstream: Upstream,
+    pub addr: SocketAddr,
+    /// Per connection: the leaf certificate (DER) the client presented.
+    pub client_certs: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+}
+
+impl TlsUpstream {
+    pub fn last_client_cert(&self) -> Option<Vec<u8>> {
+        self.client_certs.lock().unwrap().last().cloned().expect("no TLS connection was made")
+    }
+    pub fn connections(&self) -> usize {
+        self.client_certs.lock().unwrap().len()
+    }
+}
+
+/// The first certificate of a PEM fixture, as DER.
+pub fn fixture_cert(name: &str) -> Vec<u8> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    CertificateDer::from_pem_file(tls_fixture(name)).unwrap().as_ref().to_vec()
+}
+
+/// Starts the fake upstream with TLS on 127.0.0.1:0, serving `cert`/`key`.
+/// With `client_ca`, it asks clients for a certificate issued by that CA
+/// (and records it) but also accepts clients without one.
+pub async fn start_tls_upstream(cert: &str, key: &str, client_ca: Option<&str>) -> TlsUpstream {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(tls_fixture(cert)).unwrap().map(Result::unwrap).collect();
+    let key = PrivateKeyDer::from_pem_file(tls_fixture(key)).unwrap();
+    let builder =
+        rustls::ServerConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().unwrap();
+    let builder = match client_ca {
+        Some(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for c in CertificateDer::pem_file_iter(tls_fixture(ca)).unwrap() {
+                roots.add(c.unwrap()).unwrap();
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .allow_unauthenticated()
+                .build()
+                .unwrap();
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let config = builder.with_single_cert(chain, key).unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let upstream = Upstream::default();
+    let app = Router::new().fallback(upstream_handler).with_state(upstream.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client_certs = Arc::new(Mutex::new(Vec::new()));
+    let seen = client_certs.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, app, seen) = (acceptor.clone(), app.clone(), seen.clone());
+            tokio::spawn(async move {
+                // A failed handshake never reaches the handler.
+                let Ok(tls) = acceptor.accept(tcp).await else { return };
+                let peer = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec());
+                seen.lock().unwrap().push(peer);
+                let svc = hyper_util::service::TowerToHyperService::new(app);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
+                    .await;
+            });
+        }
+    });
+    TlsUpstream { upstream, addr, client_certs }
+}
+
 pub fn price(provider: &str, model: &str, input: f64, output: f64, cache_read: Option<f64>) -> ModelPrice {
     ModelPrice {
         provider: provider.into(),
@@ -271,6 +423,53 @@ pub fn price(provider: &str, model: &str, input: f64, output: f64, cache_read: O
         cache_write_1h: None,
         free: false,
     }
+}
+
+/// Providers `anthropic`, `deepseek` and `openrouter`, all on one fake
+/// upstream, with test prices.
+fn default_llm(o: &EnvOptions, upstream_addr: SocketAddr) -> LlmConfig {
+    let mut providers = BTreeMap::new();
+    let mk = |kind, base_url: String| ProviderConfig {
+        allow_http: true,
+        require_stream_usage: o.require_stream_usage,
+        ..ProviderConfig::new(kind, base_url)
+    };
+    providers.insert("anthropic".into(), mk(ProviderKind::Anthropic, format!("http://{upstream_addr}")));
+    providers.insert("deepseek".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1")));
+    providers.insert("openrouter".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1/")));
+    LlmConfig {
+        max_request_bytes: o.max_request_bytes,
+        request_read_timeout_secs: 5,
+        connect_timeout_secs: 2,
+        response_timeout_secs: o.response_timeout_secs,
+        idle_timeout_secs: o.idle_timeout_secs,
+        max_duration_secs: 30,
+        max_error_body_bytes: 4096,
+        max_buffered_response_bytes: 1 << 20,
+        max_concurrent_per_token: o.max_concurrent_per_token,
+        max_concurrent_total: 1024,
+        max_reservation_tokens: 32_000,
+        limits_endpoint_per_minute: 30,
+        providers,
+        pricing: vec![
+            // USD per million tokens (test values).
+            price("anthropic", "test-model", 3.0, 15.0, Some(0.3)),
+            price("anthropic", "echo-key", 1.0, 1.0, None),
+            price("anthropic", "long-stream", 1.0, 1.0, None),
+            price("anthropic", "stall-stream", 1.0, 1.0, None),
+            price("anthropic", "slow-json", 1.0, 1.0, None),
+            price("anthropic", "huge-stream", 1.0, 1.0, None),
+            price("anthropic", "cheap-model", 0.1, 0.1, None),
+            price("anthropic", "cheap-model-2", 0.1, 0.1, None),
+            price("anthropic", "expensive-model", 50.0, 100.0, None),
+            price("deepseek", "deepseek-*", 0.5, 2.0, Some(0.1)),
+        ],
+    }
+}
+
+/// The `[llm]` section of a test's TOML configuration.
+pub fn llm_config(toml: &str) -> LlmConfig {
+    broker_server::ServerConfig::parse(toml).unwrap_or_else(|e| panic!("test config: {e}")).llm
 }
 
 pub struct Env {
@@ -313,9 +512,18 @@ impl Env {
     }
 
     pub async fn with(o: EnvOptions) -> Option<Self> {
+        let (upstream, upstream_addr) = start_upstream().await;
+        let llm = default_llm(&o, upstream_addr);
+        Self::with_llm(o, llm, (upstream, upstream_addr)).await
+    }
+
+    /// An environment with the given LLM configuration (e.g. parsed from a
+    /// test's own TOML). `upstream` is the fake upstream exposed as
+    /// `env.upstream`; the configuration decides which providers use it.
+    pub async fn with_llm(o: EnvOptions, llm: LlmConfig, upstream: (Upstream, SocketAddr)) -> Option<Self> {
         telemetry();
         let db = TestDb::create().await?;
-        let (upstream, upstream_addr) = start_upstream().await;
+        let (upstream, upstream_addr) = upstream;
         let clock = Arc::new(ManualClock::new(T0));
         let kek = LocalKeyProvider::new("test-1", Secret::new(random_bytes(KEY_LEN).unwrap())).unwrap();
         let hasher = TokenHasher::new(Secret::new(random_bytes(KEY_LEN).unwrap())).unwrap();
@@ -326,43 +534,6 @@ impl Env {
             clock.clone(),
             KeeperSettings::default(),
         );
-        let mut providers = BTreeMap::new();
-        let mk = |kind, base_url: String| ProviderConfig {
-            kind,
-            base_url,
-            allow_http: true,
-            propagate_trace_context: true,
-            require_stream_usage: o.require_stream_usage,
-        };
-        providers.insert("anthropic".into(), mk(ProviderKind::Anthropic, format!("http://{upstream_addr}")));
-        providers.insert("deepseek".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1")));
-        providers.insert("openrouter".into(), mk(ProviderKind::Openai, format!("http://{upstream_addr}/v1/")));
-        let llm = LlmConfig {
-            max_request_bytes: o.max_request_bytes,
-            request_read_timeout_secs: 5,
-            connect_timeout_secs: 2,
-            response_timeout_secs: o.response_timeout_secs,
-            idle_timeout_secs: o.idle_timeout_secs,
-            max_duration_secs: 30,
-            max_error_body_bytes: 4096,
-            max_buffered_response_bytes: 1 << 20,
-            max_concurrent_per_token: o.max_concurrent_per_token,
-            max_concurrent_total: 1024,
-            providers,
-            pricing: vec![
-                // USD per million tokens (test values).
-                price("anthropic", "test-model", 3.0, 15.0, Some(0.3)),
-                price("anthropic", "echo-key", 1.0, 1.0, None),
-                price("anthropic", "long-stream", 1.0, 1.0, None),
-                price("anthropic", "stall-stream", 1.0, 1.0, None),
-                price("anthropic", "slow-json", 1.0, 1.0, None),
-                price("anthropic", "huge-stream", 1.0, 1.0, None),
-                price("anthropic", "cheap-model", 0.1, 0.1, None),
-                price("anthropic", "cheap-model-2", 0.1, 0.1, None),
-                price("anthropic", "expensive-model", 50.0, 100.0, None),
-                price("deepseek", "deepseek-*", 0.5, 2.0, Some(0.1)),
-            ],
-        };
         let proxy = LlmProxy::new(&llm).unwrap();
         let state = AppState {
             keeper: Arc::new(keeper),
@@ -376,7 +547,7 @@ impl Env {
             PublicOptions {
                 timeout: Duration::from_secs(10),
                 body_limit: 256 * 1024,
-                llm_body_limit: o.max_request_bytes,
+                llm_body_limit: llm.max_request_bytes,
                 trust_caller_trace_context: o.trust_caller_trace_context,
             },
         );

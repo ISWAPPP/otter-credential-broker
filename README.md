@@ -10,8 +10,9 @@ tokens:
 - Agent pods get an internal LLM token and use the broker as their API base
   URL. The broker swaps the token for the tenant's provider key, forwards the
   request unchanged, streams the response back and charges the usage against
-  the token's budget. A leaked token only works through the broker, for one
-  tenant, within its budget and rate limit, until it expires or is revoked.
+  the budgets of the token, its tenant and the provider. A leaked token only
+  works through the broker, for one tenant, within those budgets and rate
+  limits, until it expires or is revoked.
 - Workers get a single-use job token that releases exactly the secrets listed
   for one job.
 - The platform core manages secrets and tokens through an admin API but can
@@ -43,7 +44,7 @@ Vault Transit or a cloud KMS can be added behind the `KeyProvider` trait.
 ## Quick start
 
 You need the toolchain pinned in `rust-toolchain.toml` and a PostgreSQL
-server at the URL in `config/dev.toml`.
+server (13 or later) at the URL in `config/dev.toml`.
 
 ```sh
 make run-dev   # creates ./secrets (KEK, token key, admin token), listens on localhost:8080/8081/9090
@@ -70,13 +71,25 @@ curl -s localhost:8080/llm/anthropic/v1/messages \
 `model-small` stands for a real model id; with a USD budget the model needs a
 price in `[[llm.pricing]]`.
 
-Clients need only a different base URL and key: the Anthropic SDK uses
-`http://<broker>:8080/llm/anthropic`, OpenAI-compatible SDKs use
-`http://<broker>:8080/llm/openai/<provider-id>`, and the internal token goes
-where the SDK expects its API key. OpenAI-compatible streaming requests must
+Clients need only a different base URL and key: any configured provider is
+reached at `http://<broker>:8080/llm/p/<provider-id>`, whatever its kind;
+the older forms `http://<broker>:8080/llm/anthropic` (the provider
+`anthropic`) and `http://<broker>:8080/llm/openai/<provider-id>` still work.
+The internal token goes where the SDK expects its API key. Several providers
+may share a kind, e.g. a public API and a gateway in front of it; a provider
+can be limited to some endpoints, to tokens that name it
+(`access = "explicit"`), and given its own CA and client certificate
+(`tls`). OpenAI-compatible streaming requests must
 set `stream_options: {"include_usage": true}`, because the broker never
 modifies request bodies and needs the usage chunk for accounting; providers
 that always send usage can turn this off with `require_stream_usage = false`.
+
+Limits apply to each token, to its tenant (set through the admin API) and
+to each provider for every tenant (in its configuration): requests per
+minute, requests in flight and budgets in tokens or USD, per UTC day or
+month for tenants and providers. Every answer tells the caller what it has
+left (`RateLimit`, `ocb-budget-*` headers), and `GET /llm/_/limits` shows it
+all, with the same token.
 
 The full HTTP API is described in [docs/API.md](docs/API.md).
 
@@ -88,6 +101,13 @@ Settings come from defaults, then the TOML file given with `--config` (or
 documents every key. Three key files are required: the KEK (`[kek]`), the
 token key (`token_key_file`; changing it invalidates every issued token) and
 the admin tokens (`admin_tokens_file`).
+
+Providers, their limits and prices apply without a restart: the broker
+checks the config file and the providers' TLS files every
+`reload_interval_secs` and takes over changes to `[llm.providers.*]` and
+`[[llm.pricing]]`. An invalid file, or a change to any other key, is logged
+and left for a restart. Providers can only be changed this way; the admin
+API lists them but cannot edit them.
 
 The binary has five commands: `serve`, `migrate`, `check-config`, `keygen`
 (prints a 32-byte hex key for a KEK or the token key) and `gen-token` (prints
@@ -104,11 +124,20 @@ export uses the standard `OTEL_*` variables and is off by default.
   written first.
 - Tokens are stored as keyed digests and token rows carry MACs, so write
   access to the database alone cannot mint or widen a token.
-- Upstream hosts come only from configuration. Endpoints, query keys and
-  caller headers are allowlisted, and redirects are never followed.
+- Upstream hosts come only from configuration, never from the API.
+  Endpoints, query keys and caller headers are allowlisted, and redirects
+  are never followed. A provider with its own TLS settings trusts only its
+  own CA.
+- A provider can be set to pass more headers by name prefix, never
+  credentials, cookies or redirects, and to refuse requests that would have
+  it run tools on its own side (web search, web fetch, code execution, MCP
+  servers), which would let an agent reach past its network rules.
 - Budgets and rate limits are enforced in PostgreSQL, so they hold across
-  replicas. Usage comes from the provider's own report even when the caller
-  hangs up.
+  replicas, on three levels: token, tenant and provider. A level only
+  counts what the levels below it let through, so one runaway token cannot
+  use up its neighbours' limits, and budgets of tenants and providers are
+  reserved before a request is sent. Usage comes from the provider's own
+  report even when the caller hangs up.
 - Keys never appear in logs, traces, metrics or responses, and provider error
   bodies are scrubbed. A test runs every flow with TRACE logging of all
   crates and checks for key fragments.

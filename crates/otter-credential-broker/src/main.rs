@@ -30,7 +30,7 @@ enum Cmd {
         #[arg(long, env = "OCB_CONFIG")]
         config: Option<PathBuf>,
     },
-    /// Validate the configuration (providers, prices, key files) and exit.
+    /// Validate the configuration (providers, prices, TLS and key files) and exit.
     CheckConfig {
         #[arg(long, env = "OCB_CONFIG")]
         config: Option<PathBuf>,
@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve { config } => {
             let _guard = telemetry::init("otter-credential-broker")?;
-            broker_server::serve(load(config.as_deref())?).await
+            broker_server::serve(load(config.as_deref())?, config).await
         }
         Cmd::Migrate { config } => {
             let _guard = telemetry::init("otter-credential-broker")?;
@@ -62,15 +62,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::CheckConfig { config } => {
             let cfg = load(config.as_deref())?;
-            let (providers, prices) = cfg.llm.validate().map_err(|e| anyhow::anyhow!("llm: {e}"))?;
+            // Validates providers and prices and reads the providers' TLS files.
+            let proxy = broker_server::LlmProxy::new(&cfg.llm).map_err(|e| anyhow::anyhow!("llm: {e}"))?;
+            let snapshot = proxy.snapshot();
             LocalKeyProvider::from_file(cfg.kek.id.clone(), &cfg.kek.file).context("current KEK")?;
             broker_core::auth::StaticTokenAuthenticator::from_file(&cfg.admin_tokens_file).context("admin tokens")?;
             broker_core::tokens::TokenHasher::from_file(&cfg.token_key_file).context("token key")?;
             broker_server::database_url(&cfg)?;
             println!(
-                "config ok: {} provider(s), pricing {}",
-                providers.len(),
-                if prices.is_empty() { "empty" } else { "set" }
+                "config ok: {} provider(s), pricing {}, version {}",
+                snapshot.providers().count(),
+                if snapshot.prices().is_empty() { "empty" } else { "set" },
+                snapshot.version()
             );
             Ok(())
         }
